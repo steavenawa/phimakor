@@ -1,0 +1,22 @@
+[package]
+name = "phimakor"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Phigros chart editor (RPE format), derived from TeamFlos/phira prpr"
+
+[dependencies]
+anyhow = "*"
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+winit = "*"
+wgpu = "*"
+pollster = "*"
+rodio = "*"
+image = "*"
+bytemuck = { version = "*", features = ["derive"] }
+fontdue = "*"
+softbuffer = "*"
+
+[profile.release]
+lto = true
