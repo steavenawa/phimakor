@@ -1,9 +1,10 @@
 //! phimakor M0 preview: play an RPE chart with audio.
+//! Single window, minimal HUD overlay via the existing text/quad pipeline.
 
-mod audio;
-mod core;
+use phimakor::{audio, core, render};
+
+#[cfg(not(target_os = "android"))]
 mod debug;
-mod render;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,8 +16,6 @@ use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
-
-const COMBO_LABEL: &str = "combo";
 
 struct App {
     dir: PathBuf,
@@ -30,8 +29,6 @@ struct State {
     chart: core::chart::Chart,
     info: core::model::ChartInfo,
     audio: Option<audio::AudioHandle>,
-    /// Fallback clock when the music file is missing.
-    // ponytail: silent preview ignores pause/seek keys
     started: Instant,
     fps_frames: u32,
     fps_since: Instant,
@@ -39,19 +36,18 @@ struct State {
     fps_tx: std::sync::mpsc::SyncSender<f64>,
     combo: u32,
     hits: u32,
-    /// Cached at init (Chart::max_combo); avoids borrowing chart while the
-    /// frame borrow is live.
     note_count: usize,
     seek_dim_until: Instant,
-    debug: Option<debug::DebugWindow>,
     fps: f64,
+    #[cfg(not(target_os = "android"))]
+    debug: Option<debug::DebugWindow>,
 }
 
 impl App {
     fn init(&self, event_loop: &ActiveEventLoop) -> anyhow::Result<State> {
         let window = Arc::new(event_loop.create_window(
             WindowAttributes::default()
-                .with_title("phimakor preview")
+                .with_title("phimakor")
                 .with_inner_size(LogicalSize::new(1200.0, 800.0)),
         )?);
         let mut renderer = pollster::block_on(render::Renderer::new(window.clone()))?;
@@ -68,7 +64,6 @@ impl App {
             }
         }
 
-        // Resource pack: `res/` under the process CWD.
         let res_dir = PathBuf::from("res");
         if let Ok(font) = std::fs::read(res_dir.join("Exo2.ttf")) {
             if !renderer.set_font(font) {
@@ -105,8 +100,6 @@ impl App {
             Err(e) => eprintln!("warning: cannot read illustration {:?}: {e}", info.illustration),
         }
 
-        // Hitsounds fire on a dedicated trigger thread so an occluded window
-        // (winit stops RedrawRequested) can't delay them.
         let audio = match audio::spawn_audio_thread(res_dir.as_path(), &self.dir) {
             Ok(a) => Some(a),
             Err(e) => {
@@ -116,8 +109,9 @@ impl App {
         };
 
         let note_count = chart.max_combo();
-        let debug_window = debug::DebugWindow::new(event_loop);
-        Ok(State { window, renderer, chart, info, audio, started: Instant::now(), fps_frames: 0, fps_since: Instant::now(), aspect_idx: 0, fps_tx: self.fps_tx.clone(), combo: 0, hits: 0, note_count, seek_dim_until: Instant::now(), debug: debug_window, fps: 0.0 })
+        #[cfg(not(target_os = "android"))]
+        let debug = debug::DebugWindow::new(event_loop);
+        Ok(State { window, renderer, chart, info, audio, started: Instant::now(), fps_frames: 0, fps_since: Instant::now(), aspect_idx: 0, fps_tx: self.fps_tx.clone(), combo: 0, hits: 0, note_count, seek_dim_until: Instant::now(), fps: 0.0, debug })
     }
 }
 
@@ -137,11 +131,11 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else { return };
-        if state.debug.as_ref().is_some_and(|d| d.id() == id) {
-            // Debug window: ignore everything (incl. CloseRequested) — the
-            // main window owns the app lifecycle.
+        if id != state.window.id() {
+            // Debug window: swallow everything (incl. CloseRequested).
             return;
         }
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.renderer.resize(size.width, size.height),
@@ -161,8 +155,6 @@ impl ApplicationHandler for App {
                             let delta = if code == KeyCode::ArrowLeft { -5.0 } else { 5.0 };
                             let new_audio = (audio.time() + delta).max(0.0);
                             audio.seek(new_audio);
-                            // Recompute score state for the seek target
-                            // (auto-play = all Perfect, so combo == hits).
                             let total_offset = (state.chart.offset() + state.info.offset) as f64;
                             let new_chart_time = (new_audio - total_offset).max(0.0);
                             let hits = state.chart.hits_before(new_chart_time) as u32;
@@ -172,7 +164,6 @@ impl ApplicationHandler for App {
                         }
                     }
                     KeyCode::Tab => {
-                        // Cycle playfield aspect (editor preview convention).
                         const ASPECTS: [f32; 4] = [3.0 / 2.0, 16.0 / 9.0, 4.0 / 3.0, 1.0];
                         state.aspect_idx = (state.aspect_idx + 1) % ASPECTS.len();
                         let a = ASPECTS[state.aspect_idx];
@@ -187,58 +178,51 @@ impl ApplicationHandler for App {
                     Some(audio) => audio.time(),
                     None => state.started.elapsed().as_secs_f64(),
                 };
-                // prpr scene/game.rs: chart time lags audio by the total offset.
                 let total_offset = (state.chart.offset() + state.info.offset) as f64;
                 let chart_time = (audio_time - total_offset).max(0.0);
+                let duration = state.chart.duration();
                 let frame = state.chart.state_at(chart_time);
-                // Hit effects + score for notes fired since last frame
-                // (core reports crossings, incl. culled notes and hold re-hits).
-                // Hitsounds are the trigger thread's job, not this loop's.
+
                 for fired in &frame.fired {
                     let line = &frame.lines[fired.line];
                     let theta = line.rotation;
-                    let x = fired.x as f32; // FiredNote.x is f64 in core
+                    let x = fired.x as f32;
                     let cx = (line.position[0] + theta.cos() * x) * 675.0;
                     let cy = (line.position[1] + theta.sin() * x) * 450.0;
                     if fired.hold_tail {
-                        // Hold tail: judge-only event, silent and effect-less.
-                        if !fired.fake {
-                            state.combo += 1;
-                            state.hits += 1;
-                        }
+                        if !fired.fake { state.combo += 1; state.hits += 1; }
                         continue;
                     }
-                    if fired.tick {
-                        // Mid-hold tick: visual pulse only, hold stays muted.
-                        state.renderer.spawn_hit_fx([cx, cy]);
-                        continue;
-                    }
-                    if fired.fake {
-                        continue;
-                    }
+                    if fired.tick { state.renderer.spawn_hit_fx([cx, cy]); continue; }
+                    if fired.fake { continue; }
                     state.combo += 1;
                     state.hits += 1;
                     state.renderer.spawn_hit_fx([cx, cy]);
                 }
+
                 let size = state.window.inner_size();
                 let aspect = size.width as f32 / size.height.max(1) as f32;
                 let dim = if Instant::now() < state.seek_dim_until { 0.7 } else { 1.0 };
-                // Game UI (auto-play = all Perfect).
-                const UI_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.85];
-                let score =
-                    (state.hits as f64 / state.note_count.max(1) as f64 * 1_000_000.).round() as u32;
-                state.renderer.draw_text(&format!("{score:07}"), render::TextAnchor::TopLeft, UI_COLOR);
+                let score = (state.hits as f64 / state.note_count.max(1) as f64 * 1_000_000.).round() as u32;
+
+                // HUD via the existing draw_text pipeline
+                const C: [f32; 4] = [1.0, 1.0, 1.0, 0.85];
+                state.renderer.draw_text(&format!("{score:07}"), render::TextAnchor::TopLeft, C);
                 if state.combo >= 3 {
-                    state.renderer.draw_text(&state.combo.to_string(), render::TextAnchor::TopCenter, UI_COLOR);
-                    state.renderer.draw_text(COMBO_LABEL, render::TextAnchor::ComboLabel, UI_COLOR);
+                    state.renderer.draw_text(&state.combo.to_string(), render::TextAnchor::TopCenter, C);
+                    state.renderer.draw_text("combo", render::TextAnchor::ComboLabel, C);
                 }
-                state.renderer.draw_text(&state.info.name, render::TextAnchor::BottomLeftEdge, UI_COLOR);
-                state.renderer.draw_text(&state.info.level, render::TextAnchor::BottomRightEdge, UI_COLOR);
+                state.renderer.draw_text(&state.fps.to_string(), render::TextAnchor::BottomLeftEdge, C);
+
+                state.renderer.set_progress(audio_time as f32 / duration as f32);
+
                 if let Err(e) = state.renderer.render(frame, aspect, dim) {
                     eprintln!("render error: {e:?}");
                 }
+
+                #[cfg(not(target_os = "android"))]
                 if let Some(dbg) = &mut state.debug {
-                    let visible_notes: usize = frame.lines.iter().map(|l| l.notes.len()).sum();
+                    let visible_notes = frame.lines.iter().map(|l| l.notes.len()).sum();
                     dbg.update(&debug::DebugInfo {
                         chart_time,
                         audio_time,
@@ -254,12 +238,11 @@ impl ApplicationHandler for App {
                         window_size: (size.width, size.height),
                     });
                 }
+
                 state.fps_frames += 1;
                 let elapsed = state.fps_since.elapsed();
                 if elapsed.as_secs() >= 5 {
                     state.fps = state.fps_frames as f64 / elapsed.as_secs_f64();
-                    // Never block the render loop on console IO: drop if the
-                    // printer thread is behind.
                     let _ = state.fps_tx.try_send(state.fps);
                     state.fps_frames = 0;
                     state.fps_since = Instant::now();
@@ -271,8 +254,8 @@ impl ApplicationHandler for App {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = &self.state {
-            // ponytail: vsync present mode is enough throttle
             state.window.request_redraw();
+            #[cfg(not(target_os = "android"))]
             if let Some(dbg) = &state.debug {
                 dbg.request_redraw();
             }
@@ -289,8 +272,6 @@ impl ApplicationHandler for App {
 }
 
 fn main() -> anyhow::Result<()> {
-    // Background printer: console writes can block on Windows, keep them off
-    // the render loop (bounded channel, try_send drops when full).
     let (fps_tx, fps_rx) = std::sync::mpsc::sync_channel::<f64>(4);
     std::thread::spawn(move || {
         while let Ok(fps) = fps_rx.recv() {

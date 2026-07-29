@@ -1,7 +1,7 @@
 // Derived from TeamFlos/phira prpr, GPL-3.0.
 //! Beat/time conversion, ported from `prpr/src/core.rs` (`Triple`, `BpmList`).
 
-#[derive(serde::Deserialize, Clone, Copy, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug)]
 /// `(i, n, d)`: `i + n / d`. `d == 0` yields inf/NaN (unchecked, same as prpr).
 pub struct Triple(i32, u32, u32);
 impl Default for Triple {
@@ -14,6 +14,30 @@ impl Triple {
     pub fn beats(&self) -> f64 {
         self.0 as f64 + self.1 as f64 / self.2 as f64
     }
+
+    /// Approximates a beat position as `i + n/d` (fixed denominator 1e6,
+    /// reduced by gcd). // ponytail: ~1e-6-beat precision is plenty for
+    /// editor split points; exact rationals need the chart's original text.
+    pub fn from_beats(beats: f64) -> Self {
+        let i = beats.floor() as i32;
+        let frac = beats - f64::from(i);
+        const D: u32 = 1_000_000;
+        let n = (frac * f64::from(D)).round() as u32;
+        if n >= D {
+            return Self(i + 1, 0, 1);
+        }
+        let g = gcd(n, D);
+        Self(i, n / g, D / g)
+    }
+}
+
+fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a.max(1)
 }
 
 #[derive(Default)] // the default is a dummy

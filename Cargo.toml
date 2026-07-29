@@ -17,6 +17,8 @@ image = "*"
 bytemuck = { version = "*", features = ["derive"] }
 fontdue = "*"
 softbuffer = "*"
+iced = { version = "*", default-features = false, features = ["tiny-skia", "advanced", "image", "smol"] }
 
 [profile.release]
-lto = true
+lto = "thin"
+codegen-units = 16

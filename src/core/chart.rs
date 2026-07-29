@@ -603,24 +603,32 @@ pub struct Chart {
     fired_scratch: Vec<(usize, FiredNote)>,
 }
 
+/// Reads `info.json` in `dir` (falling back to an RPE-export `info.txt`
+/// when absent), rejecting non-RPE formats. Shared by [`Chart::load`] and
+/// the editor document API ([`crate::core::edit`]).
+pub(crate) fn load_info(dir: &std::path::Path) -> Result<ChartInfo> {
+    let info: ChartInfo = match std::fs::read_to_string(dir.join("info.json")) {
+        Ok(src) => serde_json::from_str(&src).context("failed to parse info.json")?,
+        Err(json_err) => {
+            let src = std::fs::read_to_string(dir.join("info.txt"))
+                .with_context(|| format!("failed to read info.json ({json_err}) or info.txt"))?;
+            parse_info_txt(&src)
+        }
+    };
+    if let Some(format) = &info.format {
+        if *format != ChartFormat::Rpe {
+            anyhow::bail!("unsupported chart format {format:?}: M0 supports RPE only");
+        }
+    }
+    Ok(info)
+}
+
 impl Chart {
     /// Reads `info.json` in `dir` (falling back to an RPE-export `info.txt`
     /// when absent), then the chart file it names. M0 supports the RPE
     /// format only.
     pub fn load(dir: &std::path::Path) -> Result<(ChartInfo, Chart)> {
-        let info: ChartInfo = match std::fs::read_to_string(dir.join("info.json")) {
-            Ok(src) => serde_json::from_str(&src).context("failed to parse info.json")?,
-            Err(json_err) => {
-                let src = std::fs::read_to_string(dir.join("info.txt"))
-                    .with_context(|| format!("failed to read info.json ({json_err}) or info.txt"))?;
-                parse_info_txt(&src)
-            }
-        };
-        if let Some(format) = &info.format {
-            if *format != ChartFormat::Rpe {
-                anyhow::bail!("unsupported chart format {format:?}: M0 supports RPE only");
-            }
-        }
+        let info = load_info(dir)?;
         let chart_src = std::fs::read_to_string(dir.join(&info.chart)).with_context(|| format!("failed to read chart file {:?}", info.chart))?;
         let chart = Self::from_rpe(&chart_src, info.use_rpe_170_speed == Some(true)).with_context(|| format!("failed to parse chart file {:?}", info.chart))?;
         Ok((info, chart))

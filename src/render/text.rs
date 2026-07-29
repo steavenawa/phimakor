@@ -42,14 +42,15 @@ impl TextAnchor {
     /// y-range is ±(675/aspect), so anchors follow the playfield aspect.
     fn layout(self, aspect: f32) -> (f32, HAlign, f32) {
         let top = 675.0 / aspect; // visible canvas y at the playfield top
+        let bottom = -675.0 / aspect;
         match self {
             Self::TopLeft => (36.0, HAlign::Left(-655.0), top - 8.0 - 36.0),
-            Self::TopCenter => (56.0, HAlign::Center, top - 2.0 - 56.0),
-            Self::BottomLeft => (30.0, HAlign::Left(-655.0), -(top - 20.0 - 30.0)),
-            Self::BottomRight => (30.0, HAlign::Right(655.0), -(top - 20.0 - 30.0)),
+            Self::TopCenter => (56.0, HAlign::Center, top - 8.0 - 56.0),
+            Self::BottomLeft => (30.0, HAlign::Left(-655.0), (bottom + 20.0 + 30.0)),
+            Self::BottomRight => (30.0, HAlign::Right(655.0), (bottom + 20.0 + 30.0)),
             // Viewport edges: y resolved in push_text from the window size.
-            Self::BottomLeftEdge => (30.0, HAlign::Left(-655.0), 0.0),
-            Self::BottomRightEdge => (30.0, HAlign::Right(655.0), 0.0),
+            Self::BottomLeftEdge => (30.0, HAlign::Left(-655.0), bottom),
+            Self::BottomRightEdge => (30.0, HAlign::Right(655.0), bottom),
             // Directly below TopCenter on screen (+y = up): 6 px gap, 26 px.
             Self::ComboLabel => (26.0, HAlign::Center, top - 2.0 - 56.0 - 6.0 - 26.0),
         }

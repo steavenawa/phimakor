@@ -3,7 +3,7 @@
 //! in [`crate::core::chart`]. Field names/types mirror `prpr/src/parse/rpe.rs`
 //! and `prpr/src/info.rs` exactly.
 
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 
 use crate::core::bpm::Triple;
@@ -39,14 +39,14 @@ where
     Ok(parsed.unwrap_or_else(rpe_version_default))
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPEBpmItem {
     pub bpm: f64,
     pub start_time: Triple,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPEEvent<T = f32> {
     #[serde(default = "f32_zero")]
@@ -67,7 +67,7 @@ pub struct RPEEvent<T = f32> {
 
 /// Control event (`posControl` etc.). Parsed for tolerance only; not lowered
 /// in M0 (// ponytail: M3 ctrl events).
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPECtrlEvent {
     pub easing: u8,
@@ -76,7 +76,7 @@ pub struct RPECtrlEvent {
     pub value: HashMap<String, f32>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPEEventLayer {
     pub alpha_events: Option<Vec<RPEEvent>>,
@@ -86,7 +86,7 @@ pub struct RPEEventLayer {
     pub speed_events: Option<Vec<RPEEvent>>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RGBColor(pub u8, pub u8, pub u8);
 
 impl From<RGBColor> for crate::core::Color {
@@ -95,7 +95,7 @@ impl From<RGBColor> for crate::core::Color {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPEExtendedEvents {
     pub color_events: Option<Vec<RPEEvent<RGBColor>>>,
@@ -107,7 +107,7 @@ pub struct RPEExtendedEvents {
     pub gif_events: Option<Vec<RPEEvent>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPENote {
     #[serde(rename = "type")]
@@ -131,7 +131,7 @@ pub struct RPENote {
     pub judge_area: Option<f32>, // no judging in M0
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPEJudgeLine {
     #[serde(rename = "Name")]
@@ -162,7 +162,7 @@ pub struct RPEJudgeLine {
     pub y_control: Vec<RPECtrlEvent>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPEMetadata {
     /// Chart offset in **milliseconds**.
@@ -171,7 +171,7 @@ pub struct RPEMetadata {
     pub rpe_version: i32,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPEChart {
     #[serde(rename = "META")]
@@ -185,7 +185,7 @@ pub struct RPEChart {
 // info.json
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ChartFormat {
     Rpe,
@@ -197,7 +197,7 @@ pub enum ChartFormat {
 /// Mirrors `prpr/src/info.rs`. `serde(default)` on the whole struct: an empty
 /// `{}` is valid. `created`/`updated`/`chart_updated` are kept as raw strings
 /// (no chrono dependency; unused in M0).
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartInfo {

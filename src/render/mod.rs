@@ -15,6 +15,7 @@ use winit::window::Window;
 use crate::core::FrameState;
 
 mod fx;
+pub mod preview;
 mod text;
 
 pub use text::TextAnchor;
@@ -157,11 +158,92 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+/// Shared pipeline setup for the window and offscreen paths: quad shader,
+/// texture bind-group layout + sampler, alpha-blended TriangleStrip instanced
+/// quads. `format` is the color target (surface format or offscreen Rgba8Unorm).
+pub(crate) fn create_pipeline(
+    device: &wgpu::Device,
+    format: wgpu::TextureFormat,
+) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Sampler) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("phimakor-quad"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
+    });
+
+    let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: None,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None,
+        bind_group_layouts: &[Some(&tex_bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("phimakor-quad"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            compilation_options: Default::default(),
+            buffers: &[Some(INSTANCE_LAYOUT)],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: None,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    (pipeline, tex_bgl, sampler)
+}
+
 pub struct Renderer {
-    surface: wgpu::Surface<'static>,
+    /// Window surface; `None` for surfaceless (offscreen preview) renderers.
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
+    /// Present configuration; `None` when surfaceless.
+    config: Option<wgpu::SurfaceConfiguration>,
+    /// Viewport size in px (drives the text overlay layout).
+    size: [u32; 2],
 
     pipeline: wgpu::RenderPipeline,
     tex_bgl: wgpu::BindGroupLayout,
@@ -179,6 +261,8 @@ pub struct Renderer {
     background_dim: f32,
     /// Playfield canvas aspect (w/h), hotkey-switchable.
     playfield_aspect: f32,
+    /// Playback progress 0..1 for the top progress bar.
+    progress: f32,
     /// Live hit-effect bursts (see `fx.rs`).
     hit_fx: Vec<fx::HitFx>,
     /// Text overlay state (see `text.rs`).
@@ -186,6 +270,19 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    pub fn device(&self) -> &wgpu::Device { &self.device }
+    pub fn queue(&self) -> &wgpu::Queue { &self.queue }
+
+    /// Acquire the next surface texture. Returns `Err` variants that the caller
+    /// should handle (Timeout/Occluded → skip frame, Validation → propagate).
+    pub fn surface_acquire(&mut self) -> Result<wgpu::SurfaceTexture, wgpu::CurrentSurfaceTexture> {
+        let surface = self.surface.as_ref().expect("surface_acquire on a surfaceless renderer");
+        match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(st) | wgpu::CurrentSurfaceTexture::Suboptimal(st) => Ok(st),
+            other => Err(other),
+        }
+    }
+
     pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -199,17 +296,6 @@ impl Renderer {
             })
             .await
             .context("no suitable GPU adapter")?;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                experimental_features: wgpu::ExperimentalFeatures::default(),
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::Off,
-            })
-            .await
-            .context("failed to create device")?;
 
         let caps = surface.get_capabilities(&adapter);
         eprintln!("present modes available: {:?}", caps.present_modes);
@@ -232,74 +318,54 @@ impl Renderer {
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
         };
-        surface.configure(&device, &config);
+        let (width, height) = (config.width, config.height);
+        Self::init(Some((surface, config)), adapter, format, width, height).await
+    }
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("phimakor-quad"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
-        });
+    /// Surfaceless constructor for offscreen rendering (preview / embedding).
+    /// No compatible surface on the adapter request; the target format is
+    /// fixed to non-sRGB Rgba8Unorm, matching the window path's pass-through
+    /// color choice.
+    pub(crate) async fn new_surfaceless(width: u32, height: u32) -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions::default())
+            .await
+            .context("no suitable GPU adapter")?;
+        Self::init(None, adapter, wgpu::TextureFormat::Rgba8Unorm, width.max(1), height.max(1)).await
+    }
 
-        let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: None,
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: None,
-            bind_group_layouts: &[Some(&tex_bgl)],
-            immediate_size: 0,
-        });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("phimakor-quad"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[Some(INSTANCE_LAYOUT)],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+    /// Shared construction for the window and surfaceless paths: device/queue,
+    /// pipeline (via [`create_pipeline`]), instance double-buffer, white
+    /// texture. A passed-in surface is configured with its config here.
+    async fn init(
+        surface: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
+        adapter: wgpu::Adapter,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> anyhow::Result<Self> {
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: None,
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                experimental_features: wgpu::ExperimentalFeatures::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                trace: wgpu::Trace::Off,
+            })
+            .await
+            .context("failed to create device")?;
 
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: None,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
+        let (surface, config) = match surface {
+            Some((surface, config)) => {
+                surface.configure(&device, &config);
+                (Some(surface), Some(config))
+            }
+            None => (None, None),
+        };
+
+        let (pipeline, tex_bgl, sampler) = create_pipeline(&device, format);
 
         let instance_bufs = [
             Self::make_instance_buf(&device, INITIAL_DRAW_CAPACITY),
@@ -314,6 +380,7 @@ impl Renderer {
             device,
             queue,
             config,
+            size: [width, height],
             pipeline,
             tex_bgl,
             sampler,
@@ -325,6 +392,7 @@ impl Renderer {
             background: None,
             background_dim: 1.0,
             playfield_aspect: ASPECT,
+            progress: 0.0,
             hit_fx: Vec::new(),
             text: text::TextState::new(),
         })
@@ -419,16 +487,21 @@ impl Renderer {
     }
 
     fn reconfigure(&self) {
-        self.surface.configure(&self.device, &self.config);
+        if let (Some(surface), Some(config)) = (&self.surface, &self.config) {
+            surface.configure(&self.device, config);
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return; // minimized; keep last valid config
         }
-        self.config.width = width;
-        self.config.height = height;
-        self.reconfigure();
+        self.size = [width, height];
+        if let Some(config) = &mut self.config {
+            config.width = width;
+            config.height = height;
+            self.reconfigure();
+        }
     }
 
     pub fn set_background(&mut self, img_bytes: &[u8], dim: f32) -> anyhow::Result<()> {
@@ -443,6 +516,11 @@ impl Renderer {
         self.playfield_aspect = aspect;
     }
 
+    /// Update the top progress bar (0..1).
+    pub fn set_progress(&mut self, progress: f32) {
+        self.progress = progress.clamp(0.0, 1.0);
+    }
+
     pub fn load_texture(&mut self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         let (bind_group, size) = self.upload_image(bytes).with_context(|| format!("texture {name:?}"))?;
         self.textures.insert(name.to_string(), TexEntry { bind_group, size });
@@ -453,13 +531,39 @@ impl Renderer {
     /// failures are reported via `wgpu::CurrentSurfaceTexture`. Lost/Outdated
     /// are handled here by reconfiguring with the stored size (frame skipped);
     /// Timeout/Occluded skip silently; only Validation is returned as `Err`.
-    /// `dim`: global brightness multiplied into every quad's rgb (alpha kept).
     pub fn render(
         &mut self,
         frame: &FrameState,
         window_aspect: f32,
         dim: f32,
     ) -> Result<(), wgpu::CurrentSurfaceTexture> {
+        let surface = self.surface.as_ref().expect("render() requires a window surface");
+        let st = match surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(st) | wgpu::CurrentSurfaceTexture::Suboptimal(st) => st,
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.reconfigure();
+                return Ok(());
+            }
+            other => return Err(other), // Validation
+        };
+        let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        self.draw_to_view(&view, frame, window_aspect, dim);
+        self.queue.present(st);
+        Ok(())
+    }
+
+    /// Build this frame's draw list and execute the render pass into `view`
+    /// (window surface view or offscreen target). Submits on the internal
+    /// queue; the caller presents (window path) or copies out (preview path).
+    /// `dim`: global brightness multiplied into every quad's rgb (alpha kept).
+    pub(crate) fn draw_to_view(
+        &mut self,
+        view: &wgpu::TextureView,
+        frame: &FrameState,
+        window_aspect: f32,
+        dim: f32,
+    ) {
         // RPE canvas model: world x ±1 = canvas ±675px, world y ±1 = ±450px
         // (1350×900, SQUARE canvas pixels). Letterbox the 3:2 canvas into the
         // window; canvas px stay uniform on every window, so rotated quads
@@ -559,8 +663,11 @@ impl Renderer {
                 ),
             );
             // Notes: below-notes first, above-notes after (contract).
+            // Within each group draw by kind priority (prpr NoteKind::order):
+            // hold at the bottom, then drag, tap, flick on top.
             for &above in &[false, true] {
-                for note in line.notes.iter().filter(|n| n.above == above) {
+                for kind in [2u8, 4, 1, 3] {
+                    for note in line.notes.iter().filter(|n| n.above == above && n.kind == kind) {
                     let rgb = match note.kind {
                         1 => TAP_COLOR,
                         2 => HOLD_COLOR,
@@ -732,8 +839,31 @@ impl Renderer {
                 }
             }
         }
+        }
 
         // Hit effects: sprite-sheet bursts in canvas-pixel space, after notes.
+        // Top progress bar (Phigros-style): thin white strip hugging the
+        // visible canvas top edge, grows left → right with `progress`.
+        if self.progress > 0.0 {
+            let top = CANVAS_W / aspect; // visible canvas y at the top (+y = up)
+            let bar_h = 5.0;
+            let bar_w = 1350.0 * self.progress;
+            cmds.push(DrawCmd {
+                uniform: DrawUniform {
+                    model: mat_mul(
+                        &letterbox,
+                        &mat_mul(
+                            &mat_translate(-CANVAS_W + bar_w * 0.5, top - bar_h * 0.5),
+                            &mat_scale(bar_w, bar_h),
+                        ),
+                    ),
+                    color: [1.0, 1.0, 1.0, 0.9],
+                    uv_rect: [0., 0., 1., 1.],
+                },
+                tex: &self.white,
+            });
+        }
+
         // Field-split call: `cmds` already borrows `self.textures`/`self.white`.
         Self::push_hit_fx(&mut self.hit_fx, &self.textures, &mut cmds, &letterbox);
 
@@ -743,7 +873,7 @@ impl Renderer {
             &self.text.cache,
             &mut cmds,
             &letterbox,
-            [self.config.width as f32, self.config.height as f32],
+            [self.size[0] as f32, self.size[1] as f32],
         );
 
         // Convert cmds to instances (applying the global rgb dim on the CPU),
@@ -774,17 +904,6 @@ impl Renderer {
             );
         }
 
-        let st = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(st) | wgpu::CurrentSurfaceTexture::Suboptimal(st) => st,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.reconfigure();
-                return Ok(());
-            }
-            other => return Err(other), // Validation
-        };
-
-        let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
@@ -792,7 +911,7 @@ impl Renderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -816,9 +935,7 @@ impl Renderer {
             }
         }
         self.queue.submit([encoder.finish()]);
-        self.queue.present(st);
         self.frame_idx ^= 1;
-        Ok(())
     }
 }
 
