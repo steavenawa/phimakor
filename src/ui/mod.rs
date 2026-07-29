@@ -6,19 +6,20 @@ use iced_tiny_skia::Renderer;
 
 pub mod panels;
 
-static UI_FONT: std::sync::OnceLock<fontdue::Font> = std::sync::OnceLock::new();
+static UI_FONT: std::sync::OnceLock<Option<fontdue::Font>> = std::sync::OnceLock::new();
 
-fn get_font() -> &'static fontdue::Font {
+fn load_font_from(path: &str) -> Option<fontdue::Font> {
+    std::fs::read(path).ok().and_then(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok())
+}
+
+fn get_font() -> &'static Option<fontdue::Font> {
     UI_FONT.get_or_init(|| {
-        std::fs::read("res/Exo2.ttf").ok()
-            .and_then(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok())
-            .unwrap_or_else(|| {
-                // Fallback: built-in Exo2 or system font
-                fontdue::Font::from_bytes(
-                    include_bytes!("../../res/Exo2.ttf") as &[u8],
-                    fontdue::FontSettings::default(),
-                ).expect("Exo2.ttf bundled")
-            })
+        // Try user font first, then system fallbacks
+        load_font_from("res/Exo2.ttf")
+            .or_else(|| load_font_from("res.dis/Exo2.ttf"))
+            .or_else(|| load_font_from("C:\\Windows\\Fonts\\arial.ttf"))
+            .or_else(|| load_font_from("C:\\Windows\\Fonts\\msyh.ttc"))
+            .or_else(|| load_font_from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
     })
 }
 
@@ -26,6 +27,7 @@ fn get_font() -> &'static fontdue::Font {
 pub enum OverlayMessage {
     ToggleEvents,
     SelectLayer(usize),
+    ToggleMenu,
 }
 
 pub struct IcedOverlay {
@@ -57,8 +59,12 @@ pub struct IcedOverlay {
     select_end: Option<(f32, f32)>,
     pub selecting: bool,
     pub seek_dragging: bool,
+    pub drag_note: Option<(usize, f64, f32, f32)>, // (note_index, start_beat, mouse_x_start, mouse_y_start)
+    pub drag_updated: Option<(usize, f64, f32)>, // (note_index, new_beat, new_x)
+}
     ctx_pos: Option<(f32, f32)>,
     ctx_progress: f32,
+    pub mouse_beat: f64,
 }
 
 const KIND_COLORS: [(&str, [u8; 3]); 5] = [
@@ -72,7 +78,7 @@ impl IcedOverlay {
         let renderer = Renderer::new(iced::Font::default(), iced::Pixels(14.0));
         let root: Element<'_, (), Theme, Renderer> = iced::widget::Column::new().into();
         let tree = Tree::new(&root);
-        Self { renderer, tree, theme: Theme::Dark, pixmap: tiny_skia::Pixmap::new(w.max(1), h.max(1)).unwrap(), clip_mask: tiny_skia::Mask::new(w.max(1), h.max(1)).unwrap(), texture, bind_group, w: w.max(1), h: h.max(1), panel_progress: 0.0, events_progress: 0.0, notes_progress: 0.0, mouse_pos: None, show_overlay: true, tl_visible: false, tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 3], panel_defs: Vec::new(), messages: Vec::new(), timeline_click: None, layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, gui_scale: 1.0, select_start: None, select_end: None, selecting: false, seek_dragging: false, ctx_pos: None, ctx_progress: 0.0 }
+        Self { renderer, tree, theme: Theme::Dark, pixmap: tiny_skia::Pixmap::new(w.max(1), h.max(1)).unwrap(), clip_mask: tiny_skia::Mask::new(w.max(1), h.max(1)).unwrap(), texture, bind_group, w: w.max(1), h: h.max(1), panel_progress: 0.0, events_progress: 0.0, notes_progress: 0.0, mouse_pos: None, show_overlay: true, tl_visible: false, tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 3], panel_defs: Vec::new(), messages: Vec::new(), timeline_click: None, layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, gui_scale: 1.0, select_start: None, select_end: None, selecting: false, seek_dragging: false, drag_note: None, drag_updated: None, ctx_pos: None, ctx_progress: 0.0, mouse_beat: 0.0 }
     }
 
     fn make_texture(device: &wgpu::Device, tex_bgl: &wgpu::BindGroupLayout, sampler: &wgpu::Sampler, w: u32, h: u32) -> (wgpu::Texture, wgpu::BindGroup) {
@@ -112,6 +118,10 @@ impl IcedOverlay {
             self.select_end = Some((x as f32, y as f32));
         }
         self.tool_hover = None;
+        // Track beat under mouse for note placement
+        if self.tl_visible {
+            self.mouse_beat = self.y_to_beat(y as f32, 0.0);
+        }
         let s = self.gui_scale;
         let btn_base = 34.0 * s;
         let gap = 6.0 * s;
@@ -183,18 +193,13 @@ impl IcedOverlay {
         // Release: handle bottom bar buttons and selection end
         if !pressed {
             if self.selecting { self.selecting = false; }
-            if my >= self.h as f32 - 52.0 * s && my <= self.h as f32 - 8.0 * s && self.show_overlay {
-                let cx = self.w as f32 / 2.0;
-                let btn_w = 100.0 * s;
-                let gap = 8.0 * s;
-                let total_w = btn_w * 2.0 + gap;
-                let left_start = cx - total_w * 0.5;
-                if mx >= left_start && mx < left_start + btn_w {
-                    self.messages.push(OverlayMessage::SelectLayer(666)); return;
-                }
-                if mx >= left_start + btn_w + gap && mx < left_start + total_w {
-                    self.messages.push(OverlayMessage::ToggleEvents); return;
-                }
+            if my >= self.h as f32 - 48.0 * s && my <= self.h as f32 && self.show_overlay {
+                let btn_w = 90.0 * s;
+                let right = self.w as f32 - 10.0 * s;
+                let bx = |i: usize| right - (3 - i) as f32 * (btn_w + 6.0 * s);
+                if mx >= bx(0) && mx < bx(0) + btn_w { self.messages.push(OverlayMessage::ToggleEvents); return; }
+                if mx >= bx(1) && mx < bx(1) + btn_w { self.messages.push(OverlayMessage::SelectLayer(666)); return; }
+                if mx >= bx(2) && mx < bx(2) + btn_w { self.messages.push(OverlayMessage::ToggleMenu); return; }
                 return;
             }
         }
@@ -230,13 +235,30 @@ impl IcedOverlay {
         ((mx / sb_w).clamp(0.0, 1.0) * info.duration as f32) as f64
     }
 
+    /// Convert a Y position to beat value on the timeline (whichever panel is visible).
+    fn y_to_beat(&self, my: f32, props: f32) -> f64 {
+        let s = self.gui_scale;
+        // Find which panel the mouse is on
+        let (panel_px, panel_w, _progress) = if self.is_over_events(props) {
+            (self.panel_x(props, TL_W, self.events_progress), TL_W, self.events_progress)
+        } else if self.is_over_notes(props) {
+            (self.panel_x(props, NT_W, self.notes_progress), NT_W, self.notes_progress)
+        } else { return self.tl_scroll as f64 + self.tl_zoom as f64 * 0.5; };
+
+        let py = HEADER_H * s + 4.0 * s;
+        let ph = (self.h as f32 - 56.0 * s - py) as f64;
+        if ph <= 0.0 { return self.tl_scroll as f64; }
+        let ratio = 1.0 - ((my - py) / ph as f32).clamp(0.0, 1.0) as f64;
+        self.tl_scroll as f64 + ratio * self.tl_zoom as f64
+    }
+
     pub fn is_over_seekbar(&self) -> bool {
         let s = self.gui_scale;
         let Some((mx, my)) = self.mouse_pos else { return false };
         let pp = self.panel_progress;
         let props_x = self.w as f32 - pp * PANEL_W * s;
-        let sb_y = self.h as f32 - 50.0 * s;
-        let sb_h = 16.0 * s;
+        let sb_y = self.h as f32 - 56.0 * s;
+        let sb_h = 12.0 * s;
         let sb_x = QP_W * s + 2.0 * s;
         let sb_w = (props_x - sb_x - 2.0 * s).max(20.0);
         mx >= sb_x && mx <= sb_x + sb_w && my >= sb_y && my <= sb_y + sb_h
@@ -342,6 +364,20 @@ impl IcedOverlay {
 
     pub fn render_progress(&self) -> (f32, f32) { (self.events_progress, self.notes_progress) }
 
+    /// Render splash screen (chart picker) into the overlay texture.
+    pub fn render_splash(&mut self, queue: &wgpu::Queue, names: &[String], hover: Option<usize>) {
+        self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        let vw = self.w as f32;
+        let vh = self.h as f32;
+        draw_splash(&mut self.pixmap.as_mut(), names, hover, vw, vh, self.gui_scale);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            self.pixmap.data(),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
+            wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+        );
+    }
+
     pub fn set_panels(&mut self, panels: Vec<panels::PanelDef>) {
         self.panel_defs = panels;
     }
@@ -432,8 +468,8 @@ impl IcedOverlay {
             }
             // Seek bar: thin strip above bottom buttons, full playfield width
             if info.show_overlay {
-                let sb_h = 16.0 * s;
-                let sb_y = vh - 50.0 * s;
+                let sb_h = 12.0 * s;
+                let sb_y = vh - 56.0 * s;
                 let sb_x = qp_w;
                 let sb_w = (props_x - sb_x).max(20.0);
                 let mut sbg = tiny_skia::Paint::default();
@@ -479,8 +515,9 @@ pub fn draw_splash(pm: &mut tiny_skia::PixmapMut, charts: &[String], hover: Opti
     }
     // Title
     let font = get_font();
-    draw_text_on_pixmap(pm, "PhiMakor - Select Chart", vw * 0.5 - 100.0 * s, 40.0 * s, 18.0 * s, font);
-    // Chart list
+    if let Some(font) = font {
+        draw_text_on_pixmap(pm, "PhiMakor - Select Chart", vw * 0.5 - 100.0 * s, 40.0 * s, 18.0 * s, font);
+    }
     let mut y = 70.0 * s;
     let cell_h = 28.0 * s;
     for (i, name) in charts.iter().enumerate() {
@@ -491,7 +528,9 @@ pub fn draw_splash(pm: &mut tiny_skia::PixmapMut, charts: &[String], hover: Opti
         if let Some(r) = tiny_skia::Rect::from_xywh(40.0 * s, y, vw - 80.0 * s, cell_h) {
             pm.fill_rect(r, &cp, tiny_skia::Transform::default(), None);
         }
-        draw_text_on_pixmap(pm, name, 48.0 * s, y + cell_h * 0.5, 14.0 * s, font);
+        if let Some(font) = font {
+            draw_text_on_pixmap(pm, name, 48.0 * s, y + cell_h * 0.5, 14.0 * s, font);
+        }
         y += cell_h + 4.0 * s;
     }
 }
@@ -514,7 +553,7 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
     let head_h = HEADER_H * s;
 
     let py = head_h + 4.0 * s;
-    let ph = (vh - 50.0 * s - py) as f64;
+    let ph = (vh - 56.0 * s - py) as f64;
     if ph <= 0.0 { return; }
 
     let (scroll, zoom) = (scroll as f64, zoom as f64);
@@ -537,16 +576,22 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
         }
     }
 
-    // Beat lines across all columns
-    let b_start = (min_b.ceil() as i32).max(0);
-    let b_end = max_b.floor() as i32;
-    for b in b_start..=b_end {
-        let y = to_y(b as f64) as f32;
+    // Grid lines at snap divisions
+    let grid = (info.snap as f64).max(0.125);
+    let g_start = (min_b / grid).ceil() as i32;
+    let g_end = (max_b / grid).floor() as i32;
+    for gi in g_start..=g_end {
+        let b = gi as f64 * grid;
+        let y = to_y(b) as f32;
+        let is_whole = (b.round() - b).abs() < 0.001;
+        let is_half = !is_whole && ((b * 2.0).round() - b * 2.0).abs() < 0.001;
         let mut lp = tiny_skia::Paint::default();
-        lp.set_color_rgba8(60, 60, 70, 90);
+        let a = if is_whole { 100 } else if is_half { 70 } else { 40 };
+        lp.set_color_rgba8(60, 60, 70, a);
         for ci in 0..n_cols {
             let cx = px + 4.0 * s + ci as f32 * (col_w + col_g);
-            if let Some(r) = tiny_skia::Rect::from_xywh(cx, y, col_w, 1.0) {
+            let h = if is_whole { 2.0 } else { 1.0 };
+            if let Some(r) = tiny_skia::Rect::from_xywh(cx, y, col_w, h) {
                 pixmap.fill_rect(r, &lp, tiny_skia::Transform::default(), None);
             }
         }
@@ -623,7 +668,7 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
     let pad_x = 12.0 * s;
     let play_w = nt_w - pad_x * 2.0;
     let py = head_h + 4.0 * s;
-    let ph = (vh - 50.0 * s - py) as f64;
+    let ph = (vh - 56.0 * s - py) as f64;
     if ph <= 0.0 { return; }
 
     let (scroll, zoom) = (scroll as f64, zoom as f64);
@@ -647,11 +692,17 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
         pixmap.fill_rect(r, &hp, tiny_skia::Transform::default(), None);
     }
 
-    // Beat lines
-    for b in ((min_b.ceil() as i32).max(0))..=(max_b.floor() as i32) {
-        let y = to_y(b as f64) as f32;
+    // Grid lines at snap divisions
+    let grid = (info.snap as f64).max(0.125);
+    let g_start = (min_b / grid).ceil() as i32;
+    let g_end = (max_b / grid).floor() as i32;
+    for gi in g_start..=g_end {
+        let b = gi as f64 * grid;
+        let y = to_y(b) as f32;
+        let is_whole = (b.round() - b).abs() < 0.001;
+        let a = if is_whole { 90 } else { 50 };
         let mut lp = tiny_skia::Paint::default();
-        lp.set_color_rgba8(60, 60, 70, 70);
+        lp.set_color_rgba8(60, 60, 70, a);
         if let Some(r) = tiny_skia::Rect::from_xywh(px + pad_x, y, play_w, 1.0) {
             pixmap.fill_rect(r, &lp, tiny_skia::Transform::default(), None);
         }
@@ -725,8 +776,9 @@ pub fn draw_panel_def(pixmap: &mut tiny_skia::PixmapMut, def: &panels::PanelDef,
         pixmap.fill_rect(r, &hp, tiny_skia::Transform::default(), None);
     }
 
-    // Header text
-    draw_text_on_pixmap(pixmap, &def.name, px + 6.0 * s, 16.0 * s, 12.0 * s, font);
+    if let Some(font) = &font {
+        draw_text_on_pixmap(pixmap, &def.name, px + 6.0 * s, 16.0 * s, 12.0 * s, font);
+    }
 
     let cell_h = 22.0 * s;
     let mut y = 28.0 * s;
@@ -760,11 +812,11 @@ pub fn draw_panel_def(pixmap: &mut tiny_skia::PixmapMut, def: &panels::PanelDef,
         if let Some(r) = tiny_skia::Rect::from_xywh(px, y, pan_w, row_h) {
             pixmap.fill_rect(r, &lp, tiny_skia::Transform::default(), None);
         }
-        // Label text
-        draw_text_on_pixmap(pixmap, label, px + 8.0 * s, y + cell_h * 0.5, 10.0 * s, font);
-        // Value text
-        let vx = px + pan_w * 0.5 + 4.0 * s;
-        draw_text_on_pixmap(pixmap, val, vx, y + cell_h * 0.5, 10.0 * s, font);
+        if let Some(font) = &font {
+            draw_text_on_pixmap(pixmap, label, px + 8.0 * s, y + cell_h * 0.5, 10.0 * s, font);
+            let vx = px + pan_w * 0.5 + 4.0 * s;
+            draw_text_on_pixmap(pixmap, val, vx, y + cell_h * 0.5, 10.0 * s, font);
+        }
         y += row_h;
     }
 }
@@ -799,7 +851,7 @@ fn draw_text_on_pixmap(pixmap: &mut tiny_skia::PixmapMut, text: &str, x: f32, y:
 fn draw_quick_panel(pixmap: &mut tiny_skia::PixmapMut, tool_hover: Option<usize>, selected_tool: usize, hp: [f32; 3], info: &GameInfo, qp_w: f32, vw: f32, vh: f32, s: f32) {
     if !info.show_overlay { return; }
     if vh < 10.0 || vw < 10.0 { return; }
-    let font = get_font();
+    let font = get_font().as_ref();
     let bar_h = 48.0 * s;
     let max_hp = hp.iter().cloned().reduce(f32::max).unwrap_or(0.0);
     let bg_extra = max_hp * 100.0 * s;
@@ -835,11 +887,13 @@ fn draw_quick_panel(pixmap: &mut tiny_skia::PixmapMut, tool_hover: Option<usize>
             pixmap.fill_rect(rect, &bp, tiny_skia::Transform::default(), None);
         }
 
-        // Label text on button when hovered
+        // Label text on button when hovered (skip if no font)
         if p > 0.3 {
-            let lx = bx + 6.0 * s;
-            let ly = y + btn_base * 0.5 + 4.0 * s;
-            draw_text_on_pixmap(pixmap, name, lx, ly, 11.0 * s, font);
+            if let Some(font) = font {
+                let lx = bx + 6.0 * s;
+                let ly = y + btn_base * 0.5 + 4.0 * s;
+                draw_text_on_pixmap(pixmap, name, lx, ly, 11.0 * s, font);
+            }
         }
     }
 }
@@ -887,6 +941,7 @@ pub fn gameinfo_values(info: &GameInfo) -> std::collections::HashMap<&str, Strin
     m.insert("duration", format!("{:.2}s", info.duration));
     m.insert("gui_scale", format!("{:.1}", info.gui_scale));
     m.insert("show_overlay", if info.show_overlay { "ON" } else { "OFF" }.to_string());
+    m.insert("snap", format!("{}", info.snap));
     m
 }
 
@@ -903,6 +958,7 @@ pub struct GameInfo {
     pub selected_layer: usize, pub max_layers: usize, pub events: Vec<EventEntry>,
     pub notes: Vec<NoteEntry>,
     pub gui_scale: f32,
+    pub snap: f32,
     pub selected_tool: usize,
 }
 
@@ -941,13 +997,19 @@ fn build_ui<'a>(info: &'a GameInfo, panel: f32) -> Element<'a, (), Theme, Render
         .push(old_props)
     ).width(props_w).height(Length::Fill).into();
 
-    let show_ev = container(text("Show Event").size(iced::Pixels(13.0 * s))).padding([6.0 * s, 14.0 * s])
-        .style(|_: &Theme| container::Style::default().background(iced::Color::from_rgba(0.25, 0.25, 0.28, 0.85)));
-    let show_nt = container(text("Show Notes").size(iced::Pixels(13.0 * s))).padding([6.0 * s, 14.0 * s])
-        .style(|_: &Theme| container::Style::default().background(iced::Color::from_rgba(0.25, 0.25, 0.28, 0.85)));
+    fn btn(label: &str, s: f32) -> Element<'static, (), Theme, Renderer> {
+        container(text(label.to_owned()).size(iced::Pixels(13.0 * s))).padding([6.0 * s, 14.0 * s])
+            .style(|_: &Theme| container::Style::default().background(iced::Color::from_rgba(0.25, 0.25, 0.28, 0.85))).into()
+    }
     let bar: Element<'_, (), Theme, Renderer> = container(
-        iced::widget::Row::new().push(show_ev).push(show_nt).spacing(8.0 * s),
-    ).padding([6.0 * s, 10.0 * s])
+        iced::widget::Row::new()
+            .push(iced::widget::Row::new().width(Length::Fill))
+            .push(btn("Events", s))
+            .push(btn("Notes", s))
+            .push(btn("Menu", s))
+            .spacing(6.0 * s)
+            .padding([0.0, 10.0 * s]),
+    ).height(48.0 * s).width(Length::Fill)
         .style(|_: &Theme| container::Style::default().background(iced::Color::from_rgba(0.15, 0.15, 0.17, 0.88)))
         .into();
 

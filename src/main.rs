@@ -23,6 +23,7 @@ struct App {
     splash_hover: Option<usize>,
 }
 
+// ── Core state ──
 struct State {
     window: Arc<Window>,
     chart_dir: PathBuf,
@@ -32,31 +33,42 @@ struct State {
     chart: core::chart::Chart,
     info: core::model::ChartInfo,
     audio: Option<audio::AudioHandle>,
+
+    // ── Playback ──
     started: Instant,
     fps_since: Instant,
+    fps: f64,
+    frame_latency: f64,
+    pending_seek: Option<f64>,
+    scroll_target: Option<f64>,
+    chart_time_last: f64,
     aspect_idx: usize,
+    combo: u32,
+    hits: u32,
+    note_count: usize,
+    seek_dim_until: Instant,
+    focused: bool,
+    ctrl: bool,
+
+    // ── UI state ──
     show_overlay: bool,
     show_properties: bool,
     show_events: bool,
     show_notes: bool,
     full_notes: bool,
-    overlay_last_render: Instant,
-    combo: u32,
-    hits: u32,
-    note_count: usize,
-    seek_dim_until: Instant,
-    fps: f64,
-    frame_latency: f64,
-    selected_line: usize,
-    selected_event_idx: Option<usize>,
-    selected_layer: usize,
-    scroll_target: Option<f64>,
-    pending_seek: Option<f64>, // if set, use this instead of audio.time() next frame
-    focused: bool,
-    ctrl: bool,
     gui_scale: f32,
-    ui_dirty: bool, // forces iced widget tree rebuild
+    snap: f32, // snap interval in beats: 0.25, 0.5, 1.0
+    ui_dirty: bool,
+    overlay_last_render: Instant,
+
+    // ── Selection ──
+    selected_line: usize,
+    selected_layer: usize,
+    selected_event_idx: Option<usize>,
+
+    // ── Layout / panels ──
     layout: LayoutDef,
+    splash_names: Vec<String>,
 }
 
 impl State {
@@ -64,6 +76,22 @@ impl State {
 }
 
 impl App {
+    fn init_splash(&self, event_loop: &ActiveEventLoop, names: Vec<String>) -> Option<State> {
+        let window = Arc::new(event_loop.create_window(
+            WindowAttributes::default().with_title("phimakor").with_inner_size(LogicalSize::new(800.0, 600.0)),
+        ).ok()?);
+        let renderer = pollster::block_on(render::Renderer::new(window.clone())).ok()?;
+        let overlay = ui::IcedOverlay::new(renderer.device(), renderer.tex_bgl(), renderer.sampler(), 800, 600);
+        let tmp = std::env::temp_dir().join("phimakor-splash");
+        let _ = std::fs::create_dir_all(&tmp);
+        std::fs::write(tmp.join("info.json"), r#"{"chart":"chart.json","name":"splash"}"#).ok();
+        std::fs::write(tmp.join("chart.json"), r#"{"META":{"offset":0},"BPMList":[{"bpm":120,"startTime":[0,0,1]}],"judgeLineList":[]}"#).ok();
+        let doc = ChartDocument::open(&tmp).ok()?;
+        let chart = core::chart::Chart::from_rpe_chart(doc.chart(), false).ok()?;
+        let info = doc.info().clone();
+        Some(State { window, chart_dir: PathBuf::new(), renderer, overlay, doc, chart, info, audio: None, started: Instant::now(), fps_since: Instant::now(), aspect_idx: 0, show_overlay: true, show_properties: false, show_events: false, show_notes: false, full_notes: false, overlay_last_render: Instant::now(), combo: 0, hits: 0, note_count: 0, seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016, selected_line: 0, selected_event_idx: None, scroll_target: None, pending_seek: None, chart_time_last: 0.0, focused: true, ctrl: false, gui_scale: 1.0, snap: 0.25, selected_layer: 0, layout: LayoutDef { panels: vec![] }, ui_dirty: true, splash_names: names })
+    }
+
     fn init(&self, event_loop: &ActiveEventLoop) -> anyhow::Result<State> {
         let dir = self.dir.as_ref().expect("chart dir set");
         let window = Arc::new(event_loop.create_window(
@@ -110,24 +138,29 @@ impl App {
 
         let audio = audio::spawn_audio_thread(res_dir.as_path(), dir).ok();
         let note_count = chart.max_combo();
-        let layout = LayoutDef::load(&res_dir.join("panels.json")).unwrap_or(LayoutDef { panels: vec![] });
+        let layout = LayoutDef::load(&res_dir.join("panels.json"))
+            .or_else(|_| LayoutDef::load(&PathBuf::from("res.dis/panels.json")))
+            .unwrap_or(LayoutDef { panels: vec![] });
         let mut overlay = ui::IcedOverlay::new(renderer.device(), renderer.tex_bgl(), renderer.sampler(), 1200, 800);
         overlay.set_panels(layout.panels.clone());
-        Ok(State { window, chart_dir: dir.to_path_buf(), renderer, overlay, doc, chart, info, audio, started: Instant::now(), fps_since: Instant::now(), aspect_idx: 0, show_overlay: true, show_properties: false, show_events: false, show_notes: false, full_notes: false, overlay_last_render: Instant::now(), combo: 0, hits: 0, note_count, seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016, selected_line: 0, selected_event_idx: None, scroll_target: None, pending_seek: None, focused: true, ctrl: false, gui_scale: 1.0, selected_layer: 0, layout, ui_dirty: true })
+        Ok(State { window, chart_dir: dir.to_path_buf(), renderer, overlay, doc, chart, info, audio, started: Instant::now(), fps_since: Instant::now(), aspect_idx: 0, show_overlay: true, show_properties: false, show_events: false, show_notes: false, full_notes: false, overlay_last_render: Instant::now(), combo: 0, hits: 0, note_count, seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016, selected_line: 0, selected_event_idx: None, scroll_target: None, pending_seek: None, chart_time_last: 0.0, focused: true, ctrl: false, gui_scale: 1.0, snap: 0.25, selected_layer: 0, layout, ui_dirty: true, splash_names: vec![] })
     }
 
     /// Rebuild the render Chart from the current document state (after edits).
     fn rebuild_chart(&mut self) {
         if let Some(state) = &mut self.state {
-            if let Ok(c) = core::chart::Chart::from_rpe_chart(state.doc.chart(), state.info.use_rpe_170_speed == Some(true)) {
-                state.chart = c;
-                state.note_count = state.chart.max_combo();
-            }
+            state.rebuild_chart();
         }
     }
 }
 
 impl State {
+    fn rebuild_chart(&mut self) {
+        if let Ok(c) = core::chart::Chart::from_rpe_chart(self.doc.chart(), self.info.use_rpe_170_speed == Some(true)) {
+            self.chart = c;
+            self.note_count = self.chart.max_combo();
+        }
+    }
     fn seek(&mut self, t: f64) {
         let t = t.clamp(0.0, self.chart.duration());
         if let Some(a) = &self.audio { a.seek(t); }
@@ -141,6 +174,21 @@ impl State {
 
     fn render_frame(&mut self) {
         if !self.focused { return; }
+        // Splash mode
+        if !self.splash_names.is_empty() {
+            self.overlay.render_splash(self.renderer.queue(), &self.splash_names, Some(0));
+            let ui_bg = Some(self.overlay.bind_group());
+            match self.renderer.surface_acquire() {
+                Ok(st) => {
+                    let aspect = st.texture.width() as f32 / st.texture.height().max(1) as f32;
+                    let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                    self.renderer.draw_to_view(&view, &core::chart::FrameState { time: 0., lines: vec![], fired: vec![] }, aspect, 1.0, ui_bg);
+                    self.renderer.queue().present(st);
+                }
+                _ => {}
+            }
+            return;
+        }
         // Feed pending seek into scroll target for smooth animation
         if let Some(t) = self.pending_seek.take() {
             self.scroll_target = Some(t);
@@ -150,18 +198,24 @@ impl State {
             None => self.started.elapsed().as_secs_f64(),
         };
         let audio_time = if let Some(target) = self.scroll_target {
-            let d = target - audio_time;
-            if d.abs() < 0.008 { self.scroll_target = None; target }
-            else {
-                let step = d.signum() * (d.abs() * 0.12 + 0.004).min(d.abs().max(0.004));
-                let t = (audio_time + step).clamp(0.0, self.chart.duration());
-                self.seek(t); t
+            if self.overlay.seek_dragging {
+                self.scroll_target = None;
+                target
+            } else {
+                let d = target - audio_time;
+                if d.abs() < 0.008 { self.scroll_target = None; target }
+                else {
+                    let step = d.signum() * (d.abs() * 0.12 + 0.004).min(d.abs().max(0.004));
+                    let t = (audio_time + step).clamp(0.0, self.chart.duration());
+                    self.seek(t); t
+                }
             }
         } else { audio_time };
 
         let predict = self.frame_latency.min(0.05);
         let off = (self.chart.offset() + self.info.offset) as f64;
         let chart_time = (audio_time + predict - off).max(0.0);
+        self.chart_time_last = chart_time;
         let duration = self.chart.duration();
         let chart_beat = self.chart.time_to_beat(chart_time);
         let line_count = self.chart.line_count();
@@ -214,6 +268,7 @@ impl State {
             events: line_events,
             notes: line_notes,
             gui_scale: self.gui_scale,
+            snap: self.snap,
             selected_tool: self.overlay.selected_tool,
             chart_beat,
             events_progress: self.overlay.render_progress().0,
@@ -303,6 +358,21 @@ fn extract_line_notes(doc: &ChartDocument, line: usize) -> Vec<ui::NoteEntry> {
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.state.is_some() { return; }
+        if self.dir.is_none() {
+            let names: Vec<String> = self.charts.iter().map(|(n,_)| n.clone()).collect();
+            if !names.is_empty() {
+                if let Some(s) = self.init_splash(event_loop, names) {
+                    self.state = Some(s);
+                } else {
+                    eprintln!("splash init failed, use CLI: phimakor <chart-dir>");
+                    event_loop.exit();
+                }
+            } else {
+                eprintln!("no charts found in current directory");
+                event_loop.exit();
+            }
+            return;
+        }
         match self.init(event_loop) {
             Ok(s) => self.state = Some(s),
             Err(e) => { eprintln!("{e:#}"); event_loop.exit(); }
@@ -357,6 +427,31 @@ impl ApplicationHandler for App {
                         KeyCode::F5 => { if state.ctrl { state.full_notes = !state.full_notes; } else { state.show_notes = !state.show_notes; } state.ui_dirty = true; }
                         KeyCode::BracketLeft => { state.gui_scale = (state.gui_scale - 0.1).max(0.5); state.ui_dirty = true; }
                         KeyCode::BracketRight => { state.gui_scale = (state.gui_scale + 0.1).min(2.0); state.ui_dirty = true; }
+                        KeyCode::Digit1 => { state.snap = 1.0; state.ui_dirty = true; }
+                        KeyCode::Digit2 => { state.snap = 0.5; state.ui_dirty = true; }
+                        KeyCode::Digit3 => { state.snap = 0.25; state.ui_dirty = true; }
+                        KeyCode::Digit4 => { state.snap = 0.125; state.ui_dirty = true; }
+                        // Note placement (RPE convention)
+                        KeyCode::KeyQ | KeyCode::KeyW | KeyCode::KeyE | KeyCode::KeyR => {
+                            let kind: u8 = match code { KeyCode::KeyQ => 1, KeyCode::KeyW => 4, KeyCode::KeyE => 2, KeyCode::KeyR => 3, _ => 1 };
+                            use core::model::RPENote;
+                            let raw = state.overlay.mouse_beat;
+                            let snap = state.snap as f64;
+                            let beats = (raw / snap).round() * snap; // snap to grid
+                            let note = RPENote {
+                                kind, above: 1, start_time: core::bpm::Triple::from_beats(beats),
+                                end_time: core::bpm::Triple::from_beats(beats + if kind == 2 { 1.0 } else { 0.0 }),
+                                position_x: 0., y_offset: 0., alpha: 255, hitsound: None,
+                                size: 1.0, speed: 1.0, is_fake: 0, visible_time: 999999.,
+                                tint: None, tint_hit_effects: None, judge_area: None,
+                            };
+                            if let Err(e) = state.doc.add_note(state.selected_line, note) {
+                                eprintln!("add note: {e}");
+                            } else {
+                                state.rebuild_chart();
+                                state.ui_dirty = true;
+                            }
+                        }
                         _ => {}
                         }
                     },
@@ -412,6 +507,7 @@ impl ApplicationHandler for App {
                             if ly == 666 { state.show_notes = !state.show_notes; state.ui_dirty = true; }
                             else { state.selected_layer = ly; state.ui_dirty = true; }
                         }
+                        ui::OverlayMessage::ToggleMenu => { eprintln!("menu"); state.ui_dirty = true; }
                     }
                 }
             }
