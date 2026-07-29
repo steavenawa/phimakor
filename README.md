@@ -1,6 +1,6 @@
 # phimakor
 
-把部分主要逻辑根据另一个完全剥离重写,渲染代码后端换成了wgpu，暂时还属于谱面预览播放器。
+把部分主要逻辑根据另一个性能架构完全剥离重写,渲染代码后端换成了wgpu，暂时还属于谱面预览播放器。
 部分代码启发或衍生自 [TeamFlos/phira](https://github.com/TeamFlos/phira)（GPL-3.0，详见 [ThankList.md](ThankList.md)）。
 
 ## 运行
