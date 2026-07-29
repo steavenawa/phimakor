@@ -434,8 +434,8 @@ impl IcedOverlay {
             if info.show_overlay {
                 let sb_h = 16.0 * s;
                 let sb_y = vh - 50.0 * s;
-                let sb_x = qp_w + 2.0 * s;
-                let sb_w = (props_x - sb_x - 2.0 * s).max(20.0);
+                let sb_x = qp_w;
+                let sb_w = (props_x - sb_x).max(20.0);
                 let mut sbg = tiny_skia::Paint::default();
                 sbg.set_color_rgba8(40, 45, 55, 200);
                 if let Some(r) = tiny_skia::Rect::from_xywh(sb_x, sb_y, sb_w, sb_h) {
@@ -514,7 +514,7 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
     let head_h = HEADER_H * s;
 
     let py = head_h + 4.0 * s;
-    let ph = (vh - 48.0 * s - py) as f64;
+    let ph = (vh - 50.0 * s - py) as f64;
     if ph <= 0.0 { return; }
 
     let (scroll, zoom) = (scroll as f64, zoom as f64);
@@ -623,7 +623,7 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
     let pad_x = 12.0 * s;
     let play_w = nt_w - pad_x * 2.0;
     let py = head_h + 4.0 * s;
-    let ph = (vh - 48.0 * s - py) as f64;
+    let ph = (vh - 50.0 * s - py) as f64;
     if ph <= 0.0 { return; }
 
     let (scroll, zoom) = (scroll as f64, zoom as f64);
