@@ -17,7 +17,9 @@ image = "*"
 bytemuck = { version = "*", features = ["derive"] }
 fontdue = "*"
 softbuffer = "*"
-iced = { version = "*", default-features = false, features = ["tiny-skia", "advanced", "image", "smol"] }
+iced = { version = "*", features = ["tiny-skia", "advanced", "image"] }
+iced_tiny_skia = "*"
+tiny-skia = "*"
 
 [profile.release]
 lto = "thin"

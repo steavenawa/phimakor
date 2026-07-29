@@ -1,10 +1,7 @@
-//! phimakor M0 preview: play an RPE chart with audio.
-//! Single window, minimal HUD overlay via the existing text/quad pipeline.
-
-use phimakor::{audio, core, render};
-
-#[cfg(not(target_os = "android"))]
-mod debug;
+mod audio;
+mod core;
+mod render;
+mod ui;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +23,7 @@ struct App {
 struct State {
     window: Arc<Window>,
     renderer: render::Renderer,
+    overlay: ui::IcedOverlay,
     chart: core::chart::Chart,
     info: core::model::ChartInfo,
     audio: Option<audio::AudioHandle>,
@@ -33,14 +31,14 @@ struct State {
     fps_frames: u32,
     fps_since: Instant,
     aspect_idx: usize,
+    show_overlay: bool,
+    overlay_last_render: Instant,
     fps_tx: std::sync::mpsc::SyncSender<f64>,
     combo: u32,
     hits: u32,
     note_count: usize,
     seek_dim_until: Instant,
     fps: f64,
-    #[cfg(not(target_os = "android"))]
-    debug: Option<debug::DebugWindow>,
 }
 
 impl App {
@@ -54,149 +52,109 @@ impl App {
         let (info, chart) = core::chart::Chart::load(&self.dir)?;
 
         for name in chart.textures() {
-            match std::fs::read(self.dir.join(&name)) {
-                Ok(bytes) => {
-                    if let Err(e) = renderer.load_texture(&name, &bytes) {
-                        eprintln!("warning: failed to upload texture {name}: {e:#}");
-                    }
+            if let Ok(bytes) = std::fs::read(self.dir.join(&name)) {
+                if let Err(e) = renderer.load_texture(&name, &bytes) {
+                    eprintln!("warning: texture {name}: {e:#}");
                 }
-                Err(e) => eprintln!("warning: cannot read texture {name}: {e}"),
             }
         }
 
         let res_dir = PathBuf::from("res");
-        if let Ok(font) = std::fs::read(res_dir.join("Exo2.ttf")) {
-            if !renderer.set_font(font) {
-                eprintln!("warning: Exo2.ttf is not a usable font, system fallback");
-            }
-        }
-        for kind in ["click", "drag", "flick", "hold", "click_mh", "drag_mh", "flick_mh", "hold_mh"] {
+        for kind in ["click", "drag", "flick", "hold", "click_mh", "drag_mh", "flick_mh", "hold_mh", "hit_fx"] {
             let path = res_dir.join(format!("{kind}.png"));
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    if let Err(e) = renderer.load_texture(&format!("note:{kind}"), &bytes) {
-                        eprintln!("warning: failed to upload note sprite {kind}: {e:#}");
-                    }
-                }
-                Err(_) => eprintln!("warning: no note sprite {:?}, colored quad fallback", path),
-            }
-        }
-        let path = res_dir.join("hit_fx.png");
-        match std::fs::read(&path) {
-            Ok(bytes) => {
-                if let Err(e) = renderer.load_texture("note:hitfx", &bytes) {
-                    eprintln!("warning: failed to upload hit fx sprite: {e:#}");
+            let key = if kind == "hit_fx" { "note:hitfx".to_string() } else { format!("note:{kind}") };
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Err(e) = renderer.load_texture(&key, &bytes) {
+                    eprintln!("warning: note sprite {kind}: {e:#}");
                 }
             }
-            Err(_) => eprintln!("warning: no hit fx sprite {:?}, colored quad fallback", path),
+        }
+        if let Ok(bytes) = std::fs::read(self.dir.join(&info.illustration)) {
+            if let Err(e) = renderer.set_background(&bytes, info.background_dim) {
+                eprintln!("warning: bg: {e:#}");
+            }
         }
 
-        match std::fs::read(self.dir.join(&info.illustration)) {
-            Ok(bytes) => {
-                if let Err(e) = renderer.set_background(&bytes, info.background_dim) {
-                    eprintln!("warning: failed to set background: {e:#}");
-                }
-            }
-            Err(e) => eprintln!("warning: cannot read illustration {:?}: {e}", info.illustration),
-        }
-
-        let audio = match audio::spawn_audio_thread(res_dir.as_path(), &self.dir) {
-            Ok(a) => Some(a),
-            Err(e) => {
-                eprintln!("WARNING: cannot play music {:?}: {e:#} — preview runs SILENT", info.music);
-                None
-            }
-        };
-
+        let audio = audio::spawn_audio_thread(res_dir.as_path(), &self.dir).ok();
         let note_count = chart.max_combo();
-        #[cfg(not(target_os = "android"))]
-        let debug = debug::DebugWindow::new(event_loop);
-        Ok(State { window, renderer, chart, info, audio, started: Instant::now(), fps_frames: 0, fps_since: Instant::now(), aspect_idx: 0, fps_tx: self.fps_tx.clone(), combo: 0, hits: 0, note_count, seek_dim_until: Instant::now(), fps: 0.0, debug })
+        let overlay = ui::IcedOverlay::new(renderer.device(), renderer.tex_bgl(), renderer.sampler(), 1200, 800);
+
+        Ok(State { window, renderer, overlay, chart, info, audio, started: Instant::now(), fps_frames: 0, fps_since: Instant::now(), aspect_idx: 0, show_overlay: false, overlay_last_render: Instant::now(), fps_tx: self.fps_tx.clone(), combo: 0, hits: 0, note_count, seek_dim_until: Instant::now(), fps: 0.0 })
     }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.state.is_some() {
-            return;
-        }
+        if self.state.is_some() { return; }
         match self.init(event_loop) {
-            Ok(state) => self.state = Some(state),
-            Err(e) => {
-                eprintln!("failed to start: {e:#}");
-                event_loop.exit();
-            }
+            Ok(s) => self.state = Some(s),
+            Err(e) => { eprintln!("{e:#}"); event_loop.exit(); }
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         let Some(state) = self.state.as_mut() else { return };
-        if id != state.window.id() {
-            // Debug window: swallow everything (incl. CloseRequested).
-            return;
-        }
-
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => state.renderer.resize(size.width, size.height),
+            WindowEvent::Resized(s) => {
+                state.renderer.resize(s.width, s.height);
+                state.overlay.resize(
+                    state.renderer.device(),
+                    state.renderer.tex_bgl(),
+                    state.renderer.sampler(),
+                    s.width,
+                    s.height,
+                );
+            }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
                 let PhysicalKey::Code(code) = event.physical_key else { return };
                 match code {
                     KeyCode::Escape => event_loop.exit(),
-                    KeyCode::Space => {
-                        if let Some(audio) = &state.audio {
-                            audio.set_paused(!audio.is_paused());
-                        }
-                    }
+                    KeyCode::Space => { if let Some(a) = &state.audio { a.set_paused(!a.is_paused()); } }
                     KeyCode::ArrowLeft | KeyCode::ArrowRight => {
-                        if let Some(audio) = &state.audio {
-                            let delta = if code == KeyCode::ArrowLeft { -5.0 } else { 5.0 };
-                            let new_audio = (audio.time() + delta).max(0.0);
-                            audio.seek(new_audio);
-                            let total_offset = (state.chart.offset() + state.info.offset) as f64;
-                            let new_chart_time = (new_audio - total_offset).max(0.0);
-                            let hits = state.chart.hits_before(new_chart_time) as u32;
-                            state.hits = hits;
-                            state.combo = hits;
+                        if let Some(a) = &state.audio {
+                            let d = if code == KeyCode::ArrowLeft { -5.0 } else { 5.0 };
+                            let t = (a.time() + d).max(0.0); a.seek(t);
+                            let off = (state.chart.offset() + state.info.offset) as f64;
+                            let ct = (t - off).max(0.0);
+                            let h = state.chart.hits_before(ct) as u32;
+                            state.hits = h; state.combo = h;
                             state.seek_dim_until = Instant::now() + Duration::from_millis(400);
                         }
                     }
                     KeyCode::Tab => {
                         const ASPECTS: [f32; 4] = [3.0 / 2.0, 16.0 / 9.0, 4.0 / 3.0, 1.0];
                         state.aspect_idx = (state.aspect_idx + 1) % ASPECTS.len();
-                        let a = ASPECTS[state.aspect_idx];
-                        state.renderer.set_playfield_aspect(a);
-                        eprintln!("playfield aspect: {a:.4}");
+                        state.renderer.set_playfield_aspect(ASPECTS[state.aspect_idx]);
+                    }
+                    KeyCode::F3 => {
+                        state.show_overlay = !state.show_overlay;
                     }
                     _ => {}
                 }
             }
             WindowEvent::RedrawRequested => {
                 let audio_time = match &state.audio {
-                    Some(audio) => audio.time(),
+                    Some(a) => a.time(),
                     None => state.started.elapsed().as_secs_f64(),
                 };
-                let total_offset = (state.chart.offset() + state.info.offset) as f64;
-                let chart_time = (audio_time - total_offset).max(0.0);
+                let off = (state.chart.offset() + state.info.offset) as f64;
+                let chart_time = (audio_time - off).max(0.0);
                 let duration = state.chart.duration();
                 let frame = state.chart.state_at(chart_time);
 
                 for fired in &frame.fired {
                     let line = &frame.lines[fired.line];
-                    let theta = line.rotation;
+                    let t = line.rotation;
                     let x = fired.x as f32;
-                    let cx = (line.position[0] + theta.cos() * x) * 675.0;
-                    let cy = (line.position[1] + theta.sin() * x) * 450.0;
-                    if fired.hold_tail {
-                        if !fired.fake { state.combo += 1; state.hits += 1; }
-                        continue;
-                    }
+                    let cx = (line.position[0] + t.cos() * x) * 675.0;
+                    let cy = (line.position[1] + t.sin() * x) * 450.0;
+                    if fired.hold_tail { if !fired.fake { state.combo += 1; state.hits += 1; } continue; }
                     if fired.tick { state.renderer.spawn_hit_fx([cx, cy]); continue; }
                     if fired.fake { continue; }
-                    state.combo += 1;
-                    state.hits += 1;
+                    state.combo += 1; state.hits += 1;
                     state.renderer.spawn_hit_fx([cx, cy]);
                 }
 
@@ -204,39 +162,36 @@ impl ApplicationHandler for App {
                 let aspect = size.width as f32 / size.height.max(1) as f32;
                 let dim = if Instant::now() < state.seek_dim_until { 0.7 } else { 1.0 };
                 let score = (state.hits as f64 / state.note_count.max(1) as f64 * 1_000_000.).round() as u32;
+                let visible_notes: usize = frame.lines.iter().map(|l| l.notes.len()).sum();
 
-                // HUD via the existing draw_text pipeline
-                const C: [f32; 4] = [1.0, 1.0, 1.0, 0.85];
-                state.renderer.draw_text(&format!("{score:07}"), render::TextAnchor::TopLeft, C);
-                if state.combo >= 3 {
-                    state.renderer.draw_text(&state.combo.to_string(), render::TextAnchor::TopCenter, C);
-                    state.renderer.draw_text("combo", render::TextAnchor::ComboLabel, C);
-                }
-                state.renderer.draw_text(&state.fps.to_string(), render::TextAnchor::BottomLeftEdge, C);
+                // Build Iced UI overlay
+                let info = ui::GameInfo {
+                    chart_time, audio_time, fps: state.fps, combo: state.combo,
+                    hits: state.hits, note_count: state.note_count, score,
+                    lines: frame.lines.len(), visible_notes,
+                    paused: state.audio.as_ref().is_some_and(|a| a.is_paused()),
+                    dim,
+                };
+                // Rebuild the overlay at ~10 Hz (debug text needs no more);
+                // between updates the previous texture is reused as-is.
+                let ui_bg = if state.show_overlay {
+                    if state.overlay_last_render.elapsed().as_millis() >= 100 {
+                        state.overlay.render(state.renderer.queue(), &info);
+                        state.overlay_last_render = Instant::now();
+                    }
+                    Some(state.overlay.bind_group())
+                } else {
+                    None
+                };
 
                 state.renderer.set_progress(audio_time as f32 / duration as f32);
-
-                if let Err(e) = state.renderer.render(frame, aspect, dim) {
-                    eprintln!("render error: {e:?}");
-                }
-
-                #[cfg(not(target_os = "android"))]
-                if let Some(dbg) = &mut state.debug {
-                    let visible_notes = frame.lines.iter().map(|l| l.notes.len()).sum();
-                    dbg.update(&debug::DebugInfo {
-                        chart_time,
-                        audio_time,
-                        fps: state.fps,
-                        combo: state.combo,
-                        hits: state.hits,
-                        note_count: state.note_count,
-                        lines: frame.lines.len(),
-                        visible_notes,
-                        fired: frame.fired.len(),
-                        paused: state.audio.as_ref().is_some_and(|a| a.is_paused()),
-                        dim,
-                        window_size: (size.width, size.height),
-                    });
+                match state.renderer.surface_acquire() {
+                    Ok(st) => {
+                        let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        state.renderer.draw_to_view(&view, frame, aspect, dim, ui_bg);
+                        state.renderer.queue().present(st);
+                    }
+                    _ => {}
                 }
 
                 state.fps_frames += 1;
@@ -252,39 +207,21 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
-            state.window.request_redraw();
-            #[cfg(not(target_os = "android"))]
-            if let Some(dbg) = &state.debug {
-                dbg.request_redraw();
-            }
-        }
+    fn about_to_wait(&mut self, _: &ActiveEventLoop) {
+        if let Some(s) = &self.state { s.window.request_redraw(); }
     }
 
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(state) = &self.state {
-            if let Some(audio) = &state.audio {
-                audio.quit();
-            }
-        }
+    fn exiting(&mut self, _: &ActiveEventLoop) {
+        if let Some(s) = &self.state { if let Some(a) = &s.audio { a.quit(); } }
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    let (fps_tx, fps_rx) = std::sync::mpsc::sync_channel::<f64>(4);
-    std::thread::spawn(move || {
-        while let Ok(fps) = fps_rx.recv() {
-            eprintln!("fps: {fps:.1}");
-        }
-    });
-    let Some(dir) = std::env::args_os().nth(1) else {
-        eprintln!("usage: phimakor <chart-dir>");
-        std::process::exit(2);
-    };
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App { dir: PathBuf::from(dir), state: None, fps_tx };
-    event_loop.run_app(&mut app)?;
+    let (fps_tx, fps_rx) = std::sync::mpsc::sync_channel(4);
+    std::thread::spawn(move || { while let Ok(f) = fps_rx.recv() { eprintln!("fps: {f:.1}"); } });
+    let Some(dir) = std::env::args_os().nth(1) else { eprintln!("usage: phimakor <chart-dir>"); std::process::exit(2); };
+    let el = EventLoop::new()?;
+    el.set_control_flow(ControlFlow::Poll);
+    el.run_app(&mut App { dir: PathBuf::from(dir), state: None, fps_tx })?;
     Ok(())
 }

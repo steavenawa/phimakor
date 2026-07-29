@@ -81,7 +81,7 @@ impl PreviewEngine {
     /// Returns pixel bytes (len = w*h*4, row padding already removed).
     pub fn render_frame(&mut self, frame: &FrameState, window_aspect: f32, dim: f32) -> &[u8] {
         let view = self.target.create_view(&wgpu::TextureViewDescriptor::default());
-        self.renderer.draw_to_view(&view, frame, window_aspect, dim);
+        self.renderer.draw_to_view(&view, frame, window_aspect, dim, None);
 
         let mut encoder = self
             .renderer

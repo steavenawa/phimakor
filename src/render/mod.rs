@@ -272,6 +272,8 @@ pub struct Renderer {
 impl Renderer {
     pub fn device(&self) -> &wgpu::Device { &self.device }
     pub fn queue(&self) -> &wgpu::Queue { &self.queue }
+    pub fn tex_bgl(&self) -> &wgpu::BindGroupLayout { &self.tex_bgl }
+    pub fn sampler(&self) -> &wgpu::Sampler { &self.sampler }
 
     /// Acquire the next surface texture. Returns `Err` variants that the caller
     /// should handle (Timeout/Occluded → skip frame, Validation → propagate).
@@ -548,7 +550,7 @@ impl Renderer {
             other => return Err(other), // Validation
         };
         let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw_to_view(&view, frame, window_aspect, dim);
+        self.draw_to_view(&view, frame, window_aspect, dim, None);
         self.queue.present(st);
         Ok(())
     }
@@ -557,12 +559,15 @@ impl Renderer {
     /// (window surface view or offscreen target). Submits on the internal
     /// queue; the caller presents (window path) or copies out (preview path).
     /// `dim`: global brightness multiplied into every quad's rgb (alpha kept).
+    /// If `ui_overlay` is `Some`, a fullscreen textured quad is drawn last
+    /// (useful for compositing a CPU-rendered Iced/tiny-skia overlay).
     pub(crate) fn draw_to_view(
         &mut self,
         view: &wgpu::TextureView,
         frame: &FrameState,
         window_aspect: f32,
         dim: f32,
+        ui_overlay: Option<&wgpu::BindGroup>,
     ) {
         // RPE canvas model: world x ±1 = canvas ±675px, world y ±1 = ±450px
         // (1350×900, SQUARE canvas pixels). Letterbox the 3:2 canvas into the
@@ -885,6 +890,20 @@ impl Renderer {
                 Self::make_instance_buf(&self.device, self.instance_capacity),
             ];
         }
+        // UI overlay: just the last DrawCmd in the main pass (fullscreen NDC
+        // quad). uv flipped — CPU-rendered pixmaps are top-down row-major,
+        // our texture convention is v0 = bottom.
+        if let Some(bg) = ui_overlay {
+            cmds.push(DrawCmd {
+                uniform: DrawUniform {
+                    model: mat_scale(2.0, 2.0),
+                    color: [1.0, 1.0, 1.0, 1.0],
+                    uv_rect: [0., 1., 1., -1.],
+                },
+                tex: bg,
+            });
+        }
+
         let instances: Vec<Instance> = cmds
             .iter()
             .map(|cmd| {
@@ -896,6 +915,7 @@ impl Renderer {
                 }
             })
             .collect();
+
         if !instances.is_empty() {
             self.queue.write_buffer(
                 &self.instance_bufs[self.frame_idx],
