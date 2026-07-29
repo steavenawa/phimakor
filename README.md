@@ -2,7 +2,7 @@
 
 <p style="font-size:36px;text-align:center;">PhiMakor!("Preview" ver) 全新来袭!</p>
 
-PhiMakor 是一个 Rust + wgpu + Iced(tiny-skia) 的 Phigros 谱面编辑器。
+PhiMakor 是一个 Rust + wgpu + Iced(tiny-skia) 的 Phigros Fanmade 谱面编辑器。
 
 > 部分代码衍生自 [TeamFlos/phira](https://github.com/TeamFlos/phira)（GPL-3.0，详见 [ThankList.md](ThankList.md)）
 
