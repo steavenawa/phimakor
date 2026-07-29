@@ -42,7 +42,7 @@ const HOLD_COLOR: [f32; 3] = [0.3, 0.7, 1.0]; // kind 2
 const FLICK_COLOR: [f32; 3] = [1.0, 0.3, 0.5]; // kind 3
 const DRAG_COLOR: [f32; 3] = [1.0, 0.85, 0.2]; // kind 4
 
-const INITIAL_DRAW_CAPACITY: usize = 1024;
+const INITIAL_DRAW_CAPACITY: usize = 4096;
 
 // ---------------------------------------------------------------------------
 // 2D affine matrix, column-major, padded to WGSL uniform layout (3 × vec4).
@@ -315,8 +315,8 @@ impl Renderer {
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoNoVsync, // ponytail: unlocked for FPS benchmarking; Fifo for ship
-            desired_maximum_frame_latency: 2,
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 4,
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
         };
@@ -507,8 +507,15 @@ impl Renderer {
     }
 
     pub fn set_background(&mut self, img_bytes: &[u8], dim: f32) -> anyhow::Result<()> {
-        let (bind_group, size) = self.upload_image(img_bytes).context("background")?;
-        self.background = Some((bind_group, size));
+        // Static Gaussian blur at load time.
+        let img = image::load_from_memory(img_bytes)
+            .context("background decode")?
+            .to_rgba8();
+        let img = image::imageops::blur(&img, 8.0); // σ = 8 px, returns new image
+        let (w, h) = (img.width().max(1), img.height().max(1));
+        let texture = Self::create_texture(&self.device, &self.queue, img.as_raw(), w, h);
+        let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
+        self.background = Some((bind_group, [w as f32, h as f32]));
         self.background_dim = dim;
         Ok(())
     }
@@ -591,8 +598,8 @@ impl Renderer {
             .sum::<usize>();
         let mut cmds: Vec<DrawCmd> = Vec::with_capacity(needed);
 
-        // Background: cover-fill the visible canvas region (keep image aspect,
-        // centered, crop the overflow via uv). Dimmed.
+        // Background: cover-fill with Gaussian-blurred illustration + 30 % black
+        // overlay so judge lines / notes pop against any image.
         if let Some((bg, size)) = &self.background {
             let d = self.background_dim;
             let r = size[0] / size[1];
@@ -603,13 +610,15 @@ impl Renderer {
                 let h = r / aspect;
                 [0.0, (1.0 - h) * 0.5, 1.0, h]
             };
+            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 1350.0 / aspect));
             cmds.push(DrawCmd {
-                uniform: DrawUniform {
-                    model: mat_mul(&letterbox, &mat_scale(1350.0, 1350.0 / aspect)),
-                    color: [d, d, d, 1.0],
-                    uv_rect: uv,
-                },
+                uniform: DrawUniform { model: bg_m, color: [d, d, d, 1.0], uv_rect: uv },
                 tex: bg,
+            });
+            // 30 % black overlay
+            cmds.push(DrawCmd {
+                uniform: DrawUniform { model: bg_m, color: [0., 0., 0., 0.3], uv_rect: [0., 0., 1., 1.] },
+                tex: &self.white,
             });
         }
 
@@ -884,7 +893,9 @@ impl Renderer {
         // Convert cmds to instances (applying the global rgb dim on the CPU),
         // growing both instance buffers together when capacity falls short.
         if cmds.len() > self.instance_capacity {
-            self.instance_capacity = cmds.len().next_power_of_two();
+            // Smooth growth: 1.5× current, minimum +512. Avoids the double-
+            // capacity burst that causes visible frame spikes on D3D12.
+            self.instance_capacity = (cmds.len() as f64 * 1.5) as usize + 512;
             self.instance_bufs = [
                 Self::make_instance_buf(&self.device, self.instance_capacity),
                 Self::make_instance_buf(&self.device, self.instance_capacity),

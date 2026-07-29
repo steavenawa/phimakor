@@ -117,6 +117,7 @@ impl NoteData {
 }
 
 struct LineData {
+    name: String,
     alpha: AnimFloat,
     /// Degrees (converted to radians in `state_at`).
     rotation: AnimFloat,
@@ -527,6 +528,7 @@ fn parse_judge_line(
     };
 
     Ok(LineData {
+        name: rpe.name,
         alpha,
         rotation,
         move_x,
@@ -632,6 +634,12 @@ impl Chart {
         let chart_src = std::fs::read_to_string(dir.join(&info.chart)).with_context(|| format!("failed to read chart file {:?}", info.chart))?;
         let chart = Self::from_rpe(&chart_src, info.use_rpe_170_speed == Some(true)).with_context(|| format!("failed to parse chart file {:?}", info.chart))?;
         Ok((info, chart))
+    }
+
+    /// Build from an already-parsed `RPEChart` (editor path).
+    pub fn from_rpe_chart(rpe: &RPEChart, use_rpe_170_speed: bool) -> Result<Chart> {
+        let json = serde_json::to_string(rpe).context("rpe-re-serialize")?;
+        Self::from_rpe(&json, use_rpe_170_speed)
     }
 
     fn from_rpe(source: &str, use_rpe_170_speed: bool) -> Result<Chart> {
@@ -1000,6 +1008,17 @@ impl Chart {
             .map(|line| line.notes.iter().filter(|note| !note.fake).map(|note| 1 + (note.kind == 2) as usize).sum::<usize>())
             .sum()
     }
+
+    /// Number of judge lines.
+    pub fn line_count(&self) -> usize { self.lines.len() }
+
+    /// Convert seconds to beats at the current playback position.
+    pub fn time_to_beat(&mut self, time: f64) -> f64 {
+        self.bpm_list.beat(time)
+    }
+
+    /// Name of line `i`.
+    pub fn line_name(&self, i: usize) -> &str { &self.lines[i].name }
 
     /// Distinct non-`line.png` texture filenames used by judge lines.
     pub fn textures(&self) -> Vec<String> {

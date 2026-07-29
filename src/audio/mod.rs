@@ -60,7 +60,8 @@ impl AudioClock {
     /// are preloaded from it as hitsounds (missing files only warn).
     pub fn start(path: &Path, res_dir: Option<&Path>) -> anyhow::Result<Self> {
         // verify: 0.22 renamed OutputStreamBuilder::open_default_stream -> DeviceSinkBuilder::open_default_sink
-        let stream = rodio::DeviceSinkBuilder::open_default_sink()?;
+        let mut stream = rodio::DeviceSinkBuilder::open_default_sink()?;
+        stream.log_on_drop(false); // suppress "Dropping DeviceSink" on exit
         let player = rodio::Player::connect_new(stream.mixer());
         // Decoder::try_from(File) wraps in BufReader and sets byte_len, so the
         // source is seekable (mp3/wav/ogg/flac via symphonia).

@@ -52,8 +52,8 @@ impl Renderer {
             return;
         };
         let side = 1.5 * NOTE_SPRITE_W; // canvas px, ~1.5 note widths
-        // Phigros gold burst tint.
-        const GOLD: [f32; 4] = [1.0, 0.85, 0.35, 1.0];
+        // Pale gold burst tint.
+        const GOLD: [f32; 4] = [1.0, 0.92, 0.6, 1.0];
         for fx in hit_fx.iter() {
             let age = fx.t0.elapsed().as_secs_f32();
             let frame = ((age / HIT_FX_SECS) * HIT_FX_FRAMES as f32).min((HIT_FX_FRAMES - 1) as f32) as u32;

@@ -14,9 +14,7 @@ pub mod easing;
 pub mod edit;
 pub mod model;
 
-pub use chart::{Chart, FiredNote, FrameState, LineState, NoteState};
-pub use edit::{ChartDocument, EditError, EventKind};
-pub use model::ChartInfo;
+pub use chart::{FrameState, LineState};
 
 /// RGBA color, components in 0..=1. Stand-in for prpr's `macroquad::Color`
 /// (core must not depend on render crates).

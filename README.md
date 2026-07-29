@@ -1,7 +1,10 @@
-# phimakor
+# PhiMakor
 
-把部分主要逻辑根据另一个性能架构完全剥离重写,渲染代码后端换成了wgpu，暂时还属于谱面预览播放器。
-部分代码启发或衍生自 [TeamFlos/phira](https://github.com/TeamFlos/phira)（GPL-3.0，详见 [ThankList.md](ThankList.md)）。
+<p style="font-size:36px;text-align:center;">PhiMakor!("Preview" ver) 全新来袭!</p>
+
+PhiMakor 是一个 Rust + wgpu + Iced(tiny-skia) 的 Phigros 谱面编辑器。
+
+> 部分代码衍生自 [TeamFlos/phira](https://github.com/TeamFlos/phira)（GPL-3.0，详见 [ThankList.md](ThankList.md)）
 
 ## 运行
 
@@ -9,30 +12,43 @@
 cargo run --release <谱面目录>
 ```
 
-谱面目录含 `chart.json`谱面文件+ 音频 + 曲绘 + `info.json`（或谱面的 `info.txt`）。
-皮肤资源包解压到启动目录的 `res/` 文件夹；字体 `res/Exo2.ttf` 可选。
+谱面目录需要包含 `chart.json`（RPE 格式）、音乐文件、曲绘以及 `info.json`（或 `info.txt`）。  
+不传参数时会列出当前目录下可用的谱面。  
+note资源包放在 `res/`，字体 `res/Exo2.ttf` 可选。
 
-## 按键
+## 快捷键
 
 | 键 | 功能 |
-|---|---|
-| Space | 播放/暂停 |
-| ← / → | 快退/快进 5 秒 |
-| Tab | 切换 playfield 比例（3:2 → 16:9 → 4:3 → 1:1） |
+|--------|-----------|
+| Space | 播放 / 暂停 |
+| ← → | 后退 / 前进 5 秒 |
+| Tab | 切换 playfield 比例 |
+| 滚轮 | 时间轴滚动 / 谱面时间拖拽 |
+| Ctrl+滚轮 | 时间轴缩放 |
+| Z / C | 上一条 / 下一条判定线（抬键触发） |
+| F1 | 切换所有 UI 叠加层 |
+| F3 | 右侧属性面板（Chart / Line / Settings） |
+| F4 | 事件时间轴（Alpha / MoveX / MoveY / Rotate / Speed） |
+| F5 | Note 预览面板 |
+| Ctrl+F5 | 全线 Note 预览 |
+| [ / ] | UI 缩放 0.5× – 2.0× |
 | Esc | 退出 |
 
-启动时附带一个调试小窗（time/fps/combo/线数等），关掉它不影响主程序。
+## 当前进度
+
+note 预览、主谱面预览、事件预览、多面板信息查看。编辑器部分正在制作中。
+
+## 关于本项目
+
+本项目是指向性的 vibe coding 产物
+但是其实感觉...额...反正我有这个需要()
+
+## 关于性能
+
+本项目
 
 ## License
 
 本项目的初衷就是去做一个开源新兴前沿的谱面编辑器,亦可提供rust带来的轻量级以及wgpu技术带来的性能提升.因此(并且依照上游的参考代码许可证的传染性),此项目依照GPL-3.0开源.
 
 [GPL-3.0](LICENSE)
-
----
-
-本项目其实是有指向性的vibe coding产物
-
-如果你不喜欢它
-
-看在我很可爱的份上可以不要拉踩我嘛(pwp)
