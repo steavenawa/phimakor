@@ -20,6 +20,8 @@ fn i32_one() -> i32 {
     1
 }
 
+fn visible_time_default() -> f64 { 999999.0 }
+
 fn rpe_version_default() -> i32 {
     160
 }
@@ -119,9 +121,13 @@ pub struct RPENote {
     pub y_offset: f32,
     pub alpha: u16, // some charts have 256...
     pub hitsound: Option<String>, // tolerated, ignored in M0 (no hitsounds)
+    #[serde(default = "f32_one")]
     pub size: f32,
+    #[serde(default = "f32_one")]
     pub speed: f32,
+    #[serde(default)]
     pub is_fake: u8,
+    #[serde(default = "visible_time_default")]
     pub visible_time: f64,
     #[serde(default)]
     pub tint: Option<[u8; 3]>, // tolerated, ignored in M0 (note tint FX)
@@ -192,6 +198,7 @@ pub enum ChartFormat {
     Pec,
     Pgr,
     Pbc,
+    Pss, // Phimakor Streamable Sheet (NDJSON)
 }
 
 /// Mirrors `prpr/src/info.rs`. `serde(default)` on the whole struct: an empty

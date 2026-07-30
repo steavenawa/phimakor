@@ -376,8 +376,10 @@ impl ChartDocument {
     /// plus the chart file it names) and spawns the background save thread.
     pub fn open(dir: &Path) -> Result<Self, EditError> {
         let info = load_info(dir).map_err(|e| EditError::BadOp(format!("{e:#}")))?;
-        let chart_src = std::fs::read_to_string(dir.join(&info.chart))?;
-        let chart: RPEChart = serde_json::from_str(&chart_src)?;
+        let chart_path = dir.join(&info.chart);
+        let bytes = std::fs::read(&chart_path).map_err(|e| EditError::BadOp(format!("{e:#}")))?;
+        let fmt = super::chart_format::detect_format(&bytes);
+        let chart = super::chart_format::parse_chart(fmt, &bytes, &info).map_err(|e| EditError::BadOp(format!("{e:#}")))?;
         let (tx, rx) = mpsc::channel::<SaveMsg>();
         let saver_dir = dir.to_path_buf();
         let chart_name = info.chart.clone();

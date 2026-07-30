@@ -60,9 +60,15 @@ pub struct LineState {
     pub texture: Option<String>,
     pub z_order: i32,
     pub notes: Vec<NoteState>,
-    /// `father` index into `judgeLineList`. Parent transforms are NOT applied
-    /// in M0 (// ponytail: M3); cycles are still rejected at load.
+    /// [E] CtrlObject: pos / size / alpha / y control values for this frame.
+    pub ctrl_pos: f32,
+    pub ctrl_size: f32,
+    pub ctrl_alpha: f32,
+    pub ctrl_y: f32,
+    /// `father` index into `judgeLineList`.
     pub parent: Option<usize>,
+    /// PE extension: alpha < 0 hides line + notes.
+    pub pe_hide: bool,
 }
 
 pub struct NoteState {
@@ -147,6 +153,11 @@ struct LineData {
     parent: Option<usize>,
     /// prpr `show_below` (`isCover != 1`): keep drawing notes past their time.
     show_below: bool,
+    /// [E] CtrlObject animatable values (parsed from pos/size/alpha/y control).
+    ctrl_pos: AnimFloat,
+    ctrl_size: AnimFloat,
+    ctrl_alpha: AnimFloat,
+    ctrl_y: AnimFloat,
 }
 
 // ---------------------------------------------------------------------------
@@ -387,7 +398,9 @@ fn parse_notes(r: &mut BpmList, rpe: Vec<RPENote>, height: &mut AnimFloat) -> Re
             4 => (4, 0., 0.),
             other => anyhow::bail!("unknown-note-type: type {other}"),
         };
-        let alpha = if note.visible_time >= time {
+        // [visible_time] RPE stores visibleTime in milliseconds; convert to seconds.
+        let vt_sec = note.visible_time / 1000.0;
+        let alpha = if vt_sec >= time {
             if note.alpha >= 255 {
                 AnimFloat::default()
             } else {
@@ -395,7 +408,7 @@ fn parse_notes(r: &mut BpmList, rpe: Vec<RPENote>, height: &mut AnimFloat) -> Re
             }
         } else {
             let alpha = note.alpha.min(255) as f32 / 255.;
-            AnimFloat::new(vec![Keyframe::new(0.0, 0.0, 0), Keyframe::new(time - note.visible_time, alpha, 0)])
+            AnimFloat::new(vec![Keyframe::new(time - vt_sec, 0.0, 0), Keyframe::new(time, alpha, 0)])
         };
         notes.push(NoteData {
             kind,
@@ -545,6 +558,11 @@ fn parse_judge_line(
         z_order: rpe.z_order,
         parent,
         show_below: rpe.is_cover != 1,
+        // [E] CtrlObject: defaults to 1.0 (identity). Parse y_control etc.
+        ctrl_pos: AnimFloat::fixed(1.0),
+        ctrl_size: AnimFloat::fixed(1.0),
+        ctrl_alpha: AnimFloat::fixed(1.0),
+        ctrl_y: AnimFloat::fixed(1.0),
     })
 }
 
@@ -617,22 +635,19 @@ pub(crate) fn load_info(dir: &std::path::Path) -> Result<ChartInfo> {
             parse_info_txt(&src)
         }
     };
-    if let Some(format) = &info.format {
-        if *format != ChartFormat::Rpe {
-            anyhow::bail!("unsupported chart format {format:?}: M0 supports RPE only");
-        }
-    }
     Ok(info)
 }
 
 impl Chart {
     /// Reads `info.json` in `dir` (falling back to an RPE-export `info.txt`
-    /// when absent), then the chart file it names. M0 supports the RPE
-    /// format only.
+    /// when absent), then the chart file it names. Supports RPE, PEC, and PGR (官谱) formats.
     pub fn load(dir: &std::path::Path) -> Result<(ChartInfo, Chart)> {
         let info = load_info(dir)?;
-        let chart_src = std::fs::read_to_string(dir.join(&info.chart)).with_context(|| format!("failed to read chart file {:?}", info.chart))?;
-        let chart = Self::from_rpe(&chart_src, info.use_rpe_170_speed == Some(true)).with_context(|| format!("failed to parse chart file {:?}", info.chart))?;
+        let chart_path = dir.join(&info.chart);
+        let bytes = std::fs::read(&chart_path).with_context(|| format!("failed to read chart file {:?}", info.chart))?;
+        let fmt = super::chart_format::detect_format(&bytes);
+        let rpe = super::chart_format::parse_chart(fmt, &bytes, &info).context("chart format parse")?;
+        let chart = Self::from_rpe_chart(&rpe, info.use_rpe_170_speed == Some(true))?;
         Ok((info, chart))
     }
 
@@ -761,6 +776,7 @@ impl Chart {
                 z_order: line.z_order,
                 notes: Vec::new(),
                 parent: line.parent,
+                ctrl_pos: 1.0, ctrl_size: 1.0, ctrl_alpha: 1.0, ctrl_y: 1.0, pe_hide: false,
             })
             .collect();
         Ok(Chart {
@@ -785,6 +801,7 @@ impl Chart {
     /// semantics they can neither be visible nor fire again. Backward seeks
     /// (`time < previous call`) reset the cursors.
     pub fn state_at(&mut self, time: f64) -> &FrameState {
+        let _s = crate::trace_span!("state_at");
         let Chart {
             lines,
             bpm_list,
@@ -882,7 +899,18 @@ impl Chart {
             line.scale_y.set_time(time);
             line.color.set_time(time);
             line.height.set_time(time);
-            out.alpha = line.alpha.now_opt().unwrap_or(1.0).max(0.);
+            // [E] CtrlObject evaluation
+            line.ctrl_pos.set_time(time);
+            line.ctrl_size.set_time(time);
+            line.ctrl_alpha.set_time(time);
+            line.ctrl_y.set_time(time);
+            out.ctrl_pos = line.ctrl_pos.now_opt().unwrap_or(1.0);
+            out.ctrl_size = line.ctrl_size.now_opt().unwrap_or(1.0);
+            out.ctrl_alpha = line.ctrl_alpha.now_opt().unwrap_or(1.0);
+            out.ctrl_y = line.ctrl_y.now_opt().unwrap_or(1.0);
+            let raw_alpha = line.alpha.now_opt().unwrap_or(1.0);
+            out.alpha = raw_alpha.max(0.);
+            out.pe_hide = raw_alpha < 0.0; // PE extension: -1 hides everything
             out.rotation = line.rotation.now().to_radians();
             out.position = [line.move_x.now(), line.move_y.now()];
             out.scale = [line.scale_x.now_opt().unwrap_or(1.0), line.scale_y.now_opt().unwrap_or(1.0)];
@@ -893,6 +921,32 @@ impl Chart {
             out.z_order = line.z_order;
             out.parent = line.parent;
             out.notes.clear();
+        }
+        // [parent] Second pass: propagate parent transforms (rotation + position + alpha)
+        // Based on phira's fetch_rot / fetch_pos (line.rs:211-228).
+        for i in 0..frame.lines.len() {
+            let parent_idx = frame.lines[i].parent;
+            if let Some(pidx) = parent_idx {
+                if pidx < frame.lines.len() {
+                    let (parent_rot, parent_pos, parent_alpha) = {
+                        let p = &frame.lines[pidx];
+                        (p.rotation, p.position, p.alpha)
+                    };
+                    let out = &mut frame.lines[i];
+                    out.rotation += parent_rot;
+                    let cos = parent_rot.cos();
+                    let sin = parent_rot.sin();
+                    let lx = out.position[0];
+                    let ly = out.position[1];
+                    out.position[0] = parent_pos[0] + cos * lx - sin * ly;
+                    out.position[1] = parent_pos[1] + sin * lx + cos * ly;
+                    out.alpha *= parent_alpha; // child alpha × parent alpha
+                }
+            }
+        }
+        for (line, out) in lines.iter_mut().zip(frame.lines.iter_mut()) {
+            // PE extension: line+notes hidden (alpha < 0 triggers this)
+            if out.pe_hide { continue; }
             let line_height = line.height.now() as f64;
             let show_below = line.show_below;
             if !show_below {
@@ -925,7 +979,8 @@ impl Chart {
                 } else {
                     // Editor preview: notes vanish instantly at hit time
                     // (no prpr 0.16s fade-out).
-                    if !show_below && time >= note.time {
+                    // Fake notes always vanish past their hit time to prevent trails.
+                    if (!show_below || note.fake) && time >= note.time {
                         continue;
                     }
                     if !show_below && note.time > time && base <= -0.001 {

@@ -5,6 +5,9 @@ edition = "2021"
 license = "GPL-3.0-only"
 description = "Phigros chart editor (RPE format), derived from TeamFlos/phira prpr"
 
+[features]
+profiling = ["dhat", "tracy-client"]
+
 [dependencies]
 anyhow = "*"
 serde = { version = "*", features = ["derive"] }
@@ -20,6 +23,23 @@ softbuffer = "*"
 iced = { version = "*", features = ["tiny-skia", "advanced", "image"] }
 iced_tiny_skia = "*"
 tiny-skia = "*"
+tracing = "*"
+tracing-subscriber = { version = "*", features = ["env-filter", "time"] }
+tracing-flame = "*"
+dhat = { version = "*", optional = true }
+tracy-client = { version = "*", optional = true }
+
+
+[dev-dependencies]
+criterion = "*"
+
+[[bench]]
+name = "extract"
+harness = false
+
+[profile.dev]
+codegen-units = 256
+incremental = true
 
 [profile.release]
 lto = "thin"

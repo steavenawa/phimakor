@@ -2,7 +2,12 @@
 //! Beat/time conversion, ported from `prpr/src/core.rs` (`Triple`, `BpmList`).
 
 #[derive(serde::Deserialize, serde::Serialize, Clone, Copy, Debug)]
-/// `(i, n, d)`: `i + n / d`. `d == 0` yields inf/NaN (unchecked, same as prpr).
+/// Beat position in rational form `(i, n, d)` → `i + n/d` beats.
+///
+/// Rational representation avoids floating-point drift across chart edits:
+/// moving a note by one snap increment won't accumulate rounding errors.
+/// `d == 0` yields inf/NaN (unchecked, same as prpr — only well-formed
+/// RPE files reach this code).
 pub struct Triple(i32, u32, u32);
 impl Default for Triple {
     fn default() -> Self {

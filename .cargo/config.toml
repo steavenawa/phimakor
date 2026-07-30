@@ -1,0 +1,4 @@
+# Faster linking with rust-lld (bundled with Rust).
+# If linker fails, remove this file to fall back to default MSVC linker.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

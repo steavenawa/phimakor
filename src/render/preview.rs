@@ -81,7 +81,7 @@ impl PreviewEngine {
     /// Returns pixel bytes (len = w*h*4, row padding already removed).
     pub fn render_frame(&mut self, frame: &FrameState, window_aspect: f32, dim: f32) -> &[u8] {
         let view = self.target.create_view(&wgpu::TextureViewDescriptor::default());
-        self.renderer.draw_to_view(&view, frame, window_aspect, dim, None);
+        self.renderer.draw_to_view(&view, frame, window_aspect, dim, None, None);
 
         let mut encoder = self
             .renderer
@@ -148,6 +148,9 @@ impl PreviewEngine {
     pub fn set_progress(&mut self, progress: f32) {
         self.renderer.set_progress(progress);
     }
+
+    /// Read-only access to the last rendered RGBA frame.
+    pub fn pixels(&self) -> &[u8] { &self.pixels }
 
     pub fn spawn_hit_fx(&mut self, pos_canvas: [f32; 2]) {
         self.renderer.spawn_hit_fx(pos_canvas);

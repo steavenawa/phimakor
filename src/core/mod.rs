@@ -10,9 +10,12 @@
 pub mod anim;
 pub mod bpm;
 pub mod chart;
+pub mod chart_format;
 pub mod easing;
 pub mod edit;
+pub mod extra;
 pub mod model;
+pub mod stream;
 
 pub use chart::{FrameState, LineState};
 

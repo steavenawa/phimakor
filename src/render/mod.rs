@@ -15,7 +15,9 @@ use winit::window::Window;
 use crate::core::FrameState;
 
 mod fx;
+pub mod post;
 pub mod preview;
+pub mod shaders;
 mod text;
 
 pub use text::TextAnchor;
@@ -91,19 +93,65 @@ struct DrawCmd<'a> {
 }
 
 /// GPU instance record (64B): 2D affine + pad, tint, uv rect. One per quad,
-/// fed to the vertex shader as instance attributes (no uniforms).
+/// Instance data consumed by the vertex shader (`SHADER → fn vs`).
+///
+/// The vertex shader treats this as four `vec4<f32>` instance attributes
+/// (`VsIn` struct) and applies the affine parts as:
+///
+/// ```wgsl
+/// // @location(0): m01 = (a, b, c, d)   — linear part of Mat3
+/// // @location(1): m2p = (tx, ty, 0, 0)  — translation + padding
+/// // @location(2): color                  — rgba tint
+/// // @location(3): uv_rect = (u0, v0, du, dv) — UV rectangle
+/// let corner = vec2<f32>(f32(vi & 1u), f32(vi >> 1u));
+/// let p = corner - 0.5; // [-0.5, +0.5]
+/// world.x = a * p.x + c * p.y + tx;
+/// world.y = b * p.x + d * p.y + ty;
+/// uv = uv_rect.xy + corner * uv_rect.zw;
+/// ```
+///
+/// `model` encodes a 2D affine transform `x' = M × x` in column-major order:
+/// ```text
+/// [a  c  tx]   [0   2   4]
+/// [b  d  ty] = [1   3   5]
+/// [0  0  1 ]   [6=0 7=0 /]
+/// ```
+///
+/// Three draw types share this same layout, distinguished at construction:
+///
+/// | Type | `model` encodes | Consumer |
+/// |------|----------------|----------|
+/// | **Scene** (lines, notes, bg) | `letterbox × translate × rotate × scale(...)` | `line_m`, `note_m`, `bg_m` |
+/// | **Texture** (custom judge line) | pixel→clip mapping | `tex_m` (see `Some(name)` case) |
+/// | **UI overlay** (iced, timeline) | fullscreen NDC stretch | `mat_scale(2, 2)` + UV flip |
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Instance {
-    /// a, b, c, d, tx, ty (from column-major Mat3) + 2 pad floats.
+    /// Affine matrix: [a, b, c, d, tx, ty, 0, 0].
+    /// a,b,c,d = linear; tx,ty = translation; last 2 always 0.
     model: [f32; 8],
+    /// RGBA tint (pre-multiplied alpha in scene pass).
     color: [f32; 4],
+    /// UV rect: [u0, v0, du, dv]. Final UV = (u0, v0) + corner * (du, dv).
+    /// V⵨ is standard GPU bottom-up; overlay textures pass (du=1, dv=-1) to flip.
     uv_rect: [f32; 4],
 }
 
-/// Pack the affine part of a column-major Mat3: x' = a·x + c·y + tx.
+/// Pack the affine part of a column-major Mat3 into Instance.model format:
+/// `[m00, m01, m10, m11, m20, m21, 0, 0]`.
 fn instance_model(m: &Mat3) -> [f32; 8] {
     [m[0][0], m[0][1], m[1][0], m[1][1], m[2][0], m[2][1], 0., 0.]
+}
+
+/// Zero-overhead draw type tag — resolved at Instance construction, no
+/// runtime dispatch.
+enum DrawTag {
+    /// 3D scene element: full letterbox × T × R × S transform.
+    Scene,
+    /// Custom judge-line texture: pixel–world mapping via `RPE_HEIGHT / win_h`.
+    Texture { tex_w: f32, tex_h: f32, win_w: f32, win_h: f32 },
+    /// UI overlay: fullscreen NDC quad with optional V-flip.
+    Overlay,
 }
 
 const INSTANCE_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
@@ -263,10 +311,21 @@ pub struct Renderer {
     playfield_aspect: f32,
     /// Playback progress 0..1 for the top progress bar.
     progress: f32,
+    pub vsync: bool,
+    /// Post-processing pipeline (effects from extra.json).
+    pub post: post::PostPipe,
+    /// Intermediate scene texture (for post-processing).
+    scene_tex: Option<wgpu::Texture>,
+    scene_view: Option<wgpu::TextureView>,
+
     /// Live hit-effect bursts (see `fx.rs`).
     hit_fx: Vec<fx::HitFx>,
     /// Text overlay state (see `text.rs`).
     text: text::TextState,
+    /// Persistent single-instance buffer for UI overlay draws.
+    ui_inst_buf: wgpu::Buffer,
+    /// Currently selected judge line index (highlighted).
+    pub selected_line: usize,
 }
 
 impl Renderer {
@@ -278,6 +337,7 @@ impl Renderer {
     /// Acquire the next surface texture. Returns `Err` variants that the caller
     /// should handle (Timeout/Occluded → skip frame, Validation → propagate).
     pub fn surface_acquire(&mut self) -> Result<wgpu::SurfaceTexture, wgpu::CurrentSurfaceTexture> {
+        let _s = crate::trace_span!("surface_acquire");
         let surface = self.surface.as_ref().expect("surface_acquire on a surfaceless renderer");
         match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(st) | wgpu::CurrentSurfaceTexture::Suboptimal(st) => Ok(st),
@@ -377,6 +437,15 @@ impl Renderer {
         let white_tex = Self::create_texture(&device, &queue, &[255; 4], 1, 1);
         let white = Self::texture_bind_group(&device, &tex_bgl, &sampler, &white_tex);
 
+        let post = post::PostPipe::new(&device, width, height, format);
+        let scene_tex = Some(post::PostPipe::make_target2(&device, width, height, "scene", format));
+        let scene_view = Some(scene_tex.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
+        let ui_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui-inst"),
+            size: std::mem::size_of::<Instance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         Ok(Self {
             surface,
             device,
@@ -395,8 +464,14 @@ impl Renderer {
             background_dim: 1.0,
             playfield_aspect: ASPECT,
             progress: 0.0,
+            post,
+            scene_tex,
+            scene_view,
             hit_fx: Vec::new(),
             text: text::TextState::new(),
+            vsync: true,
+            ui_inst_buf,
+            selected_line: 0,
         })
     }
 
@@ -494,11 +569,28 @@ impl Renderer {
         }
     }
 
+    pub fn clear_hit_fx(&mut self) { self.hit_fx.clear(); }
+
+    pub fn size(&self) -> [u32; 2] { self.size }
+
+    pub fn set_vsync(&mut self, enabled: bool) {
+        self.vsync = enabled;
+        if let Some(config) = &mut self.config {
+            config.present_mode = if enabled { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+            self.reconfigure();
+        }
+    }
+
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return; // minimized; keep last valid config
         }
         self.size = [width, height];
+        self.post.resize(&self.device, width, height);
+        // Recreate scene texture at new size
+        let fmt = self.config.as_ref().map(|c| c.format).unwrap_or(wgpu::TextureFormat::Rgba8Unorm);
+        self.scene_tex = Some(post::PostPipe::make_target2(&self.device, width, height, "scene", fmt));
+        self.scene_view = Some(self.scene_tex.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
         if let Some(config) = &mut self.config {
             config.width = width;
             config.height = height;
@@ -557,7 +649,7 @@ impl Renderer {
             other => return Err(other), // Validation
         };
         let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw_to_view(&view, frame, window_aspect, dim, None);
+        self.draw_to_view(&view, frame, window_aspect, dim, None, None);
         self.queue.present(st);
         Ok(())
     }
@@ -566,8 +658,9 @@ impl Renderer {
     /// (window surface view or offscreen target). Submits on the internal
     /// queue; the caller presents (window path) or copies out (preview path).
     /// `dim`: global brightness multiplied into every quad's rgb (alpha kept).
-    /// If `ui_overlay` is `Some`, a fullscreen textured quad is drawn last
-    /// (useful for compositing a CPU-rendered Iced/tiny-skia overlay).
+    /// If `ui_overlay` is `Some`, a fullscreen textured quad is drawn last.
+    /// If `ui_iced` is also `Some`, it is drawn BEFORE `ui_overlay` (so the
+    /// iced background sits under the per-frame overlay — no CPU copy needed).
     pub(crate) fn draw_to_view(
         &mut self,
         view: &wgpu::TextureView,
@@ -575,11 +668,25 @@ impl Renderer {
         window_aspect: f32,
         dim: f32,
         ui_overlay: Option<&wgpu::BindGroup>,
+        ui_iced: Option<&wgpu::BindGroup>,
     ) {
-        // RPE canvas model: world x ±1 = canvas ±675px, world y ±1 = ±450px
-        // (1350×900, SQUARE canvas pixels). Letterbox the 3:2 canvas into the
-        // window; canvas px stay uniform on every window, so rotated quads
-        // never shear and sprites never distort.
+        let _s = crate::trace_span!("draw_to_view");
+        // ── Coordinate model ──────────────────────────────────────────────
+        // RPE's design canvas is 1350×900 px (3:2). The renderer's "world"
+        // uses a unit square ±1.0 in x. RPE canvas x 675 → world x 1.0.
+        // Canvas y is also mapped to world ±1 (so world is SQUARE, not 3:2).
+        //
+        //   world_x = canvas_x / 675        [canvas -675..+675 → world -1..+1]
+        //   world_y = canvas_y / 675        [canvas -675..+675 → world -1..+1]
+        //
+        // A 16:9 window shows ±1 horizontally but only ±(9/16) vertically = ±0.5625
+        // of world space. The letterbox matrix below maps the square world into
+        // the window's aspect ratio while preserving uniform pixel scale in both
+        // axes — rotated quads never shear, sprite textures never distort.
+        //
+        // Internal (playfield) aspect defaults to 3:2 but can be switched at
+        // runtime (Tab key cycles 3:2 → 16:9 → 4:3 → 1:1).
+        // ──────────────────────────────────────────────────────────────────
         let aspect = self.playfield_aspect;
         let (kx, ky) = if window_aspect >= aspect {
             (aspect / window_aspect, 1.0)
@@ -622,17 +729,18 @@ impl Renderer {
             });
         }
 
-        let mut lines: Vec<&crate::core::LineState> = frame.lines.iter().collect();
-        lines.sort_by_key(|l| l.z_order);
+        // Track original index before z-sort for selection highlight
+        let mut lines: Vec<(usize, &crate::core::LineState)> = frame.lines.iter().enumerate().collect();
+        lines.sort_by_key(|(_, l)| l.z_order);
 
-        for line in lines {
-            // translate → rotate → scale
+        for (orig_i, line) in &lines {
+            // T * R * S: translate to position, rotate around self, scale
             let line_m = mat_mul(
                 &letterbox,
                 &mat_mul(
                     &mat_translate(line.position[0] * CANVAS_W, line.position[1] * CANVAS_H),
                     &mat_mul(
-                        &mat_rotate(line.rotation), // radians (confirmed w/ CoreEval)
+                        &mat_rotate(line.rotation),
                         &mat_scale(line.scale[0], line.scale[1]),
                     ),
                 ),
@@ -652,19 +760,55 @@ impl Renderer {
                     });
                 }
                 Some(name) => {
+                    let c = line.color;
                     if let Some(t) = self.textures.get(name) {
-                        // prpr: natural pixel size × object scale.
-                        let c = line.color;
+                        // [Texture] raw_scale = line.scale / (2/1350). For lines without
+                        // scale events, line.scale = 1.0 (identity) but the implicit factor
+                        // 2/RPE_WIDTH must still apply → fall back to 2.0.
+                        let raw_sx = if (line.scale[0] - 1.0).abs() < 1e-6 { 2.0 } else { line.scale[0] * 675.0 };
+                        let raw_sy = if (line.scale[1] - 1.0).abs() < 1e-6 { 2.0 } else { line.scale[1] * 675.0 };
+                        let tw = t.size[0] * raw_sx / kx;
+                        let th = t.size[1] * raw_sy / kx;
+                        let tex_m = mat_mul(
+                            &letterbox,
+                            &mat_mul(
+                                &mat_translate(line.position[0] * CANVAS_W, line.position[1] * CANVAS_H),
+                                &mat_mul(&mat_rotate(line.rotation), &mat_scale(tw, th)),
+                            ),
+                        );
                         cmds.push(DrawCmd {
                             uniform: DrawUniform {
-                                model: mat_mul(&line_m, &mat_scale(t.size[0], t.size[1])),
+                                model: tex_m,
                                 color: [c[0], c[1], c[2], c[3] * line.alpha],
                                 uv_rect: [0., 0., 1., 1.],
                             },
                             tex: &t.bind_group,
                         });
+                    } else {
+                        // Fallback: draw default white bar if texture not found
+                        cmds.push(DrawCmd {
+                            uniform: DrawUniform {
+                                model: mat_mul(&line_m, &mat_scale(LINE_LEN, LINE_THICK)),
+                                color: [c[0], c[1], c[2], c[3] * line.alpha],
+                                uv_rect: [0., 0., 1., 1.],
+                            },
+                            tex: &self.white,
+                        });
                     }
                 }
+            }
+
+            // Selected line highlight (purple tint overlay)
+            if *orig_i == self.selected_line && line.alpha > 0.0 {
+                let sw = if line.texture.is_some() { 0.1 } else { 1.0 };
+                cmds.push(DrawCmd {
+                    uniform: DrawUniform {
+                        model: mat_mul(&line_m, &mat_scale(LINE_LEN * sw, LINE_THICK * 4.0)),
+                        color: [0.6, 0.2, 1.0, 0.3 * line.alpha],
+                        uv_rect: [0., 0., 1., 1.],
+                    },
+                    tex: &self.white,
+                });
             }
 
             // Notes follow the line's translation AND rotation, but NOT its
@@ -709,17 +853,19 @@ impl Renderer {
                         (self.textures.get(base), 1.0, false)
                     };
                     let mut alpha = note.alpha;
-                    if note.fake {
-                        alpha *= 0.5;
-                    }
+                    // fake notes render at full opacity (character art etc.)
                     if alpha <= 0.0 {
                         continue;
                     }
                     // prpr mirrors below notes under a scale(1, -1); CoreEval
-                    // already carries that mirror in `relative[1]` / `hold_end_y`
-                    // (core/chart.rs), so use the values as-is.
+                    // [F] Incline: sinusoidal X distortion (not yet implemented)
+                    let _incline = 0.0f32;
+                    // [E] CtrlObject from LineState (evaluated in state_at)
+                    let ctrl_y = line.ctrl_y;
                     let x = note.relative[0] * CANVAS_W;
-                    let y = note.relative[1] * CANVAS_H;
+                    // [E] ctrl_y scales the note's relative Y position
+                    let y = note.relative[1] * CANVAS_H * ctrl_y;
+                    let note_base = mat_mul(&note_m, &mat_translate(x, y));
 
                     match (note.kind, sprite) {
                         (1 | 3 | 4, Some(t)) => {
@@ -727,10 +873,7 @@ impl Renderer {
                             let h = w * t.size[1] / t.size[0];
                             cmds.push(DrawCmd {
                                 uniform: DrawUniform {
-                                    model: mat_mul(
-                                        &note_m,
-                                        &mat_mul(&mat_translate(x, y), &mat_scale(w, h)),
-                                    ),
+                                    model: mat_mul(&note_base, &mat_scale(w, h)),
                                     color: [1.0, 1.0, 1.0, alpha],
                                     uv_rect: [0., 0., 1., 1.],
                                 },
@@ -749,46 +892,36 @@ impl Renderer {
                             let head_h = w * head_px / t.size[0]; // quad heights
                             let tail_h = w * tail_px / t.size[0];
                             let tint = [1.0, 1.0, 1.0, alpha];
-                            // Below-notes are position-mirrored in core; mirror the
-                            // TEXTURE too (negative v scale) or head/tail swap and
-                            // the body gradient runs the wrong way.
+                            // [B] chart.rs negates relative[1] for below notes; mirror UV
+                            // so the hold body gradient (head→tail) stays correct.
                             let v_at = |v0: f32, len: f32| -> [f32; 4] {
                                 if note.above { [0., v0, 1., len] } else { [0., v0 + len, 1., -len] }
                             };
+                            // [B] Hold body/head/tail each get below_rot at their position
+                            let hd = |cy: f32| mat_mul(&note_m, &mat_mul(
+                                &mat_translate(x, cy), &mat_scale(w, w),
+                            ));
                             if let Some(end_y) = note.hold_end_y {
-                                let y1 = end_y as f32 * CANVAS_H;
-                                let h = (y1 - y).abs();
+                                let y1 = end_y as f32 * CANVAS_H * ctrl_y;
+                                let (head_y, tail_y) = (y, y1);
+                                let h = (tail_y - head_y).abs();
                                 if h > 1e-5 {
                                     cmds.push(DrawCmd {
                                         uniform: DrawUniform {
-                                            model: mat_mul(
-                                                &note_m,
-                                                &mat_mul(
-                                                    &mat_translate(x, (y + y1) * 0.5),
-                                                    &mat_scale(w, h),
-                                                ),
-                                            ),
+                                            model: mat_mul(&hd((head_y + tail_y) * 0.5), &mat_scale(1.0, h / w)),
                                             color: tint,
-                                            // v ∈ [head/H, 1-tail/H]
                                             uv_rect: v_at(head_uv, 1. - head_uv - tail_uv),
                                         },
                                         tex: &t.bind_group,
                                     });
                                 }
-                                // head at y (near line), tail at y1 (far end).
                                 for (cy, v0, len, quad_h) in [
-                                    (y, 0.0, head_uv, head_h),
-                                    (y1, 1.0 - tail_uv, tail_uv, tail_h),
+                                    (head_y, 0.0, head_uv, head_h),
+                                    (tail_y, 1.0 - tail_uv, tail_uv, tail_h),
                                 ] {
                                     cmds.push(DrawCmd {
                                         uniform: DrawUniform {
-                                            model: mat_mul(
-                                                &note_m,
-                                                &mat_mul(
-                                                    &mat_translate(x, cy),
-                                                    &mat_scale(w, quad_h),
-                                                ),
-                                            ),
+                                            model: mat_mul(&hd(cy), &mat_scale(1.0, quad_h / w)),
                                             color: tint,
                                             uv_rect: v_at(v0, len),
                                         },
@@ -796,13 +929,9 @@ impl Renderer {
                                     });
                                 }
                             } else {
-                                // No end (shouldn't happen for RPE holds): head only.
                                 cmds.push(DrawCmd {
                                     uniform: DrawUniform {
-                                        model: mat_mul(
-                                            &note_m,
-                                            &mat_mul(&mat_translate(x, y), &mat_scale(w, head_h)),
-                                        ),
+                                        model: mat_mul(&hd(y), &mat_scale(1.0, head_h / w)),
                                         color: tint,
                                         uv_rect: v_at(0., head_uv),
                                     },
@@ -812,20 +941,16 @@ impl Renderer {
                         }
                         // Colored-quad fallback (no sprite loaded).
                         _ => {
+                            // [B] below rotation applies to all fallback quads too
+                            let nb = || mat_mul(&note_m, &mat_translate(x, y));
                             if note.kind == 2 {
                                 if let Some(end_y) = note.hold_end_y {
-                                    let y1 = end_y as f32 * CANVAS_H;
+                                let y1 = end_y as f32 * CANVAS_H * ctrl_y;
                                     let h = (y1 - y).abs();
                                     if h > 1e-5 {
                                         cmds.push(DrawCmd {
                                             uniform: DrawUniform {
-                                                model: mat_mul(
-                                                    &note_m,
-                                                    &mat_mul(
-                                                        &mat_translate(x, (y + y1) * 0.5),
-                                                        &mat_scale(HOLD_BODY_W * note.scale, h),
-                                                    ),
-                                                ),
+                                                model: mat_mul(&nb(), &mat_scale(HOLD_BODY_W * note.scale, h)),
                                                 color: [rgb[0], rgb[1], rgb[2], alpha],
                                                 uv_rect: [0., 0., 1., 1.],
                                             },
@@ -836,13 +961,7 @@ impl Renderer {
                             }
                             cmds.push(DrawCmd {
                                 uniform: DrawUniform {
-                                    model: mat_mul(
-                                        &note_m,
-                                        &mat_mul(
-                                            &mat_translate(x, y),
-                                            &mat_scale(NOTE_W * note.scale, NOTE_H * note.scale),
-                                        ),
-                                    ),
+                                    model: mat_mul(&nb(), &mat_scale(NOTE_W * note.scale, NOTE_H * note.scale)),
                                     color: [rgb[0], rgb[1], rgb[2], alpha],
                                     uv_rect: [0., 0., 1., 1.],
                                 },
@@ -901,19 +1020,10 @@ impl Renderer {
                 Self::make_instance_buf(&self.device, self.instance_capacity),
             ];
         }
-        // UI overlay: just the last DrawCmd in the main pass (fullscreen NDC
-        // quad). uv flipped — CPU-rendered pixmaps are top-down row-major,
-        // our texture convention is v0 = bottom.
-        if let Some(bg) = ui_overlay {
-            cmds.push(DrawCmd {
-                uniform: DrawUniform {
-                    model: mat_scale(2.0, 2.0),
-                    color: [1.0, 1.0, 1.0, 1.0],
-                    uv_rect: [0., 1., 1., -1.],
-                },
-                tex: bg,
-            });
-        }
+        // UI overlay is NOT pushed to cmds here — it's drawn on the surface
+        // AFTER effects, so that post-processing doesn't affect the UI.
+        // The overlay is drawn in a separate render pass on the surface view
+        // (see Step 4 below).
 
         let instances: Vec<Instance> = cmds
             .iter()
@@ -938,11 +1048,18 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // Render 3D scene to intermediate (if effects active) or directly to surface
+        let has_effects = { let p = &self.post; !p.active.is_empty() };
+        let scene_view: &wgpu::TextureView = if has_effects {
+            self.scene_view.as_ref().unwrap()
+        } else {
+            &view
+        };
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
+                label: Some("scene"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view,
+                    view: scene_view,
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
@@ -954,8 +1071,6 @@ impl Renderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, self.instance_bufs[self.frame_idx].slice(..));
-            // Painter's algorithm: draw order is cmd order. Batch maximal
-            // runs sharing one texture bind group (pointer identity).
             let mut start = 0usize;
             for i in 1..=cmds.len() {
                 if i == cmds.len() || !std::ptr::eq(cmds[i].tex, cmds[start].tex) {
@@ -963,6 +1078,73 @@ impl Renderer {
                     pass.draw(0..4, start as u32..i as u32);
                     start = i;
                 }
+            }
+        }
+        // Step 2: Run post-processing effects (if any)
+        if has_effects {
+            self.post.apply(&mut encoder, &self.device, &self.queue, scene_view);
+        }
+        // Step 3: Blit final to surface (only when using intermediate texture)
+        if has_effects {
+            let (blit_pipe, screen_bgl, sampler, final_view) = {
+                let p = &self.post;
+                (p.blit_pipeline.as_ref().unwrap(), &p.screen_bgl, &p.sampler, p.last_view())
+            };
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(blit_pipe);
+            let screen_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blit-bg"),
+                layout: screen_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(final_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            });
+            pass.set_bind_group(0, &screen_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        // Step 4: UI overlay (iced + timeline) on the surface, never post-processed
+        let ui_instance = Instance {
+            model: [2.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0],
+            color: [1.0, 1.0, 1.0, 1.0],
+            uv_rect: [0., 1., 1., -1.],
+        };
+        self.queue.write_buffer(&self.ui_inst_buf, 0, bytemuck::cast_slice(&[ui_instance]));
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ui-overlay"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_vertex_buffer(0, self.ui_inst_buf.slice(..));
+            if let Some(bg) = ui_iced {
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw(0..4, 0..1);
+            }
+            if let Some(bg) = ui_overlay {
+                pass.set_bind_group(0, bg, &[]);
+                pass.draw(0..4, 0..1);
             }
         }
         self.queue.submit([encoder.finish()]);
