@@ -35,8 +35,12 @@ pub struct ChartSession {
     chart: Option<core::chart::Chart>,
     info: Option<core::model::ChartInfo>,
     audio: Option<audio::AudioHandle>,
+    extra: Option<core::extra::ExtraRoot>,
     width: u32,
     height: u32,
+    chart_dir: Option<std::path::PathBuf>,
+    /// Fired notes from the last `render_frame` call.
+    pub last_fired: Vec<core::chart::FiredNote>,
 }
 
 impl ChartSession {
@@ -49,8 +53,11 @@ impl ChartSession {
             chart: None,
             info: None,
             audio: None,
+            extra: None,
             width,
             height,
+            chart_dir: None,
+            last_fired: Vec::new(),
         })
     }
 
@@ -93,8 +100,13 @@ impl ChartSession {
             self.engine.set_background(&bytes, info.background_dim).ok();
         }
 
+        // Post-processing effects from extra.json
+        self.extra = std::fs::read(dir.join("extra.json")).ok()
+            .and_then(|b| core::extra::parse_extra(&b).ok());
+
         self.chart = Some(chart);
         self.info = Some(info);
+        self.chart_dir = Some(dir.to_path_buf());
         Ok(())
     }
 
@@ -106,8 +118,32 @@ impl ChartSession {
     /// Returns `None` if no chart is loaded.
     pub fn render_frame(&mut self, time: f64, dim: f32) -> Option<&[u8]> {
         let chart = self.chart.as_mut()?;
+        let info = self.info.as_ref()?;
         let duration = chart.duration();
-        let frame = chart.state_at(time);
+        let off = chart.offset() as f64 + info.offset as f64;
+        let chart_time = (time - off).max(0.0);
+        let chart_beat = chart.time_to_beat(chart_time);
+        let frame = chart.state_at(chart_time);
+        self.last_fired.clear();
+        self.last_fired.extend(frame.fired.iter().map(|f| core::chart::FiredNote {
+            line: f.line, kind: f.kind, x: f.x,
+            fake: f.fake, tick: f.tick, hold_tail: f.hold_tail,
+        }));
+        // Trigger hit FX for notes that fired since the last state_at call
+        for fired in &frame.fired {
+            if fired.hold_tail { continue; }
+            if let Some(line) = frame.lines.get(fired.line) {
+                let t = line.rotation;
+                let x = fired.x as f32;
+                let cx = (line.position[0] + t.cos() * x) * 675.0;
+                let cy = (line.position[1] + t.sin() * x) * 450.0;
+                self.engine.spawn_hit_fx([cx, cy]);
+            }
+        }
+        // Evaluate post-processing effects
+        if let Some(extra) = &self.extra {
+            self.engine.set_effects_from_extra(extra, chart_beat, chart_time as f32);
+        }
         self.engine.set_progress((time / duration.max(0.01)) as f32);
         let aspect = self.width as f32 / self.height.max(1) as f32;
         Some(self.engine.render_frame(frame, aspect, dim))
@@ -131,5 +167,12 @@ impl ChartSession {
     /// Access the underlying preview renderer for advanced use.
     pub fn engine(&mut self) -> &mut render::preview::PreviewEngine {
         &mut self.engine
+    }
+
+    /// Path to the music file (for ffmpeg audio muxing).
+    pub fn music_path(&self) -> Option<std::path::PathBuf> {
+        let dir = self.chart_dir.as_ref()?;
+        let info = self.info.as_ref()?;
+        Some(dir.join(&info.music))
     }
 }

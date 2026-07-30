@@ -439,7 +439,6 @@ impl State {
 
         let ui_bg = if self.show_overlay { Some(self.overlay.bind_group()) } else { None };
         let ui_iced = if self.show_overlay { Some(self.overlay.iced_bind_group()) } else { None };
-        self.renderer.selected_line = self.selected_line;
 
         self.renderer.set_progress(audio_time as f32 / duration as f32);
         match self.renderer.surface_acquire() {

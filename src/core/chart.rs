@@ -481,10 +481,7 @@ fn parse_judge_line(
             .collect::<Result<_>>()?;
         let mut res = AnimFloat::chain(anis);
         if res.is_default() {
-            // NB: prpr quirk — a line with NO events of this type anywhere
-            // gets fixed(0.0) (alpha 0 → invisible), while a chain of empty
-            // anims yields now_opt() = None (alpha falls back to 1.0).
-            return Ok(AnimFloat::fixed(0.0));
+            return Ok(AnimFloat::default());
         }
         res.map_value(|v| v * factor);
         Ok(res)

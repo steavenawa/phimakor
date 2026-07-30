@@ -170,4 +170,49 @@ impl PreviewEngine {
     pub fn draw_text(&mut self, text: &str, anchor: TextAnchor, color: [f32; 4]) {
         self.renderer.draw_text(text, anchor, color);
     }
+
+    /// Evaluate and apply post-processing effects from extra.json for the
+    /// current chart beat. Must be called before [`render_frame`].
+    pub fn set_effects_from_extra(&mut self, extra: &crate::core::extra::ExtraRoot, chart_beat: f64, chart_time: f32) {
+        use crate::render::shaders::EFFECTS;
+        use crate::render::post::ActiveEffect;
+        self.renderer.post.active.clear();
+        let evals = crate::core::extra::evaluate_effects(extra, chart_beat);
+        let size = self.renderer.size();
+        let (sw, sh) = (size[0] as f32, size[1] as f32);
+        for e in &evals {
+            let si = EFFECTS.iter().position(|d| d.name == e.shader_name).unwrap_or(usize::MAX);
+            let (uv, count) = if si == usize::MAX {
+                (e.uniforms.clone(), e.uniforms.len())
+            } else {
+                let def = &EFFECTS[si];
+                let mut uv: Vec<f32> = def.defaults.iter().map(|(_, v)| *v).collect();
+                let norm = |s: &str| s.to_lowercase().replace("_", "").replace("-", "");
+                for (i, (dname, _)) in def.defaults.iter().enumerate() {
+                    let base = dname.trim_end_matches("_r").trim_end_matches("_g")
+                        .trim_end_matches("_b").trim_end_matches("_a")
+                        .trim_end_matches("_x").trim_end_matches("_y");
+                    let nbase = norm(base);
+                    if let Some(pos) = e.uniforms_names.iter().position(|n| norm(n) == nbase) {
+                        uv[i] = e.uniforms[pos];
+                    }
+                    if dname.contains("screen_size") {
+                        uv[i] = if dname.ends_with('x') { sw } else { sh };
+                    }
+                    if *dname == "time" {
+                        uv[i] = chart_time;
+                    }
+                }
+                let l = uv.len();
+                (uv, l)
+            };
+            self.renderer.post.active.push(ActiveEffect {
+                shader_idx: si,
+                custom_name: if si == usize::MAX { Some(e.shader_name.clone()) } else { None },
+                priority: e.priority,
+                uniform_values: uv,
+                uniform_count: count,
+            });
+        }
+    }
 }

@@ -345,8 +345,6 @@ pub struct Renderer {
     text: text::TextState,
     /// Persistent single-instance buffer for UI overlay draws.
     ui_inst_buf: wgpu::Buffer,
-    /// Currently selected judge line index (highlighted).
-    pub selected_line: usize,
 }
 
 impl Renderer {
@@ -498,7 +496,6 @@ impl Renderer {
             text: text::TextState::new(),
             vsync: true,
             ui_inst_buf,
-            selected_line: 0,
         })
     }
 
@@ -765,7 +762,8 @@ impl Renderer {
         let mut lines: Vec<(usize, &crate::core::LineState)> = frame.lines.iter().enumerate().collect();
         lines.sort_by_key(|(_, l)| l.z_order);
 
-        for (orig_i, line) in &lines {
+        for (_orig_i, line) in &lines {
+            if line.pe_hide { continue; }
             // T * R * S: translate to position, rotate around self, scale
             let line_m = mat_mul(
                 &letterbox,
@@ -830,18 +828,7 @@ impl Renderer {
                 }
             }
 
-            // Selected line highlight (purple tint overlay)
-            if *orig_i == self.selected_line && line.alpha > 0.0 {
-                let sw = if line.texture.is_some() { 0.1 } else { 1.0 };
-                cmds.push(DrawCmd {
-                    uniform: DrawUniform {
-                        model: mat_mul(&line_m, &mat_scale(LINE_LEN * sw, LINE_THICK * 4.0)),
-                        color: [0.6, 0.2, 1.0, 0.3 * line.alpha],
-                        uv_rect: [0., 0., 1., 1.],
-                    },
-                    tex: &self.white,
-                });
-            }
+
 
             // Notes follow the line's translation AND rotation, but NOT its
             // scale or alpha (locked product decision).
