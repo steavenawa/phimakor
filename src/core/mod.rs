@@ -49,7 +49,7 @@ pub const RPE_HEIGHT: f32 = 900.;
 /// prpr: `10. / 45. / HEIGHT_RATIO`
 pub const SPEED_RATIO: f64 = 10. / 45. / HEIGHT_RATIO;
 
-/// One frame of evaluated chart state, produced by [`Chart::state_at`].
+/// One frame of evaluated chart state, produced by [`crate::core::chart::Chart::state_at`].
 /// Renderer draws this verbatim: for each line, apply line transform
 /// (translate → rotate → scale), draw line quad, then draw each note at
 /// its relative offset under the same transform.

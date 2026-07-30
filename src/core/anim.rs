@@ -5,14 +5,19 @@
 use super::easing::{StaticTween, TweenFunction, TweenId, Tweenable};
 use std::rc::Rc;
 
+/// A single keyframe defining a value at a point in time with an easing function.
 #[derive(Clone)]
 pub struct Keyframe<T> {
+    /// Time position of this keyframe (in beats).
     pub time: f64,
+    /// Animated value at this keyframe.
     pub value: T,
+    /// Easing function used when interpolating from this keyframe to the next.
     pub tween: Rc<dyn TweenFunction>,
 }
 
 impl<T> Keyframe<T> {
+    /// Create a new keyframe at the given time with a value and tween identifier.
     pub fn new(time: f64, value: T, tween: TweenId) -> Self {
         Self {
             time,
@@ -22,17 +27,19 @@ impl<T> Keyframe<T> {
     }
 }
 
+/// A keyframe animation track over a generic tweenable type.
+///
+/// Anim Tween Function is using the `tween` value of the first keyframe of an interval `(kf1, kf2)`.
+/// Supports chaining multiple animations together via `next`.
 #[derive(Clone)]
-/// Anim Tween Function is using the `tween` value of the first keyframe of an interval `(kf1, kf2)`
 pub struct Anim<T: Tweenable> {
+    /// Current playback time.
     pub time: f64,
+    /// Ordered array of keyframes defining the animation curve.
     pub keyframes: Box<[Keyframe<T>]>,
+    /// Index of the last passed keyframe for fast lookup.
     pub cursor: usize,
-    /// Next Anim to chain
-    ///
-    /// e.g. `a1.next = a2` we have a1(t) = a1.keyframes(t) + a2(t)
-    /// and if `a2.next = a3` we have a1(t) = a1.keyframes(t) + a2.keyframes(t) + a3(t)
-    /// ...
+    /// Optional chained animation that plays after (or stacked on) this one.
     pub next: Option<Box<Anim<T>>>,
 }
 
@@ -48,6 +55,7 @@ impl<T: Tweenable> Default for Anim<T> {
 }
 
 impl<T: Tweenable> Anim<T> {
+    /// Create a new animation from a non-empty list of keyframes.
     pub fn new(keyframes: Vec<Keyframe<T>>) -> Self {
         assert!(!keyframes.is_empty());
         Self {
@@ -58,6 +66,7 @@ impl<T: Tweenable> Anim<T> {
         }
     }
 
+    /// Create a single-keyframe animation that always returns a fixed value.
     pub fn fixed(value: T) -> Self {
         Self {
             keyframes: Box::new([Keyframe::new(0.0, value, 0)]),
@@ -67,10 +76,12 @@ impl<T: Tweenable> Anim<T> {
         }
     }
 
+    /// Returns true if this animation has no keyframes and no chained animation.
     pub fn is_default(&self) -> bool {
         self.keyframes.is_empty() && self.next.is_none()
     }
 
+    /// Chain multiple animations into a sequence by linking each to the next.
     pub fn chain(elements: Vec<Anim<T>>) -> Self {
         if elements.is_empty() {
             return Self::default();
@@ -84,10 +95,12 @@ impl<T: Tweenable> Anim<T> {
         *elements.into_iter().next().unwrap()
     }
 
+    /// Returns true if the cursor has reached or passed the last keyframe.
     pub fn dead(&self) -> bool {
         self.cursor + 1 >= self.keyframes.len()
     }
 
+    /// Advance the cursor to the correct keyframe pair for the given time.
     pub fn set_time(&mut self, time: f64) {
         if self.keyframes.is_empty() || time == self.time {
             self.time = time;
@@ -122,6 +135,8 @@ impl<T: Tweenable> Anim<T> {
         })
     }
 
+    /// Interpolate the current value, returning `None` if there are no keyframes.
+    /// Chains into `next` animations, summing their values.
     pub fn now_opt(&self) -> Option<T> {
         self.now_opt_inner().map(|now| {
             if let Some(next) = &self.next {
@@ -132,6 +147,7 @@ impl<T: Tweenable> Anim<T> {
         })
     }
 
+    /// Apply a transformation function to every keyframe value in this animation and all chains.
     pub fn map_value(&mut self, mut f: impl FnMut(T) -> T) {
         self.keyframes.iter_mut().for_each(|it| it.value = f(it.value.clone()));
         if let Some(next) = &mut self.next {
@@ -141,9 +157,11 @@ impl<T: Tweenable> Anim<T> {
 }
 
 impl<T: Tweenable + Default> Anim<T> {
+    /// Interpolate the current value, returning the default if there are no keyframes.
     pub fn now(&self) -> T {
         self.now_opt().unwrap_or_default()
     }
 }
 
+/// Type alias for a float-based animation track.
 pub type AnimFloat = Anim<f32>;

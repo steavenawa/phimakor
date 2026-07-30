@@ -4,6 +4,8 @@
 //! while playing. Pause/seek re-anchor. Interior mutability (`Cell`) because the
 //! contract exposes `&self` methods and everything lives on one thread.
 //!
+//! [`AudioClock`] manages the rodio device and player directly on the audio thread.
+//! [`AudioHandle`] mirrors the same API to the main thread via atomics + command channel.
 //! [`spawn_audio_thread`] owns the clock plus a second `Chart` on a dedicated
 //! trigger thread, so hitsound timing is decoupled from the winit event loop
 //! (an occluded window stops `RedrawRequested` but never the hitsounds).
@@ -100,6 +102,7 @@ impl AudioClock {
         t
     }
 
+    /// Pause or resume playback. No-op if already in the requested state.
     pub fn set_paused(&self, paused: bool) {
         if paused == !self.playing.get() {
             return;
@@ -115,6 +118,7 @@ impl AudioClock {
         }
     }
 
+    /// Whether playback is currently paused.
     pub fn is_paused(&self) -> bool {
         !self.playing.get()
     }
@@ -180,22 +184,27 @@ pub struct AudioHandle {
 }
 
 impl AudioHandle {
+    /// Current playback position in seconds (read from shared atomic).
     pub fn time(&self) -> f64 {
         f64::from_bits(self.time.load(Ordering::Relaxed))
     }
 
+    /// Whether the audio thread is currently paused (read from shared atomic).
     pub fn is_paused(&self) -> bool {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// Send a pause/resume command to the audio thread.
     pub fn set_paused(&self, paused: bool) {
         let _ = self.cmd.send(AudioCmd::Pause(paused));
     }
 
+    /// Send a seek command to the audio thread.
     pub fn seek(&self, t: f64) {
         let _ = self.cmd.send(AudioCmd::Seek(t));
     }
 
+    /// Signal the audio thread to shut down.
     pub fn quit(&self) {
         let _ = self.cmd.send(AudioCmd::Quit);
     }

@@ -11,32 +11,45 @@ use std::collections::HashMap;
 
 // ── Serde models matching extra.json ──
 
+/// Root data from extra.json, containing BPM overrides and effect definitions.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtraRoot {
+    /// BPM override timeline entries.
     #[serde(default)]
     pub bpm: Vec<ExtraBpmItem>,
+    /// Post-processing effect definitions.
     #[serde(default)]
     pub effects: Vec<ExtraEffect>,
 }
 
+/// A BPM override entry, specifying a new BPM value at a given time signature.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtraBpmItem {
+    /// Time signature (measure, beat, division) at which the override takes effect.
     pub time: Triple,
+    /// Target BPM value.
     pub bpm: f64,
 }
 
+/// A post-processing effect definition loaded from extra.json.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtraEffect {
+    /// Start time of the effect (measure, beat, division).
     pub start: Triple,
+    /// End time of the effect (measure, beat, division).
     pub end: Triple,
+    /// Name of the shader to apply.
     pub shader: String,
+    /// Whether the effect applies globally to the entire frame.
     #[serde(default)]
     pub global: bool,
+    /// Render priority (lower values are processed first).
     #[serde(default)]
     pub priority: u32,
+    /// Keyframed uniform variable values.
     #[serde(default)]
     pub vars: HashMap<String, serde_json::Value>,
 }
@@ -45,10 +58,15 @@ pub struct ExtraEffect {
 
 /// A resolved, active effect ready for the GPU pipeline.
 pub struct EvalEffect {
+    /// Name of the shader program to use.
     pub shader_name: String,
+    /// Start beat (computed from time signature).
     pub start_beat: f64,
+    /// End beat (computed from time signature).
     pub end_beat: f64,
+    /// Whether the effect applies globally.
     pub global: bool,
+    /// Render priority for ordering.
     pub priority: u32,
     /// Flat uniform values computed at the current beat.
     pub uniforms: Vec<f32>,

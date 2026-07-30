@@ -15,14 +15,17 @@ fn default_event() -> RPEEvent {
 /// Unified chart format interface.
 /// Every parser converts its source into an `RPEChart` plus metadata,
 /// so the rest of the editor works unchanged.
-
 pub trait ChartParser {
+    /// Probe `bytes` to determine whether this format can handle the input.
     fn detect(bytes: &[u8]) -> bool;
+    /// Parse `bytes` into an [`RPEChart`] using the given `info` scaffolding.
     fn parse_chart(bytes: &[u8], info: &ChartInfo) -> Result<RPEChart>;
 }
 
 // ── Format registry ──
 
+/// Probe the bytes against all registered parsers and return the format tag
+/// (`"rpe"`, `"pec"`, `"pgr"`, `"pss"`, or `"unknown"`).
 pub fn detect_format(bytes: &[u8]) -> &'static str {
     if RpeParser::detect(bytes) { "rpe" }
     else if PecParser::detect(bytes) { "pec" }
@@ -31,6 +34,7 @@ pub fn detect_format(bytes: &[u8]) -> &'static str {
     else { "unknown" }
 }
 
+/// Dispatch to the appropriate parser by format tag and return the parsed chart.
 pub fn parse_chart(format: &str, bytes: &[u8], info: &ChartInfo) -> Result<RPEChart> {
     match format {
         "rpe" => RpeParser::parse_chart(bytes, info),
@@ -43,6 +47,8 @@ pub fn parse_chart(format: &str, bytes: &[u8], info: &ChartInfo) -> Result<RPECh
 
 // ── RPE parser (JSON) ──
 
+/// RPE (RPE JSON) format parser. Detects `{"META": ...}` and deserialises
+/// directly via serde.
 pub struct RpeParser;
 
 impl ChartParser for RpeParser {
@@ -57,6 +63,8 @@ impl ChartParser for RpeParser {
 
 // ── PEC parser (Phigros Editor Chart, text format) ──
 
+/// PEC text-format parser. Detects a leading number (offset line) and parses
+/// a single-line chart with events and notes as space-delimited tokens.
 pub struct PecParser;
 
 impl ChartParser for PecParser {
@@ -252,6 +260,9 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
 
 // ── PGR (Phigros official chart JSON) parser ──
 
+/// PGR (Phigros official JSON) format parser. Detects `"format_version"` or
+/// `"judge_line_list"` (without `"META"`) and deserialises via serde with
+/// camelCase mapping.
 pub struct PgrParser;
 
 #[derive(serde::Deserialize)]
@@ -423,6 +434,9 @@ fn ev_to_rpe(ev: PgrEvent) -> RPEEvent {
 
 // ── PSS parser (Phimakor Streamable Sheet, NDJSON) ──
 
+/// PSS (Phimakor Streamable Sheet v2, NDJSON) format parser. Detects
+/// `"type":"meta"` on the first line and delegates to
+/// [`from_stream_bytes`](crate::core::stream::from_stream_bytes).
 pub struct PssParser;
 
 impl ChartParser for PssParser {

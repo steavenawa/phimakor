@@ -5,7 +5,7 @@
 //!
 //! # Quick start
 //!
-//! ```ignore
+//! ```text
 //! import phimakor as pk
 //!
 //! # Open an editor session (with undo/redo)
@@ -395,7 +395,7 @@ impl PyNoteState {
 /// Loads a chart directory and evaluates note/line state at arbitrary
 /// points in time. Useful for headless analysis and rendering.
 ///
-/// ```ignore
+/// ```text
 /// chart = pk.Chart.open("path/to/chart")
 /// state = chart.state_at(time=10.5)
 /// ```
@@ -444,7 +444,7 @@ impl PyChart {
 /// Open a chart directory, add/remove notes and events, undo/redo
 /// operations, and save back to disk.
 ///
-/// ```ignore
+/// ```text
 /// doc = pk.Editor.open("path/to/chart")
 /// n = pk.Note(kind=1, start_beat=4.0, position_x=0.0)
 /// doc.add_note(line=0, note=n)

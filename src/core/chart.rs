@@ -22,7 +22,9 @@ use super::{
 
 /// One frame of evaluated chart state, produced by [`Chart::state_at`].
 pub struct FrameState {
+    /// Chart clock time in seconds for this frame.
     pub time: f64,
+    /// Per-line evaluated state in `judgeLineList` order.
     pub lines: Vec<LineState>,
     /// Notes whose hit time was crossed between the previous and this
     /// `state_at` call (for hitsounds/FX). Independent of culling: notes no
@@ -38,6 +40,7 @@ pub struct FiredNote {
     pub kind: u8,
     /// Note x in internal units (`position_x / 675`).
     pub x: f32,
+    /// `true` if this note is a fake (no score contribution).
     pub fake: bool,
     /// `true` for hold sustain-beat repeats; `false` for the initial hit
     /// (all kinds, including a hold's first hit).
@@ -48,19 +51,26 @@ pub struct FiredNote {
     pub hold_tail: bool,
 }
 
+/// Per-line evaluated state for one frame.
+/// See also [`Chart::state_at`].
 pub struct LineState {
+    /// Line opacity in [0, 1].
     pub alpha: f32,
     /// Radians, ready for `Rotation2`.
     pub rotation: f32,
     /// Internal coords (center origin, x ±1, y ±0.83175).
     pub position: [f32; 2],
+    /// Scale multiplier `[x, y]` in internal units.
     pub scale: [f32; 2],
+    /// RGBA color in `[0, 1]` range.
     pub color: [f32; 4],
     /// `None` = built-in `line.png`; `Some` = file in chart dir.
     pub texture: Option<String>,
+    /// Draw ordering (higher = drawn on top).
     pub z_order: i32,
+    /// Visible notes for this frame, in draw order.
     pub notes: Vec<NoteState>,
-    /// [E] CtrlObject: pos / size / alpha / y control values for this frame.
+    /// `[E]` CtrlObject: pos / size / alpha / y control values for this frame.
     pub ctrl_pos: f32,
     pub ctrl_size: f32,
     pub ctrl_alpha: f32,
@@ -71,6 +81,8 @@ pub struct LineState {
     pub pe_hide: bool,
 }
 
+/// Evaluated per-note state for one frame.
+/// See also [`LineState`].
 pub struct NoteState {
     /// 1 tap, 2 hold, 3 flick, 4 drag.
     pub kind: u8,
@@ -83,9 +95,13 @@ pub struct NoteState {
     pub relative: [f32; 2],
     /// Hold body end in the same relative space as `relative[1]`.
     pub hold_end_y: Option<f64>,
+    /// Opacity in [0, 1].
     pub alpha: f32,
+    /// Note size multiplier.
     pub scale: f32,
+    /// `true` = above the line (normal), `false` = below (mirrored).
     pub above: bool,
+    /// `true` if this is a fake note (no score, no hitsound).
     pub fake: bool,
     /// Multiple-hint: another note (any line, fakes included) shares the
     /// exact same hit time. Port of prpr `process_lines` (parse.rs).
@@ -174,6 +190,9 @@ impl<T> RPEEvent<T> {
         ((int(p[0]) * 100 + int(p[1])) as u16, int(p[2]), int(p[3]))
     }
 
+    /// Resolve the tween function for this RPE event.
+    ///
+    /// Caches bezier curves in `bezier_map`; clamps easing left/right values.
     pub fn tween(&self, bezier_map: &BezierMap) -> Rc<dyn TweenFunction> {
         // easingType < 1 counts as 1; >= 30 falls back to linear.
         let tween = RPE_TWEEN_MAP.get(self.easing_type.max(1) as usize).copied().unwrap_or(RPE_TWEEN_MAP[0]);
@@ -608,6 +627,10 @@ fn get_bezier_map(rpe: &RPEChart) -> BezierMap {
 // Chart
 // ---------------------------------------------------------------------------
 
+/// A fully loaded Phigros chart, ready for per-frame evaluation.
+///
+/// Parses RPE-format chart data and produces per-frame [`FrameState`]
+/// via [`state_at`](Chart::state_at).
 pub struct Chart {
     offset: f32,
     duration: f64,
@@ -1012,6 +1035,7 @@ impl Chart {
         frame
     }
 
+    /// Total chart duration in seconds.
     pub fn duration(&self) -> f64 {
         self.duration
     }

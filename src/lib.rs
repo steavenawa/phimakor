@@ -1,6 +1,5 @@
-//! phimakor library: RPE chart evaluation core, audio clock, wgpu renderer.
+//! phimakor library: high performance chart editor/previewer that with any you need it. Including Python, Gui, FXs and More Fancy And Smoothly.
 //!
-//! Architecture overview: [`docs/render-arch.md`] and [`docs/perf.md`].
 //!
 //! The `phimakor` binary (`main.rs`) is a thin winit shell over these
 //! modules; embedders (iced editor, mobile readback) use
@@ -32,7 +31,7 @@ mod python_bindings;
 
 /// Python bindings for the Phimakor chart engine.
 ///
-/// ```ignore
+/// ```text
 /// import phimakor as pk
 /// doc = pk.Editor.open("chart_dir")
 /// print(doc.info().name)

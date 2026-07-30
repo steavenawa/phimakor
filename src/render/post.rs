@@ -7,17 +7,26 @@ use std::collections::HashMap;
 
 /// A single active effect instance (from extra.json).
 pub struct ActiveEffect {
+    /// Index into the built-in [`EFFECTS`] array.
+    /// `usize::MAX` signals a custom shader loaded from the chart directory.
     pub shader_idx: usize,
-    pub custom_name: Option<String>,  // if shader_idx == usize::MAX, use this
+    /// Custom shader filename used when `shader_idx` is `usize::MAX`.
+    pub custom_name: Option<String>,
+    /// Execution order within the effect chain (lower = earlier).
     pub priority: u32,
+    /// Float values written into the effect's uniform buffer each frame.
     pub uniform_values: Vec<f32>,
-    pub uniform_count: usize,         // how many f32 values are meaningful
+    /// How many leading elements of `uniform_values` are meaningful.
+    pub uniform_count: usize,
 }
 
 /// Ping-pong pair + per-effect GPU pipelines.
 pub struct PostPipe {
+    /// Ping-pong colour targets (alternate read/write for multi-pass effects).
     pub(crate) targets: [Option<wgpu::Texture>; 2],
+    /// Texture views for the ping-pong targets.
     pub(crate) target_views: [Option<wgpu::TextureView>; 2],
+    /// Index of the current write target (toggles 0/1 each pass).
     idx: usize,
 
     /// Bind group layout for screen texture (shared by all effects, needed by Renderer too).
@@ -35,8 +44,11 @@ pub struct PostPipe {
     /// Active effects for the current frame.
     pub active: Vec<ActiveEffect>,
 
+    /// Viewport width in pixels.
     pub width: u32,
+    /// Viewport height in pixels.
     pub height: u32,
+    /// Colour format of all render targets.
     pub tex_format: wgpu::TextureFormat,
 }
 
@@ -49,6 +61,8 @@ struct EffPipe {
 }
 
 impl PostPipe {
+    /// Create a new post-processing pipeline. Builds the blit pipeline, sampler,
+    /// screen bind-group layout, and initial ping-pong targets at the given size.
     pub fn new(device: &wgpu::Device, width: u32, height: u32, tex_fmt: wgpu::TextureFormat) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("post-sampler"),
@@ -143,6 +157,7 @@ impl PostPipe {
         pipe
     }
 
+    /// Recreate ping-pong targets at a new viewport size.
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);

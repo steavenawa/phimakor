@@ -7,6 +7,7 @@ use crate::core::FrameState;
 use super::{Renderer, TextAnchor};
 
 /// Offscreen [`Renderer`] + target texture + readback buffer.
+/// Returns RGBA8 pixel data for embedding in the iced editor or mobile readback.
 pub struct PreviewEngine {
     renderer: Renderer,
     /// Offscreen color target (RENDER_ATTACHMENT | COPY_SRC).
@@ -22,6 +23,8 @@ pub struct PreviewEngine {
 }
 
 impl PreviewEngine {
+    /// Create an offscreen preview renderer at the given size.
+    /// Spawns a surfaceless wgpu device and allocates the readback staging buffer.
     pub async fn new(width: u32, height: u32) -> anyhow::Result<Self> {
         let (width, height) = (width.max(1), height.max(1));
         let renderer = Renderer::new_surfaceless(width, height).await?;
@@ -59,6 +62,7 @@ impl PreviewEngine {
         (target, readback, padded_bpr)
     }
 
+    /// Resize the offscreen target and readback staging buffer.
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 || (width == self.width && height == self.height) {
             return;
@@ -73,6 +77,7 @@ impl PreviewEngine {
         self.renderer.resize(width, height);
     }
 
+    /// Current output dimensions in pixels.
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }
@@ -133,18 +138,22 @@ impl PreviewEngine {
         &self.pixels
     }
 
+    /// Set the background image (delegates to [`Renderer::set_background`]).
     pub fn set_background(&mut self, img_bytes: &[u8], dim: f32) -> anyhow::Result<()> {
         self.renderer.set_background(img_bytes, dim)
     }
 
+    /// Load a named texture (delegates to [`Renderer::load_texture`]).
     pub fn load_texture(&mut self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
         self.renderer.load_texture(name, bytes)
     }
 
+    /// Switch playfield canvas aspect ratio (delegates to [`Renderer::set_playfield_aspect`]).
     pub fn set_playfield_aspect(&mut self, aspect: f32) {
         self.renderer.set_playfield_aspect(aspect);
     }
 
+    /// Update playback progress for the top progress bar (delegates to [`Renderer::set_progress`]).
     pub fn set_progress(&mut self, progress: f32) {
         self.renderer.set_progress(progress);
     }
@@ -152,10 +161,12 @@ impl PreviewEngine {
     /// Read-only access to the last rendered RGBA frame.
     pub fn pixels(&self) -> &[u8] { &self.pixels }
 
+    /// Spawn a hit-effect burst at the given canvas position.
     pub fn spawn_hit_fx(&mut self, pos_canvas: [f32; 2]) {
         self.renderer.spawn_hit_fx(pos_canvas);
     }
 
+    /// Queue a text overlay for the next frame.
     pub fn draw_text(&mut self, text: &str, anchor: TextAnchor, color: [f32; 4]) {
         self.renderer.draw_text(text, anchor, color);
     }

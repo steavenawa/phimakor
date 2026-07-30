@@ -2,7 +2,7 @@
 //! undo/redo command history (操作分支), debounced background saving, and
 //! first-class judge-line split/bind ops (拆线/绑线).
 //!
-//! History is the classic command pattern stored as *data* (the [`Inverse`]
+//! History is the classic command pattern stored as *data* (the `Inverse`
 //! enum — no closures): every applied op records everything needed to undo
 //! AND redo it. The stacks are linear for now; the intended 操作分支 upgrade
 //! path is a history tree — give each entry a parent link and per-node
@@ -25,6 +25,7 @@ use crate::core::bpm::Triple;
 // Errors
 // ---------------------------------------------------------------------------
 
+/// Errors that can occur during chart editing operations.
 #[derive(Debug)]
 pub enum EditError {
     Io(std::io::Error),
@@ -396,10 +397,12 @@ impl ChartDocument {
         })
     }
 
+    /// Returns a reference to the parsed chart metadata.
     pub fn info(&self) -> &ChartInfo {
         &self.info
     }
 
+    /// Returns a reference to the in-memory chart model.
     pub fn chart(&self) -> &RPEChart {
         &self.chart
     }
@@ -424,6 +427,7 @@ impl ChartDocument {
         Ok(index)
     }
 
+    /// Removes the note at `index` in the given `line`, returning the removed note.
     pub fn remove_note(&mut self, line: usize, index: usize) -> Result<RPENote, EditError> {
         let notes = self.notes_mut(line)?;
         if index >= notes.len() {
@@ -491,6 +495,8 @@ impl ChartDocument {
         Ok(())
     }
 
+    /// Removes the event at `index` from the specified (line, layer, kind)
+    /// event list, returning the removed event.
     pub fn remove_event(
         &mut self,
         line: usize,
@@ -562,6 +568,8 @@ impl ChartDocument {
 
     // --- history ---
 
+    /// Reverts the most recent edit. Returns `true` if an edit was undone,
+    /// `false` if the undo stack was empty.
     pub fn undo(&mut self) -> bool {
         let Some(inv) = self.undo_stack.pop() else {
             return false;
@@ -579,6 +587,8 @@ impl ChartDocument {
         }
     }
 
+    /// Re-applies the most recently undone edit. Returns `true` if an edit
+    /// was redone, `false` if the redo stack was empty.
     pub fn redo(&mut self) -> bool {
         let Some(inv) = self.redo_stack.pop() else {
             return false;
@@ -596,10 +606,12 @@ impl ChartDocument {
         }
     }
 
+    /// Returns `true` when there are edits that can be undone.
     pub fn can_undo(&self) -> bool {
         !self.undo_stack.is_empty()
     }
 
+    /// Returns `true` when there are undone edits that can be redone.
     pub fn can_redo(&self) -> bool {
         !self.redo_stack.is_empty()
     }

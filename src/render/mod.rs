@@ -1,11 +1,19 @@
-//! wgpu 30 renderer for M0: procedural colored quads + named textures.
+//! wgpu 30 renderer for M0. Architecture:
 //!
-//! Consumes [`crate::core::FrameState`] only; never touches serde models or IO.
-//!
-//! Internal coordinates (see `crate::core`): center origin, x ∈ [-1, 1],
-//! y down-positive (same convention as prpr's world space). The playfield
-//! (16:9, letterboxed with black bars) spans world x ±1, world y ±1/ASPECT;
-//! the letterbox scale is pixel-uniform so rotated quads stay rectangular.
+//! - **Quad pipeline**: instanced `TriangleStrip` quads with a shared WGSL shader
+//!   (`SHADER`). Each instance encodes a 2D affine transform, RGBA tint, and UV rect.
+//! - **Coordinate model**: centre-origin world space (x ∈ ±1, y ∈ ±1/ASPECT),
+//!   letterboxed for non-16:9 windows. Canvas-to-world: 675 px → 1.0 world unit.
+//! - **Draw pipeline**: `draw_to_view` builds a `DrawCmd` list
+//!   → converts to `Instance` records → vertex‑buffer upload → scene render pass
+//!   → post‑processing (see `post`) → UI overlay pass (iced + timeline).
+//! - **Note rendering**: sprite‑based (textured) with coloured‑quad fallback.
+//!   Holds use atlas textures (head + stretchable body + tail); _mh variants for
+//!   multi‑press hints. Z‑order sorted by judge line, then kind priority.
+//! - **Post‑processing**: ping‑pong render targets with per‑effect pipelines.
+//!   Effects loaded from `extra.json` (grayscale, chromatic, glitch, vignette, etc.).
+//! - **Hit effects**: sprite‑sheet burst particles (`fx.rs`).
+//! - **Consumes** [`crate::core::FrameState`]; never touches serde models or IO.
 
 use std::{borrow::Cow, collections::HashMap, mem::size_of, sync::Arc};
 
@@ -82,8 +90,11 @@ fn mat_mul(a: &Mat3, b: &Mat3) -> Mat3 {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct DrawUniform {
+    /// Column-major 2D affine transform (Mat3 padded to 3×vec4).
     model: Mat3,
+    /// RGBA tint, pre-multiplied alpha in scene pass.
     color: [f32; 4],
+    /// UV rectangle: [u0, v0, du, dv]; final UV = xy + quad_uv * zw.
     uv_rect: [f32; 4],
 }
 
@@ -209,6 +220,13 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 /// Shared pipeline setup for the window and offscreen paths: quad shader,
 /// texture bind-group layout + sampler, alpha-blended TriangleStrip instanced
 /// quads. `format` is the color target (surface format or offscreen Rgba8Unorm).
+///
+/// The vertex shader expects per-instance attributes matching [`Instance`] layout:
+/// `@location(0)`: `m01` (linear part `[a, b, c, d]`),
+/// `@location(1)`: `m2p` (translation `[tx, ty, 0, 0]`),
+/// `@location(2)`: `color` (RGBA),
+/// `@location(3)`: `uv_rect` (`[u0, v0, du, dv]`).
+/// See the `VsIn` struct inside `SHADER` for the WGSL definition.
 pub(crate) fn create_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -283,6 +301,9 @@ pub(crate) fn create_pipeline(
     (pipeline, tex_bgl, sampler)
 }
 
+/// wgpu-based renderer driving the main window (or offscreen preview).
+/// Holds the device, queue, pipelines, double-buffered instance storage,
+/// texture cache, background image, post-processing pipe, and UI overlay state.
 pub struct Renderer {
     /// Window surface; `None` for surfaceless (offscreen preview) renderers.
     surface: Option<wgpu::Surface<'static>>,
@@ -329,9 +350,13 @@ pub struct Renderer {
 }
 
 impl Renderer {
+    /// Borrow the wgpu device.
     pub fn device(&self) -> &wgpu::Device { &self.device }
+    /// Borrow the wgpu queue.
     pub fn queue(&self) -> &wgpu::Queue { &self.queue }
+    /// Borrow the texture bind-group layout (shared by all textures).
     pub fn tex_bgl(&self) -> &wgpu::BindGroupLayout { &self.tex_bgl }
+    /// Borrow the shared linear sampler.
     pub fn sampler(&self) -> &wgpu::Sampler { &self.sampler }
 
     /// Acquire the next surface texture. Returns `Err` variants that the caller
@@ -345,6 +370,8 @@ impl Renderer {
         }
     }
 
+    /// Create a new windowed renderer: surface, adapter, device, pipelines,
+    /// double-buffered instance storage, white texture, and post-processing pipe.
     pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
@@ -569,10 +596,13 @@ impl Renderer {
         }
     }
 
+    /// Clear all pending hit-effect bursts.
     pub fn clear_hit_fx(&mut self) { self.hit_fx.clear(); }
 
+    /// Viewport size in pixels.
     pub fn size(&self) -> [u32; 2] { self.size }
 
+    /// Enable or disable V-sync (reconfigures the surface present mode).
     pub fn set_vsync(&mut self, enabled: bool) {
         self.vsync = enabled;
         if let Some(config) = &mut self.config {
@@ -581,6 +611,8 @@ impl Renderer {
         }
     }
 
+    /// Resize the viewport, surface, and post-processing targets.
+    /// Ignores zero dimensions (minimised window).
     pub fn resize(&mut self, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return; // minimized; keep last valid config

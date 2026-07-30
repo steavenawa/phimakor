@@ -22,7 +22,8 @@ use std::collections::HashMap;
 
 const DEFAULT_CHUNK_SPAN: f64 = 10.0;
 
-/// Serialize into PSS bytes (tracking chunk offsets for seeking).
+/// Serialize an RPE chart + metadata into PSS (Phimakor Streamable Sheet v2) bytes.
+/// Records chunk byte offsets in the trailing index for HTTP Range seeking.
 pub fn to_stream_bytes(chart: &RPEChart, info: &ChartInfo) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut chunk_index: Vec<ChunkEntry> = Vec::new();
@@ -176,7 +177,8 @@ pub fn to_stream_bytes(chart: &RPEChart, info: &ChartInfo) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Parse full PSS from bytes (all chunks).
+/// Parse a complete PSS byte stream back into an RPE chart + metadata.
+/// Merges all chunk events and notes into judge lines, sorts events by start time.
 pub fn from_stream_bytes(bytes: &[u8]) -> Result<(RPEChart, ChartInfo)> {
     let source = std::str::from_utf8(bytes)?;
     let mut info = ChartInfo::default();

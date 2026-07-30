@@ -7,6 +7,8 @@ use std::{any::Any, ops::Range, rc::Rc};
 
 use crate::core::{Color, EPS};
 
+/// Numeric identifier for a tween function, indexing into [`TWEEN_FUNCTIONS`]
+/// or [`INT_TWEEN_FUNCTIONS`].
 pub type TweenId = u8;
 
 const PI: f32 = std::f32::consts::PI;
@@ -101,6 +103,11 @@ fn bounce(x: f32) -> f32 {
     })
 }
 
+/// Lookup table of 33 easing functions indexed by [`TweenId`].
+///
+/// Indices: 0 = zero, 1 = one, 2 = linear, then groups of three (In, Out,
+/// InOut) for Sine, Quad, Cubic, Quart, Quint, Expo, Circ, Back, Elastic,
+/// Bounce.
 #[rustfmt::skip]
 pub static TWEEN_FUNCTIONS: [fn(f32) -> f32; 33] = [
 	|_| 0.,			|_| 1.,			|x| x,
@@ -247,6 +254,10 @@ fn int_bounce(x: f32) -> f32 {
     x - bounce_h(1.) + bounce_h(1. - x)
 }
 
+/// Lookup table of 33 integrated easing functions indexed by [`TweenId`].
+///
+/// Same index layout as [`TWEEN_FUNCTIONS`]; each entry is the definite
+/// integral from 0 to x of the corresponding easing curve.
 #[rustfmt::skip]
 pub static INT_TWEEN_FUNCTIONS: [fn(f32) -> f32; 33] = [
     |_| 0.,				|x| x,			|x| x * x / 2.,
@@ -263,10 +274,14 @@ pub static INT_TWEEN_FUNCTIONS: [fn(f32) -> f32; 33] = [
     i1!(int_bounce),	i2!(int_bounce),	i3!(int_bounce),
 ];
 
+/// Trait for easing functions: `y(x)` maps an input `x` in `[0, 1]` to an
+/// eased output (not necessarily in `[0, 1]`).
 pub trait TweenFunction {
+    /// Evaluate the easing curve at `x ∈ [0, 1]`.
     fn y(&self, x: f32) -> f32;
     fn as_any(&self) -> &dyn Any;
 
+    /// Approximate the derivative at `x` via central differences.
     fn derivative(&self, x: f32) -> f32 {
         let eps = 1e-6;
         let l = (x - eps).max(1e-7);
@@ -278,6 +293,7 @@ pub trait TweenFunction {
     }
 }
 
+/// A tween that dispatches to [`TWEEN_FUNCTIONS`] by index.
 pub struct StaticTween(pub TweenId);
 impl TweenFunction for StaticTween {
     fn y(&self, x: f32) -> f32 {
@@ -290,6 +306,7 @@ impl TweenFunction for StaticTween {
 }
 
 impl StaticTween {
+    /// Wrap a [`TweenId`] in an `Rc<dyn TweenFunction>`.
     pub fn get_rc(tween: TweenId) -> Rc<dyn TweenFunction> {
         // ponytail: prpr caches these in a thread_local; one small alloc per
         // keyframe at load time is fine, add the cache back if profiling says so.
@@ -297,6 +314,7 @@ impl StaticTween {
     }
 }
 
+/// A tween that dispatches to [`INT_TWEEN_FUNCTIONS`] by index.
 pub struct IntStaticTween(pub TweenId);
 impl TweenFunction for IntStaticTween {
     fn y(&self, x: f32) -> f32 {
@@ -309,11 +327,14 @@ impl TweenFunction for IntStaticTween {
 }
 
 impl IntStaticTween {
+    /// Wrap a [`TweenId`] in an `Rc<dyn TweenFunction>` backed by the integral
+    /// table.
     pub fn get_rc(tween: TweenId) -> Rc<dyn TweenFunction> {
         Rc::new(IntStaticTween(tween))
     }
 }
 
+/// An integrated tween clamped to an arbitrary `x`/`y` range.
 pub struct IntClampedTween {
     tween_id: TweenId,
     x_range: Range<f32>,
@@ -339,6 +360,8 @@ impl TweenFunction for IntClampedTween {
 }
 
 impl IntClampedTween {
+    /// Create an integrated clamped tween from a standard [`TweenId`] and an
+    /// `x` range; the `y` range is computed automatically.
     pub fn new(tween_id: TweenId, x_range: Range<f32>) -> Self {
         let tween = TWEEN_FUNCTIONS[tween_id as usize];
         let y_range = tween(x_range.start)..tween(x_range.end);
@@ -353,6 +376,7 @@ impl IntClampedTween {
 }
 
 // TODO assuming monotone, but actually they're not (e.g. Back tween)
+/// A standard tween clamped to given `x` and `y` ranges.
 pub struct ClampedTween(pub TweenId, pub Range<f32>, pub Range<f32>);
 impl TweenFunction for ClampedTween {
     fn y(&self, x: f32) -> f32 {
@@ -365,6 +389,8 @@ impl TweenFunction for ClampedTween {
 }
 
 impl ClampedTween {
+    /// Create a clamped tween from a [`TweenId`] and `x` range; the `y` range
+    /// is computed automatically.
     pub fn new(tween: TweenId, range: Range<f32>) -> Self {
         let f = TWEEN_FUNCTIONS[tween as usize];
         let y_range = f(range.start)..f(range.end);
@@ -372,9 +398,12 @@ impl ClampedTween {
     }
 }
 
+/// The numerical integral of an arbitrary [`TweenFunction`] via Gauss–Legendre
+/// quadrature (3-point).
 pub struct GeneralIntTween(Rc<dyn TweenFunction>);
 
 impl GeneralIntTween {
+    /// Wrap a tween function for numerical integration.
     pub fn new(tween: Rc<dyn TweenFunction>) -> Self {
         Self(tween)
     }
@@ -415,6 +444,7 @@ const SUBDIVISION_PRECISION: f32 = 1e-7;
 const SUBDIVISION_MAX_ITERATION: usize = 10;
 const SLOPE_EPS: f32 = 1e-7;
 
+/// A cubic Bézier easing curve parameterized by two control points.
 pub struct BezierTween {
     sample_table: [f32; SAMPLE_TABLE_SIZE],
     pub p1: (f32, f32),
@@ -477,6 +507,8 @@ impl BezierTween {
         t
     }
 
+    /// Solve for the parameter `t` such that the Bézier curve's x-coordinate
+    /// equals the given `x`.
     pub fn t_for_x(&self, x: f32) -> f32 {
         if x == 0. || x == 1. {
             return x;
@@ -492,6 +524,8 @@ impl BezierTween {
         }
     }
 
+    /// Create a new Bézier tween with the given control points `(x1, y1)` and
+    /// `(x2, y2)`.
     pub fn new(p1: (f32, f32), p2: (f32, f32)) -> Self {
         Self {
             sample_table: std::array::from_fn(|i| Self::sample(p1.0, p2.0, i as f32 * SAMPLE_STEP)),
@@ -501,6 +535,7 @@ impl BezierTween {
     }
 }
 
+/// The "major" easing category (sine, quad, cubic, …).
 #[repr(u8)]
 pub enum TweenMajor {
     Plain,
@@ -516,6 +551,7 @@ pub enum TweenMajor {
     Bounce,
 }
 
+/// The "minor" easing variant: in, out, or in-out.
 #[repr(u8)]
 pub enum TweenMinor {
     In,
@@ -523,6 +559,7 @@ pub enum TweenMinor {
     InOut,
 }
 
+/// Combine a [`TweenMajor`] and [`TweenMinor`] into a [`TweenId`].
 pub const fn easing_from(major: TweenMajor, minor: TweenMinor) -> TweenId {
     major as u8 * 3 + minor as u8
 }
@@ -552,7 +589,9 @@ pub const RPE_TWEEN_MAP: [TweenId; 30] = {
     ]
 };
 
+/// Trait for values that can be linearly interpolated (tweened).
 pub trait Tweenable: Clone {
+    /// Linearly interpolate between `x` and `y` at parameter `t` ∈ [0, 1].
     fn tween(x: &Self, y: &Self, t: f32) -> Self;
     fn add(_x: &Self, _y: &Self) -> Self {
         unimplemented!()
@@ -594,12 +633,19 @@ impl Tweenable for Color {
 // Speed integration (from prpr/src/parse/rpe.rs)
 // ---------------------------------------------------------------------------
 
+/// Determines how speed-integral tweens are evaluated.
 #[derive(Copy, Clone)]
 pub enum SpeedEasingMode {
+    /// Uses the derivative of the tween to compute speed.
     Legacy,
+    /// Uses the integral of the tween to compute speed.
     Modern,
 }
 
+/// A tween that integrates a speed function to produce a position curve.
+///
+/// Wraps a [`TweenFunction`] and applies a linear transform `y(x)·k + b·x`,
+/// then normalizes by the total area so `y(0) = 0` and `y(1) = 1`.
 pub struct SpeedIntegralTween {
     tween: Rc<dyn TweenFunction>,
     k: f32,
@@ -608,6 +654,8 @@ pub struct SpeedIntegralTween {
 }
 
 impl SpeedIntegralTween {
+    /// Try to create a speed-integral tween. Returns `None` if the total area
+    /// is zero or non-finite.
     pub fn try_create(tween: Rc<dyn TweenFunction>, k: f32, b: f32) -> Option<(Rc<dyn TweenFunction>, f32)> {
         let mut result = Self { tween, k, b, total: 0. };
         let total = result.partial(1.);
@@ -644,6 +692,7 @@ impl TweenFunction for SpeedIntegralTween {
     }
 }
 
+/// Build a linear speed tween between `start_speed` and `end_speed`.
 pub fn speed_linear_tween(start_speed: f32, end_speed: f32) -> Rc<dyn TweenFunction> {
     if (start_speed - end_speed).abs() < EPS as f32 {
         StaticTween::get_rc(2)
@@ -654,6 +703,10 @@ pub fn speed_linear_tween(start_speed: f32, end_speed: f32) -> Rc<dyn TweenFunct
     }
 }
 
+/// Build a speed tween for a segment using the given easing curve and mode.
+///
+/// Returns the tween and the total area (used for timing). Falls back to
+/// [`speed_linear_tween`] when the computation fails.
 pub fn speed_segment_tween(mode: SpeedEasingMode, start_speed: f32, end_speed: f32, tween: Rc<dyn TweenFunction>) -> (Rc<dyn TweenFunction>, f32) {
     let (tween, total) = match mode {
         SpeedEasingMode::Legacy => {
