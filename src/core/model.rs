@@ -109,7 +109,7 @@ pub struct RPEExtendedEvents {
     pub gif_events: Option<Vec<RPEEvent>>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPENote {
     #[serde(rename = "type")]

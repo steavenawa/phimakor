@@ -712,10 +712,10 @@ impl Renderer {
             let r = size[0] / size[1];
             let uv = if r > aspect {
                 let w = aspect / r;
-                [(1.0 - w) * 0.5, 0.0, w, 1.0]
+                [(1.0 - w) * 0.5, 1.0, w, -1.0]
             } else {
                 let h = r / aspect;
-                [0.0, (1.0 - h) * 0.5, 1.0, h]
+                [0.0, (1.0 + h) * 0.5, 1.0, -h]
             };
             let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 1350.0 / aspect));
             cmds.push(DrawCmd {

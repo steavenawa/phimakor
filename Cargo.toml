@@ -3,10 +3,14 @@ name = "phimakor"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
-description = "Phigros chart editor (RPE format), derived from TeamFlos/phira prpr"
+description = "A Phigros/Phira high performance chart editor/previewer that with any you need it. Including Python, Gui, FXs and More Fancy And Smoothly."
 
 [features]
 profiling = ["dhat", "tracy-client"]
+python = ["dep:pyo3"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 anyhow = "*"
@@ -28,6 +32,7 @@ tracing-subscriber = { version = "*", features = ["env-filter", "time"] }
 tracing-flame = "*"
 dhat = { version = "*", optional = true }
 tracy-client = { version = "*", optional = true }
+pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }
 
 
 [dev-dependencies]

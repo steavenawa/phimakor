@@ -34,6 +34,8 @@ pub struct AudioClock {
     hit_click: Option<SamplesBuffer>,
     hit_drag: Option<SamplesBuffer>,
     hit_flick: Option<SamplesBuffer>,
+    /// Path to the music file, stored for re-creating the source after exhaustion.
+    music_path: std::path::PathBuf,
 }
 
 /// Decode a whole ogg into an in-memory sample buffer.
@@ -75,6 +77,7 @@ impl AudioClock {
             flick = load_samples(&res.join("flick.ogg"));
         }
 
+        let music_path = path.to_path_buf();
         Ok(Self {
             stream,
             player,
@@ -84,6 +87,7 @@ impl AudioClock {
             hit_click: click,
             hit_drag: drag,
             hit_flick: flick,
+            music_path,
         })
     }
 
@@ -115,12 +119,24 @@ impl AudioClock {
         !self.playing.get()
     }
 
-    /// Seek to `t` seconds from the start, clamped at 0. Seek failures are
-    /// tolerated (logged) — the clock base is reset regardless.
+    /// Seek to `t` seconds from the start, clamped at 0. If the previous
+    /// source has exhausted (track ended), re-create and re-append it so
+    /// seek + playback can restart. If the player was paused before the
+    /// seek, pause it again after re-appending.
     pub fn seek(&self, t: f64) {
         let t = t.max(0.0);
-        if let Err(e) = self.player.try_seek(Duration::from_secs_f64(t)) {
-            eprintln!("audio seek to {t:.2}s failed: {e}");
+        let was_playing = self.playing.get();
+        if self.player.try_seek(Duration::from_secs_f64(t)).is_err() {
+            // Source exhausted — re-create and re-append.
+            if let Ok(file) = std::fs::File::open(&self.music_path) {
+                if let Ok(source) = rodio::Decoder::try_from(file) {
+                    self.player.append(source);
+                    let _ = self.player.try_seek(Duration::from_secs_f64(t));
+                    if !was_playing {
+                        self.player.pause();
+                    }
+                }
+            }
         }
         self.pos.set(t);
         self.anchor.set(Instant::now());

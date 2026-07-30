@@ -1,0 +1,17 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "phimakor"
+requires-python = ">=3.10"
+authors = [
+    {name = "PhiMakor contributors"},
+]
+license = {text = "GPL-3.0-only"}
+description = "Phigros chart editor core — RPE chart parsing, editing, and evaluation"
+readme = "README.md"
+
+[tool.maturin]
+bindings = "pyo3"
+features = ["python"]

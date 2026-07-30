@@ -26,3 +26,20 @@ pub mod audio;
 pub mod core;
 pub mod engine;
 pub mod render;
+
+#[cfg(feature = "python")]
+mod python_bindings;
+
+/// Python bindings for the Phimakor chart engine.
+///
+/// ```ignore
+/// import phimakor as pk
+/// doc = pk.Editor.open("chart_dir")
+/// print(doc.info().name)
+/// ```
+#[cfg(feature = "python")]
+#[pyo3::pymodule]
+fn phimakor(_py: pyo3::Python<'_>, m: &pyo3::Bound<'_, pyo3::types::PyModule>) -> pyo3::PyResult<()> {
+    python_bindings::register(m)?;
+    Ok(())
+}
