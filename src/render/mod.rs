@@ -722,13 +722,11 @@ impl Renderer {
         } else {
             (1.0, window_aspect / aspect)
         };
-        // The RPE canvas (1350×900) is scaled UNIFORMLY by S to fit the
-        // playfield box (1350 × 1350/aspect px): y=1 (450 px) maps to the
-        // box's visible top at any aspect (16:9 shrinks the canvas with side
-        // bars; 3:2 fills it), sprites never distort, and nothing clips.
-        // kx/ky then letterbox the playfield into the window.
-        let fit = (1350.0 / aspect).min(900.0) / 900.0; // uniform canvas scale
-        let letterbox = mat_scale(kx * fit / CANVAS_W, ky * aspect * fit / CANVAS_W);
+        // Coordinate mapping (Phigros-style): the y unit adapts to the
+        // playfield aspect. world_x = canvas_x/675, world_y = canvas_y*aspect/675
+        // (so y:1 = 675/aspect px: 3:2→450, 16:9→379, 4:3→507, 1:1→675).
+        // kx/ky letterbox the playfield into the window preserving its aspect.
+        let letterbox = mat_scale(kx / CANVAS_W, ky * aspect / CANVAS_W);
 
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame
@@ -1033,7 +1031,7 @@ impl Renderer {
         // canvas top edge otherwise.
         if self.progress > 0.0 {
             let bar_h = 5.0;
-            let top = CANVAS_H; // canvas top: y=450 maps to the playfield top at any aspect
+            let top = CANVAS_W / aspect; // visible canvas y at the top
             let bar_w = 1350.0 * self.progress;
             if let Some(bl) = frame.lines.iter().find(|l| l.attach_ui.as_deref() == Some("bar")) {
                 if !bl.pe_hide && bl.alpha > 0.0 {
