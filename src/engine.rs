@@ -136,7 +136,7 @@ impl ChartSession {
                 let t = line.rotation;
                 let x = fired.x as f32;
                 let cx = (line.position[0] + t.cos() * x) * 675.0;
-                let cy = (line.position[1] + t.sin() * x) * 450.0;
+                let cy = (line.position[1] + t.sin() * x * 1.5) * 450.0;
                 self.engine.spawn_hit_fx([cx, cy]);
             }
         }

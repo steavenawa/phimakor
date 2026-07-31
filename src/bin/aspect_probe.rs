@@ -13,12 +13,14 @@ fn main() {
     for (name, aspect) in [("3:2", 1.5f32), ("16:9", 16.0 / 9.0), ("4:3", 4.0 / 3.0), ("1:1", 1.0)] {
         let (kx, ky) = if window_aspect >= aspect { (aspect / window_aspect, 1.0) } else { (1.0, window_aspect / aspect) };
         let fit = (1.5 / aspect).min(1.0);
+        // Event positions stretch on both axes by aspect/1.5 (sprites keep the
+        // uniform letterbox scale). y_top = canvas top (450) in world units.
         let ev_x = aspect / 1.5;
-        let ev_y = 1.5 / aspect;
+        let ev_y = aspect / 1.5;
         // Uniform letterbox: (kx/675, ky*aspect/675); positions ×(ev_x, ev_y)
         let lx = kx / 675.0;
         let ly = ky * aspect / 675.0;
-        // box top edge: canvas y=450 should hit world ky at every aspect
+        // box top edge in world units (canvas top 450, stretched by ev_y)
         let y_top = 450.0 * ev_y * ly;
         // sprite uniformity: screen px per canvas px on both axes
         let sx = lx * 640.0;
@@ -35,9 +37,10 @@ fn main() {
         let (cos, sin) = (line.rotation.cos(), line.rotation.sin());
         let nwx = lx * (ctrl_px + cos * nx - sin * ny);
         let nwy = ly * (ctrl_py + sin * nx + cos * ny);
-        // fx world pos: letterbox * T(cx*ev_x, cy*ev_y)
+        // fx world pos: letterbox * T(cx*ev_x, cy*ev_y); cy uses the canvas-X
+        // rotation term ×(675/450)=1.5 so the burst lands on the note center.
         let cx = (line.position[0] + cos * note.relative[0]) * 675.0;
-        let cy = (line.position[1] + sin * note.relative[0]) * 450.0;
+        let cy = (line.position[1] + sin * note.relative[0] * 1.5) * 450.0;
         let fwx = lx * cx * ev_x;
         let fwy = ly * cy * ev_y;
         println!(

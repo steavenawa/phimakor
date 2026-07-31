@@ -736,17 +736,16 @@ impl Renderer {
         // Uniform letterbox: canvas px → world /675 (x) and ×aspect/675 (y) —
         // the y×aspect exactly compensates the window aspect so SPRITES keep
         // a uniform screen scale at every playfield aspect. Positions get the
-        // per-axis factors separately (ev_x fills the width, ev_y puts y=450
-        // at the box top): see below.
+        // per-axis factors separately (ev_x/ev_y fill the box at every aspect,
+        // and the y stretch overflows the box at wide aspects): see below.
         let letterbox = mat_scale(kx / CANVAS_W, ky * aspect / CANVAS_W);
-        // Event-position x offset: x positions stretch by aspect/1.5 so the
-        // canvas fills the playfield box width at any aspect (3:2 → ×1.0,
-        // 16:9 → ×1.19, 4:3 → ×0.89, 1:1 → ×0.67). Sprites (sizes) are NOT
-        // affected — they keep the uniform letterbox scale.
+        // Event positions: both axes stretch by aspect/1.5 so the canvas
+        // fills the playfield box at any aspect (3:2 → ×1.0, 16:9 → ×1.19,
+        // 4:3 → ×0.89, 1:1 → ×0.67). At wide aspects the y content overflows
+        // the box top/bottom — the playfield edge is the box edge. Sprites
+        // (sizes) are NOT affected — they keep the uniform letterbox scale.
         let ev_x = aspect / 1.5;
-        // y positions: ×1.5/aspect so y=±450 (the canvas top/bottom) sits at
-        // the box edge at EVERY aspect.
-        let ev_y = 1.5 / aspect;
+        let ev_y = aspect / 1.5;
 
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame

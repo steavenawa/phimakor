@@ -36,8 +36,9 @@ impl Renderer {
 
     /// Queue draws for all live bursts (called from `render`, after notes).
     /// `letterbox` is the canvas px → NDC playfield transform.
-    /// `ev_x` = aspect/1.5, `ev_y` = 1.5/aspect: event positions are scaled
-    /// to fill the box (the fx burst pos is in canvas px, pre-ev).
+    /// `ev_x` = `ev_y` = aspect/1.5: event positions stretch with the playfield
+    /// aspect (the fx burst pos is in canvas px, pre-ev). The sprite itself
+    /// keeps the uniform scale (`side`), only its position stretches.
     /// Free function with field-split borrows: `cmds` already holds shared
     /// borrows of `self.textures`, so a `&mut self` method would not compile.
     pub(crate) fn push_hit_fx<'a>(
