@@ -483,7 +483,10 @@ fn extract_line_events(doc: &ChartDocument, line: usize, layer_idx: usize) -> Ve
             }
         }
     }
-    out.sort_by(|a, b| a.start_beats.total_cmp(&b.start_beats));
+    // Sorted by end_beats: the timeline draws binary-search the visible window
+    // (draw_5col_timeline partition_point). Index consistency is preserved —
+    // clicks and drawing share the same sorted vec.
+    out.sort_by(|a, b| a.end_beats.total_cmp(&b.end_beats));
     out
 }
 
@@ -492,7 +495,7 @@ fn extract_line_notes(doc: &ChartDocument, line: usize) -> Vec<ui::NoteEntry> {
     let rpe = doc.chart();
     let Some(jl) = rpe.judge_line_list.get(line) else { return vec![] };
     let Some(notes) = &jl.notes else { return vec![] };
-    notes.iter().enumerate().map(|(i, n)| ui::NoteEntry {
+    let mut out: Vec<ui::NoteEntry> = notes.iter().enumerate().map(|(i, n)| ui::NoteEntry {
         index: i,
         kind: n.kind,
         start_beats: n.start_time.beats(),
@@ -501,9 +504,11 @@ fn extract_line_notes(doc: &ChartDocument, line: usize) -> Vec<ui::NoteEntry> {
         speed: n.speed,
         scale: n.size,
         texture: n.hitsound.clone().unwrap_or_default(),
-    }).collect()
+    }).collect();
+    // Sorted by end_beats for the timeline's binary-search visible window.
+    out.sort_by(|a, b| a.end_beats.total_cmp(&b.end_beats));
+    out
 }
-
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let _s = trace_span!("resumed");

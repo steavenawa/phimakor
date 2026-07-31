@@ -81,9 +81,86 @@ fn main() {
     {
         #[path = "../ui/mod.rs"]
         mod ui;
-        use ui::{GameInfo, IcedOverlay};
+        use ui::{GameInfo, IcedOverlay, NoteEntry, EventEntry};
         let r = eng.renderer();
         let (w, h) = (1280u32, 800u32);
+        // Build realistic note/event entries from the chart (like main.rs does).
+        let doc = phimakor::core::edit::ChartDocument::open(std::path::Path::new(&dir)).unwrap();
+        let rpe = doc.chart().clone();
+        let mut notes: Vec<NoteEntry> = Vec::new();
+        let mut events: Vec<EventEntry> = Vec::new();
+        for jl in rpe.judge_line_list.iter() {
+            if let Some(ns) = &jl.notes {
+                for (i, n) in ns.iter().enumerate() {
+                    notes.push(NoteEntry {
+                        index: i, kind: n.kind,
+                        start_beats: n.start_time.beats(), end_beats: n.end_time.beats(),
+                        x: n.position_x, speed: n.speed, scale: n.size,
+                        texture: n.hitsound.clone().unwrap_or_default(),
+                    });
+                }
+            }
+            for (li, layer) in jl.event_layers.iter().flatten().enumerate() {
+                for (kind, list) in [
+                    ("Alpha", &layer.alpha_events), ("MoveX", &layer.move_x_events),
+                    ("MoveY", &layer.move_y_events), ("Rotate", &layer.rotate_events),
+                    ("Speed", &layer.speed_events),
+                ] {
+                    if let Some(evs) = list {
+                        for (i, e) in evs.iter().enumerate() {
+                            events.push(EventEntry {
+                                layer: li, kind: kind.to_string(), index: i,
+                                start_beats: e.start_time.beats(), end_beats: e.end_time.beats(),
+                                start: e.start, end: e.end, easing: e.easing_type,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        println!("real data: {} notes, {} events", notes.len(), events.len());
+        if std::env::var("PHIMAKOR_NOTES_ONLY").is_ok() { events.clear(); }
+        if std::env::var("PHIMAKOR_EVENTS_ONLY").is_ok() { notes.clear(); }
+        // The real app only shows the SELECTED line's events in the timeline.
+        if std::env::var("PHIMAKOR_ALL_LINES").is_err() {
+            let sel = 0usize;
+            let mut sel_events = Vec::new();
+            let mut sel_notes = Vec::new();
+            if let Some(jl) = rpe.judge_line_list.get(sel) {
+                if let Some(ns) = &jl.notes {
+                    for (i, n) in ns.iter().enumerate() {
+                        sel_notes.push(NoteEntry {
+                            index: i, kind: n.kind,
+                            start_beats: n.start_time.beats(), end_beats: n.end_time.beats(),
+                            x: n.position_x, speed: n.speed, scale: n.size,
+                            texture: n.hitsound.clone().unwrap_or_default(),
+                        });
+                    }
+                }
+                for (li, layer) in jl.event_layers.iter().flatten().enumerate() {
+                    for (kind, list) in [
+                        ("Alpha", &layer.alpha_events), ("MoveX", &layer.move_x_events),
+                        ("MoveY", &layer.move_y_events), ("Rotate", &layer.rotate_events),
+                        ("Speed", &layer.speed_events),
+                    ] {
+                        if let Some(evs) = list {
+                            for (i, e) in evs.iter().enumerate() {
+                                sel_events.push(EventEntry {
+                                    layer: li, kind: kind.to_string(), index: i,
+                                    start_beats: e.start_time.beats(), end_beats: e.end_time.beats(),
+                                    start: e.start, end: e.end, easing: e.easing_type,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            events = sel_events;
+            notes = sel_notes;
+        }
+        println!("timeline data: {} notes, {} events (selected line)", notes.len(), events.len());
+        events.sort_by(|a, b| a.end_beats.total_cmp(&b.end_beats));
+        notes.sort_by(|a, b| a.end_beats.total_cmp(&b.end_beats));
         let mut overlay = IcedOverlay::new(r.device(), r.tex_bgl(), r.sampler(), w, h);
         let info = GameInfo {
             chart_time: 10.0, chart_beat: 20.0, audio_time: 10.0, fps: 60.0,
@@ -95,7 +172,7 @@ fn main() {
             show_notes: true, events_progress: 1.0, notes_progress: 1.0,
             has_custom_tex: false, full_notes: false,
             selected_line: 0, line_name: "line0".into(), line_count: 90,
-            selected_layer: 0, max_layers: 1, events: vec![], notes: vec![],
+            selected_layer: 0, max_layers: 1, events, notes,
             gui_scale: 1.0, snap: 0.25, vsync: true, vertical_split: 1,
             selected_tool: 0, show_menu: false, selected_event_idx: None,
             event_edit_target: 0, ev_kind: String::new(),
@@ -111,13 +188,36 @@ fn main() {
         }
         stats("render_iced(timeline+ui)", &overlay_times);
 
-        // 4b. Per-frame path in the real app: timeline-only redraw
+        // 4b. Per-frame path in the real app: timeline-only redraw.
+        // Simulate playback: chart_beat advances each frame (scrolling).
         let mut tl_times = Vec::with_capacity(frames);
+        for fi in 0..frames {
+            let mut info2 = GameInfo {
+                chart_beat: 20.0 + fi as f64 * 0.1,
+                chart_time: (20.0 + fi as f64 * 0.1) * 0.5,
+                chart_name: info.chart_name.clone(),
+                composer: info.composer.clone(),
+                level: info.level.clone(),
+                line_name: info.line_name.clone(),
+                ev_kind: info.ev_kind.clone(),
+                events: info.events.clone(),
+                notes: info.notes.clone(),
+                effect_names: info.effect_names.clone(),
+                ..info
+            };
+            let s = Instant::now();
+            overlay.redraw_timeline(r.queue(), &info2);
+            tl_times.push(s.elapsed().as_secs_f64() * 1000.0);
+        }
+        stats("redraw_timeline(playing)", &tl_times);
+
+        // 4c. Paused path (static beat)
+        let mut tl_paused = Vec::with_capacity(frames);
         for _ in 0..frames {
             let s = Instant::now();
             overlay.redraw_timeline(r.queue(), &info);
-            tl_times.push(s.elapsed().as_secs_f64() * 1000.0);
+            tl_paused.push(s.elapsed().as_secs_f64() * 1000.0);
         }
-        stats("redraw_timeline(per-frame)", &tl_times);
+        stats("redraw_timeline(paused)", &tl_paused);
     }
 }

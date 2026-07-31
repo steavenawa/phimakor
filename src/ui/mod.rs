@@ -73,6 +73,7 @@ pub struct IcedOverlay {
     ctx_progress: f32,
     pub mouse_beat: f64,
     notes_cache: Vec<NoteEntry>,
+    last_drawn_beat: f64,
     pub splash_click: Option<usize>,
 }
 
@@ -102,7 +103,7 @@ impl IcedOverlay {
             layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, gui_scale: 1.0,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
             drag_note: None, drag_updated: None, ctx_pos: None, ctx_progress: 0.0,
-            mouse_beat: 0.0, notes_cache: Vec::new(), splash_click: None,
+            mouse_beat: 0.0, notes_cache: Vec::new(), last_drawn_beat: 0.0, splash_click: None,
         }
     }
 
@@ -526,7 +527,7 @@ impl IcedOverlay {
             if info.show_events {
                 let tl_w = TL_W * s;
                 if let Some(r) = tiny_skia::Rect::from_xywh(events_x + 2.0 * s, ct_y - 1.0, tl_w - 4.0 * s, 3.0) {
-                    self.pixmap.as_mut().fill_rect(r, &cp, tiny_skia::Transform::default(), None);
+                    fill_rect_clipped(&mut self.pixmap.as_mut(), r, &cp);
                 }
             }
             // Notes timeline playhead
@@ -534,7 +535,7 @@ impl IcedOverlay {
                 let pad_x = 12.0 * s;
                 let play_w = NT_W * s - pad_x * 2.0;
                 if let Some(r) = tiny_skia::Rect::from_xywh(notes_x + pad_x, ct_y - 1.0, play_w, 3.0) {
-                    self.pixmap.as_mut().fill_rect(r, &cp, tiny_skia::Transform::default(), None);
+                    fill_rect_clipped(&mut self.pixmap.as_mut(), r, &cp);
                 }
             }
         }
@@ -553,13 +554,25 @@ impl IcedOverlay {
         self.show_overlay = info.show_overlay;
         self.tl_visible = info.show_events || info.show_notes;
         self.gui_scale = info.gui_scale;
+        let prev_progress = (self.panel_progress, self.events_progress, self.notes_progress);
         self.panel_progress = self.approach(self.panel_progress, if info.show_properties { 1.0 } else { 0.0 });
         self.events_progress = self.approach(self.events_progress, if info.show_events { 1.0 } else { 0.0 });
         self.notes_progress = self.approach(self.notes_progress, if info.show_notes { 1.0 } else { 0.0 });
         self.animate_all();
+        // During playback the timeline scrolls and the seek bar advances every
+        // frame — the base pixmap is stale. Fall back to a full redraw then;
+        // the fast path (base copy + playhead) is only valid while static.
+        let playing = (info.chart_beat - self.last_drawn_beat).abs() > 1e-4;
+        let panels_moving = prev_progress != (self.panel_progress, self.events_progress, self.notes_progress);
+        if playing || panels_moving {
+            self.upload_timeline_to(queue, info);
+            self.last_drawn_beat = info.chart_beat;
+            return;
+        }
         // Restore base content (no playhead) — memcpy, much cheaper than redraw.
         self.pixmap.data_mut().copy_from_slice(self.base_pixmap.data());
         self.draw_playhead(info);
+        self.last_drawn_beat = info.chart_beat;
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             self.pixmap.data(),
@@ -589,20 +602,16 @@ impl IcedOverlay {
             let ph = (vh - 56.0 * s - py) as f64;
             let to_y = |b: f64| py as f64 + ph - (b - min_b) / zoom * ph;
             let ct_y = to_y(info.chart_beat).clamp(py as f64, py as f64 + ph) as f32;
-            let mut cp = tiny_skia::Paint::default();
-            cp.set_color_rgba8(255, 200, 80, 230);
             if info.show_events {
                 let tl_w = TL_W * s;
-                if let Some(r) = tiny_skia::Rect::from_xywh(events_x + 2.0 * s, ct_y - 1.0, tl_w - 4.0 * s, 3.0) {
-                    self.pixmap.as_mut().fill_rect(r, &cp, tiny_skia::Transform::default(), None);
-                }
+                hline(&mut self.pixmap.as_mut(), ct_y - 1.0, events_x + 2.0 * s, events_x + tl_w - 2.0 * s, [255, 200, 80, 230]);
+                hline(&mut self.pixmap.as_mut(), ct_y + 1.0, events_x + 2.0 * s, events_x + tl_w - 2.0 * s, [255, 200, 80, 230]);
             }
             if info.show_notes {
                 let pad_x = 12.0 * s;
                 let play_w = NT_W * s - pad_x * 2.0;
-                if let Some(r) = tiny_skia::Rect::from_xywh(notes_x + pad_x, ct_y - 1.0, play_w, 3.0) {
-                    self.pixmap.as_mut().fill_rect(r, &cp, tiny_skia::Transform::default(), None);
-                }
+                hline(&mut self.pixmap.as_mut(), ct_y - 1.0, notes_x + pad_x, notes_x + pad_x + play_w, [255, 200, 80, 230]);
+                hline(&mut self.pixmap.as_mut(), ct_y + 1.0, notes_x + pad_x, notes_x + pad_x + play_w, [255, 200, 80, 230]);
             }
         }
     }
@@ -685,7 +694,7 @@ impl IcedOverlay {
                 let rh = (s.1 - e.1).abs();
                 if rw > 2.0 && rh > 2.0 {
                     if let Some(r) = tiny_skia::Rect::from_xywh(rx, ry, rw, rh) {
-                        pm.fill_rect(r, &sel, tiny_skia::Transform::default(), None);
+                        fill_rect_clipped(&mut pm, r, &sel);
                     }
                 }
             }
@@ -696,7 +705,7 @@ impl IcedOverlay {
                 let mut mp = tiny_skia::Paint::default();
                 mp.set_color_rgba8(25, 25, 30, alpha);
                 if let Some(r) = tiny_skia::Rect::from_xywh(mx.min(vw - mw), my.min(vh - mh), mw, mh) {
-                    pm.fill_rect(r, &mp, tiny_skia::Transform::default(), None);
+                    fill_rect_clipped(&mut pm, r, &mp);
                 }
             }
             // Seek bar: thin strip above bottom buttons, full playfield width
@@ -708,14 +717,14 @@ impl IcedOverlay {
                 let mut sbg = tiny_skia::Paint::default();
                 sbg.set_color_rgba8(40, 45, 55, 200);
                 if let Some(r) = tiny_skia::Rect::from_xywh(sb_x, sb_y, sb_w, sb_h) {
-                    pm.fill_rect(r, &sbg, tiny_skia::Transform::default(), None);
+                    fill_rect_clipped(&mut pm, r, &sbg);
                 }
                 let prog = (info.chart_time / info.duration.max(0.01)) as f32;
                 if prog > 0.01 {
                     let mut fp = tiny_skia::Paint::default();
                     fp.set_color_rgba8(100, 180, 255, 200);
                     if let Some(r) = tiny_skia::Rect::from_xywh(sb_x + 1.0 * s, sb_y + 1.0 * s, (sb_w - 2.0 * s) * prog.min(1.0), (sb_h - 2.0 * s).max(1.0)) {
-                        pm.fill_rect(r, &fp, tiny_skia::Transform::default(), None);
+                        fill_rect_clipped(&mut pm, r, &fp);
                     }
                 }
             }
@@ -755,7 +764,7 @@ pub fn draw_splash(pm: &mut tiny_skia::PixmapMut, charts: &[String], hover: Opti
     let mut bg = tiny_skia::Paint::default();
     bg.set_color_rgba8(15, 15, 20, 255);
     if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, vw, vh - bar_h) {
-        pm.fill_rect(r, &bg, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pm, r, &bg);
     }
     // Title
     let font = get_font();
@@ -770,7 +779,7 @@ pub fn draw_splash(pm: &mut tiny_skia::PixmapMut, charts: &[String], hover: Opti
         let mut cp = tiny_skia::Paint::default();
         cp.set_color_rgba8(if is_hover { 40 } else { 25 }, if is_hover { 45 } else { 28 }, if is_hover { 55 } else { 32 }, 220);
         if let Some(r) = tiny_skia::Rect::from_xywh(40.0 * s, y, vw - 80.0 * s, cell_h) {
-            pm.fill_rect(r, &cp, tiny_skia::Transform::default(), None);
+            fill_rect_clipped(pm, r, &cp);
         }
         if let Some(font) = font {
             draw_text_on_pixmap(pm, name, 48.0 * s, y + cell_h * 0.5, 14.0 * s, font);
@@ -785,7 +794,7 @@ pub fn draw_menu(pm: &mut tiny_skia::PixmapMut, vw: f32, vh: f32, s: f32) {
     let mut bg = tiny_skia::Paint::default();
     bg.set_color_rgba8(0, 0, 0, 160);
     if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, vw, vh) {
-        pm.fill_rect(r, &bg, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pm, r, &bg);
     }
     // Panel
     let pw = 240.0 * s;
@@ -795,7 +804,7 @@ pub fn draw_menu(pm: &mut tiny_skia::PixmapMut, vw: f32, vh: f32, s: f32) {
     let mut panel = tiny_skia::Paint::default();
     panel.set_color_rgba8(30, 32, 38, 240);
     if let Some(r) = tiny_skia::Rect::from_xywh(px, py, pw, ph) {
-        pm.fill_rect(r, &panel, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pm, r, &panel);
     }
     // Title
     let font = get_font();
@@ -811,7 +820,7 @@ pub fn draw_menu(pm: &mut tiny_skia::PixmapMut, vw: f32, vh: f32, s: f32) {
         let mut ip = tiny_skia::Paint::default();
         ip.set_color_rgba8(45, 48, 55, 255);
         if let Some(r) = tiny_skia::Rect::from_xywh(px + 8.0 * s, y, pw - 16.0 * s, item_h - 4.0 * s) {
-            pm.fill_rect(r, &ip, tiny_skia::Transform::default(), None);
+            fill_rect_clipped(pm, r, &ip);
         }
         if let Some(font) = font {
             draw_text_on_pixmap(pm, label, px + 16.0 * s, y + item_h * 0.5, 14.0 * s, font);
@@ -831,7 +840,7 @@ pub const PANEL_W: f32 = 280.0;
 
 fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32, info: &GameInfo, px: f32, vh: f32, s: f32) {
     let _s = trace_span!("draw_5col");
-    if !info.show_overlay || !info.show_events || info.events.is_empty() { return; }
+        if !info.show_overlay || !info.show_events || info.events.is_empty() { return; }
     let tl_w = TL_W * s;
     let col_w = COL_W * s;
     let col_g = COL_GAP * s;
@@ -845,7 +854,7 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
     let mut ebg = tiny_skia::Paint::default();
     ebg.set_color_rgba8(20, 25, 35, 200);
     if let Some(r) = tiny_skia::Rect::from_xywh(px, 0.0, tl_w, vh - 48.0 * s) {
-        pixmap.fill_rect(r, &ebg, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pixmap, r, &ebg);
     }
 
     let (scroll, zoom) = (scroll as f64, zoom as f64);
@@ -862,7 +871,7 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
     let mut hbg = tiny_skia::Paint::default();
     hbg.set_color_rgba8(40, 50, 65, 200);
     if let Some(hr) = tiny_skia::Rect::from_xywh(hdr_x, 2.0 * s, hdr_w, hdr_h) {
-        pixmap.fill_rect(hr, &hbg, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pixmap, hr, &hbg);
     }
 
     // Grid lines at snap divisions (single rect spanning all columns)
@@ -876,29 +885,24 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
         let y = to_y(b) as f32;
         let is_whole = (b.round() - b).abs() < 0.001;
         let is_half = !is_whole && ((b * 2.0).round() - b * 2.0).abs() < 0.001;
-        let mut lp = tiny_skia::Paint::default();
         let a = if is_whole { 100 } else if is_half { 70 } else { 40 };
-        lp.set_color_rgba8(60, 60, 70, a);
         let h = if is_whole { 2.0 } else { 1.0 };
-        if let Some(r) = tiny_skia::Rect::from_xywh(grid_x, y, grid_w, h) {
-            pixmap.fill_rect(r, &lp, tiny_skia::Transform::default(), None);
+        for dy in 0..h as i32 {
+            hline(pixmap, y + dy as f32, grid_x, grid_x + grid_w, [60, 60, 70, a]);
         }
     }
 
     // Current time line across all columns (beat-aligned)
     let ct_y = to_y(info.chart_beat).clamp(py as f64, py as f64 + ph) as f32;
-    let mut cp = tiny_skia::Paint::default();
-    cp.set_color_rgba8(255, 200, 80, 230);
-    if let Some(r) = tiny_skia::Rect::from_xywh(px + 2.0 * s, ct_y - 1.0, tl_w - 4.0 * s, 3.0) {
-        pixmap.fill_rect(r, &cp, tiny_skia::Transform::default(), None);
-    }
+    hline(pixmap, ct_y - 1.0, px + 2.0 * s, px + tl_w - 2.0 * s, [255, 200, 80, 230]);
+    hline(pixmap, ct_y + 1.0, px + 2.0 * s, px + tl_w - 2.0 * s, [255, 200, 80, 230]);
 
     // Layer selector at bottom of timeline panel
     let layer_bar_y = (vh - 48.0 * s) as f32 - 26.0 * s;
     let mut lbg = tiny_skia::Paint::default();
     lbg.set_color_rgba8(30, 30, 35, 200);
     if let Some(r) = tiny_skia::Rect::from_xywh(px + 2.0 * s, layer_bar_y, tl_w - 4.0 * s, 22.0 * s) {
-        pixmap.fill_rect(r, &lbg, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pixmap, r, &lbg);
     }
     for li in 0..info.max_layers.min(10) {
         let bx = px + 6.0 * s + li as f32 * (20.0 * s + 4.0 * s);
@@ -906,15 +910,19 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
         if li == info.selected_layer { lp.set_color_rgba8(200, 200, 220, 220); }
         else { lp.set_color_rgba8(100, 100, 120, 160); }
         if let Some(r) = tiny_skia::Rect::from_xywh(bx, layer_bar_y + 3.0 * s, 20.0 * s, 16.0 * s) {
-            pixmap.fill_rect(r, &lp, tiny_skia::Transform::default(), None);
+            fill_rect_clipped(pixmap, r, &lp);
         }
     }
 
-    // Event blocks per column (cols 0-4), skip outside visible range
+    // Event blocks per column (cols 0-4), skip outside visible range.
+    // info.events is sorted by end_beats (extract_line_events) → binary search
+    // the visible window instead of iterating every event.
     let ev_min = min_b - zoom * 0.05;
     let ev_max = max_b + zoom * 0.05;
-    for (ei, ev) in info.events.iter().enumerate() {
-        if ev.end_beats < ev_min || ev.start_beats > ev_max { continue; }
+    let ev_start = info.events.partition_point(|e| e.end_beats < ev_min);
+    for (ei, ev) in info.events[ev_start..].iter().enumerate() {
+        if ev.start_beats > ev_max { break; }
+        let ei = ev_start + ei;
         let ci = match ev.kind.as_str() {
             "Alpha" => Some(0), "MoveX" => Some(1), "MoveY" => Some(2),
             "Rotate" => Some(3), "Speed" => Some(4), _ => None,
@@ -930,14 +938,14 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
             sp.set_color_rgba8(255, 255, 255, 220);
             let cx = px + 4.0 * s + ci as f32 * (col_w + col_g);
             if let Some(r) = tiny_skia::Rect::from_xywh(cx - 2.0, y0.min(y1) - 2.0, col_w + 4.0, bh + 4.0) {
-                pixmap.fill_rect(r, &sp, tiny_skia::Transform::default(), None);
+                fill_rect_clipped(pixmap, r, &sp);
             }
         }
         let mut ep = tiny_skia::Paint::default();
         ep.set_color_rgba8(c[0], c[1], c[2], if selected { 255 } else { 200 });
         let cx = px + 4.0 * s + ci as f32 * (col_w + col_g);
         if let Some(r) = tiny_skia::Rect::from_xywh(cx, y0.min(y1), col_w, bh) {
-            pixmap.fill_rect(r, &ep, tiny_skia::Transform::default(), None);
+            fill_rect_clipped(pixmap, r, &ep);
         }
     }
 
@@ -952,7 +960,7 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
             np.set_color_rgba8(c[0], c[1], c[2], 200);
             let cx = px + 4.0 * s + 5.0 * (col_w + col_g);
             if let Some(r) = tiny_skia::Rect::from_xywh(cx + 1.0, y0.min(y1), col_w - 2.0, bh) {
-                pixmap.fill_rect(r, &np, tiny_skia::Transform::default(), None);
+                fill_rect_clipped(pixmap, r, &np);
             }
         }
     }
@@ -960,7 +968,7 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
 
 fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32, info: &GameInfo, px: f32, vh: f32, s: f32) {
     let _s = trace_span!("draw_notes");
-    if !info.show_overlay || !info.show_notes || info.notes.is_empty() { return; }
+        if !info.show_overlay || !info.show_notes || info.notes.is_empty() { return; }
     let nt_w = NT_W * s;
     let head_h = HEADER_H * s;
     let pad_x = 12.0 * s;
@@ -992,7 +1000,7 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
     let mut bg = tiny_skia::Paint::default();
     bg.set_color_rgba8(20, 25, 35, 215);
     if let Some(r) = tiny_skia::Rect::from_xywh(px, 0.0, nt_w, vh - 48.0 * s) {
-        pixmap.fill_rect(r, &bg, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pixmap, r, &bg);
     }
 
     // Header (full preview mode = different color)
@@ -1000,7 +1008,7 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
     if info.full_notes { hp.set_color_rgba8(200, 140, 255, 200); }
     else { hp.set_color_rgba8(140, 200, 255, 180); }
     if let Some(r) = tiny_skia::Rect::from_xywh(px + pad_x, 2.0 * s, play_w, head_h - 4.0 * s) {
-        pixmap.fill_rect(r, &hp, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pixmap, r, &hp);
     }
     // Header split indicator (top-right)
     if let Some(font) = get_font() {
@@ -1016,7 +1024,7 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
             let mut vp = tiny_skia::Paint::default();
             vp.set_color_rgba8(80, 100, 140, 80);
             if let Some(r) = tiny_skia::Rect::from_xywh(x, py, 1.0, ph as f32) {
-                pixmap.fill_rect(r, &vp, tiny_skia::Transform::default(), None);
+                fill_rect_clipped(pixmap, r, &vp);
             }
         }
     }
@@ -1025,39 +1033,46 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
     let grid = (info.snap as f64).max(0.125);
     let g_start = (min_b / grid).ceil() as i32;
     let g_end = (max_b / grid).floor() as i32;
+    if std::env::var("PHIMAKOR_SKIP_GRID").is_err() {
     for gi in g_start..=g_end {
         let b = gi as f64 * grid;
         let y = to_y(b) as f32;
         let is_whole = (b.round() - b).abs() < 0.001;
         let a = if is_whole { 90 } else { 50 };
-        let mut lp = tiny_skia::Paint::default();
-        lp.set_color_rgba8(60, 60, 70, a);
-        if let Some(r) = tiny_skia::Rect::from_xywh(px + pad_x, y, play_w, 1.0) {
-            pixmap.fill_rect(r, &lp, tiny_skia::Transform::default(), None);
-        }
+        hline(pixmap, y, px + pad_x, px + pad_x + play_w, [60, 60, 70, a]);
+    }
     }
 
     // Center line
+    if std::env::var("PHIMAKOR_SKIP_CENTER").is_err() {
     let cx = to_x(0.0);
-    let mut cl = tiny_skia::Paint::default();
-    cl.set_color_rgba8(100, 100, 120, 120);
-    if let Some(r) = tiny_skia::Rect::from_xywh(cx, py, 1.0, ph as f32) {
-        pixmap.fill_rect(r, &cl, tiny_skia::Transform::default(), None);
+    // 1px vertical line: write pixels directly
+    {
+        let h = pixmap.height() as i32;
+        let w = pixmap.width() as i32;
+        let x = (cx.round() as i32).clamp(0, w - 1);
+        let y0 = (py.round() as i32).max(0);
+        let y1 = ((ph as f32 + py).round() as i32).min(h - 1);
+        let data = pixmap.data_mut();
+        for yy in y0..=y1 {
+            let i = (yy as usize * w as usize + x as usize) * 4;
+            data[i] = 100; data[i+1] = 100; data[i+2] = 120; data[i+3] = 120;
+        }
+    }
     }
 
     // Current time (beat-aligned)
     let ct_y = to_y(info.chart_beat).clamp(py as f64, py as f64 + ph) as f32;
-    let mut cp = tiny_skia::Paint::default();
-    cp.set_color_rgba8(255, 200, 80, 230);
-    if let Some(r) = tiny_skia::Rect::from_xywh(px + pad_x, ct_y - 1.0, play_w, 3.0) {
-        pixmap.fill_rect(r, &cp, tiny_skia::Transform::default(), None);
-    }
+    hline(pixmap, ct_y - 1.0, px + pad_x, px + pad_x + play_w, [255, 200, 80, 230]);
+    hline(pixmap, ct_y + 1.0, px + pad_x, px + pad_x + play_w, [255, 200, 80, 230]);
 
-    // Notes, skip outside visible range
+    // Notes, skip outside visible range (info.notes sorted by end_beats)
     let nt_min = min_b - zoom * 0.05;
     let nt_max = max_b + zoom * 0.05;
-    for note in &info.notes {
-        if note.end_beats < nt_min || note.start_beats > nt_max { continue; }
+    if std::env::var("PHIMAKOR_SKIP_NOTES").is_err() {
+    let nt_start = info.notes.partition_point(|n| n.end_beats < nt_min);
+    for note in &info.notes[nt_start..] {
+        if note.start_beats > nt_max { break; }
         let c = match note.kind { 1 => [50, 150, 255], 2 => [100, 200, 255], 3 => [255, 80, 150], 4 => [255, 220, 60], _ => [180; 3] };
         let xn = to_col_x(note.x);
         let y0 = to_y(note.start_beats).clamp(py as f64, py as f64 + ph) as f32;
@@ -1073,12 +1088,13 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
 
         if note.kind == 2 && bh > nh * 2.0 {
             if let Some(r) = tiny_skia::Rect::from_xywh(xn - 2.0 * s, y0.min(y1), 4.0 * s, bh) {
-                pixmap.fill_rect(r, &np, tiny_skia::Transform::default(), None);
+                fill_rect_clipped(pixmap, r, &np);
             }
         }
         if let Some(r) = tiny_skia::Rect::from_xywh(xn - nw * 0.5, y0 - nh * 0.5, nw, nh) {
-            pixmap.fill_rect(r, &np, tiny_skia::Transform::default(), None);
+            fill_rect_clipped(pixmap, r, &np);
         }
+    }
     }
 }
 
@@ -1097,13 +1113,13 @@ pub fn draw_panel_def(pixmap: &mut tiny_skia::PixmapMut, def: &panels::PanelDef,
     let mut bg = tiny_skia::Paint::default();
     bg.set_color_rgba8(12, 12, 14, 200);
     if let Some(r) = tiny_skia::Rect::from_xywh(px, 0.0, pan_w, bg_h) {
-        pixmap.fill_rect(r, &bg, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pixmap, r, &bg);
     }
 
     let mut hp = tiny_skia::Paint::default();
     hp.set_color_rgba8(60, 60, 70, 180);
     if let Some(r) = tiny_skia::Rect::from_xywh(px, 0.0, pan_w, 24.0 * s) {
-        pixmap.fill_rect(r, &hp, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pixmap, r, &hp);
     }
 
     if let Some(font) = &font {
@@ -1120,7 +1136,7 @@ pub fn draw_panel_def(pixmap: &mut tiny_skia::PixmapMut, def: &panels::PanelDef,
             let mut sp = tiny_skia::Paint::default();
             sp.set_color_rgba8(50, 50, 60, 100);
             if let Some(r) = tiny_skia::Rect::from_xywh(px + 4.0 * s, y, pan_w - 8.0 * s, 1.0) {
-                pixmap.fill_rect(r, &sp, tiny_skia::Transform::default(), None);
+                fill_rect_clipped(pixmap, r, &sp);
             }
             y += cell_h * 0.3;
             continue;
@@ -1131,7 +1147,7 @@ pub fn draw_panel_def(pixmap: &mut tiny_skia::PixmapMut, def: &panels::PanelDef,
             let mut sp = tiny_skia::Paint::default();
             sp.set_color_rgba8(60, 60, 75, 160);
             if let Some(r) = tiny_skia::Rect::from_xywh(px + 2.0 * s, y, pan_w - 4.0 * s, 2.0 * s) {
-                pixmap.fill_rect(r, &sp, tiny_skia::Transform::default(), None);
+                fill_rect_clipped(pixmap, r, &sp);
             }
             y += cell_h * 0.4;
             continue;
@@ -1140,7 +1156,7 @@ pub fn draw_panel_def(pixmap: &mut tiny_skia::PixmapMut, def: &panels::PanelDef,
         let mut lp = tiny_skia::Paint::default();
         lp.set_color_rgba8(20, 20, 25, 120);
         if let Some(r) = tiny_skia::Rect::from_xywh(px, y, pan_w, row_h) {
-            pixmap.fill_rect(r, &lp, tiny_skia::Transform::default(), None);
+            fill_rect_clipped(pixmap, r, &lp);
         }
         if let Some(font) = &font {
             draw_text_on_pixmap(pixmap, label, px + 8.0 * s, y + cell_h * 0.5, 10.0 * s, font);
@@ -1157,7 +1173,7 @@ pub fn draw_panel_def(pixmap: &mut tiny_skia::PixmapMut, def: &panels::PanelDef,
             let mut eb = tiny_skia::Paint::default();
             eb.set_color_rgba8(40, 42, 50, 230);
             if let Some(r) = tiny_skia::Rect::from_xywh(px, ey, pan_w, event_h * 7.0 + 8.0 * s) {
-                pixmap.fill_rect(r, &eb, tiny_skia::Transform::default(), None);
+                fill_rect_clipped(pixmap, r, &eb);
             }
             let rows: [(&str, &str, u8); 6] = [
                 ("Event", &info.ev_kind, 255),
@@ -1175,7 +1191,7 @@ pub fn draw_panel_def(pixmap: &mut tiny_skia::PixmapMut, def: &panels::PanelDef,
                         let mut hp = tiny_skia::Paint::default();
                         hp.set_color_rgba8(60, 80, 120, 60);
                         if let Some(r) = tiny_skia::Rect::from_xywh(px + 4.0 * s, ry, pan_w - 8.0 * s, event_h) {
-                            pixmap.fill_rect(r, &hp, tiny_skia::Transform::default(), None);
+                            fill_rect_clipped(pixmap, r, &hp);
                         }
                     }
                     draw_text_on_pixmap(pixmap, label, px + 8.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
@@ -1200,7 +1216,7 @@ fn draw_effects_panel(pixmap: &mut tiny_skia::PixmapMut, info: &GameInfo, px: f3
     let mut bg = tiny_skia::Paint::default();
     bg.set_color_rgba8(12, 12, 14, 200);
     if let Some(r) = tiny_skia::Rect::from_xywh(px, 0.0, pan_w, bg_h) {
-        pixmap.fill_rect(r, &bg, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pixmap, r, &bg);
     }
 
     let mut y = 28.0 * s;
@@ -1274,7 +1290,7 @@ fn draw_quick_panel(pixmap: &mut tiny_skia::PixmapMut, tool_hover: Option<usize>
     let mut bg = tiny_skia::Paint::default();
     bg.set_color_rgba8(18, 18, 22, 230);
     if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, bg_w, bg_h) {
-        pixmap.fill_rect(r, &bg, tiny_skia::Transform::default(), None);
+        fill_rect_clipped(pixmap, r, &bg);
     }
 
     let tools: [(&str, [u8; 3]); 4] = [
@@ -1298,7 +1314,7 @@ fn draw_quick_panel(pixmap: &mut tiny_skia::PixmapMut, tool_hover: Option<usize>
         let a = if i == selected_tool { 230 } else { (80.0 + p * 100.0) as u8 };
         bp.set_color_rgba8(color[0], color[1], color[2], a);
         if let Some(rect) = tiny_skia::Rect::from_xywh(bx, y, bw, btn_base) {
-            pixmap.fill_rect(rect, &bp, tiny_skia::Transform::default(), None);
+            fill_rect_clipped(pixmap, rect, &bp);
         }
 
         // Label text on button when hovered (skip if no font)
@@ -1313,6 +1329,60 @@ fn draw_quick_panel(pixmap: &mut tiny_skia::PixmapMut, tool_hover: Option<usize>
 }
 
 // ── Display data ──
+
+/// 1px horizontal line via direct pixel writes (tiny_skia fill_rect is
+/// ~300µs/call in debug — grid lines are the hot path).
+fn hline(pm: &mut tiny_skia::PixmapMut, y: f32, x0: f32, x1: f32, rgba: [u8; 4]) {
+    let h = pm.height() as i32;
+    let w = pm.width() as i32;
+    let y = y.round() as i32;
+    if y < 0 || y >= h { return; }
+    let x0 = (x0.round() as i32).max(0);
+    let x1 = (x1.round() as i32).min(w - 1);
+    if x0 > x1 { return; }
+    let row = (y as usize) * (w as usize);
+    let data = pm.data_mut();
+    for x in x0..=x1 {
+        let i = (row + x as usize) * 4;
+        data[i] = rgba[0]; data[i + 1] = rgba[1]; data[i + 2] = rgba[2]; data[i + 3] = rgba[3];
+    }
+}
+
+/// fill_rect clipped to the pixmap bounds. Panels slide in from off-screen
+/// (x > w during animations), and tiny_skia asserts on out-of-bounds rects.
+/// Edges are rounded OUTWARD to whole pixels: tiny_skia 0.11.4's hairline AA
+/// asserts on 1px-wide rects with fractional origins (inner width → 0).
+/// Solid colors are written directly via `slice::fill` — tiny_skia's
+/// per-pixel pipeline costs ~5ms for a large rect in debug builds.
+pub fn fill_rect_clipped(pm: &mut tiny_skia::PixmapMut, rect: tiny_skia::Rect, paint: &tiny_skia::Paint) {
+    let w = pm.width() as i32;
+    let h = pm.height() as i32;
+    let l = (rect.left().floor() as i32).max(0);
+    let t = (rect.top().floor() as i32).max(0);
+    let r = (rect.right().ceil() as i32).min(w);
+    let b = (rect.bottom().ceil() as i32).min(h);
+    if r <= l || b <= t { return; }
+    // Fast path: solid color → direct u32 fill.
+    if let tiny_skia::Shader::SolidColor(c) = &paint.shader {
+        let rgba = c.premultiply().to_color_u8();
+        let color = u32::from_le_bytes([rgba.red(), rgba.green(), rgba.blue(), rgba.alpha()]);
+        let data = pm.data_mut();
+        for y in t..b {
+            let row = (y as usize) * (w as usize) * 4;
+            let start = row + (l as usize) * 4;
+            let end = row + (r as usize) * 4;
+            let bytes = &mut data[start..end];
+            let words = bytemuck::cast_slice_mut::<u8, u32>(bytes);
+            words.fill(color);
+        }
+        return;
+    }
+    if let Some(cr) = tiny_skia::Rect::from_ltrb(l as f32, t as f32, r as f32, b as f32) {
+        let mut p = paint.clone();
+        p.anti_alias = false;
+        pm.fill_rect(cr, &p, tiny_skia::Transform::default(), None);
+    }
+}
 
 #[derive(Clone)]
 pub struct EventEntry {
