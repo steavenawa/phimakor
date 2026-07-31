@@ -722,13 +722,13 @@ impl Renderer {
         } else {
             (1.0, window_aspect / aspect)
         };
-        // RPE canvas positions live in a UNIFORM pixel space (canvas px → world
-        // /675 on both axes) so sprites never distort. The playfield's aspect
-        // is handled by stretching POSITIONS vertically ×Y_STRETCH: y=1 (RPE
-        // 450 px) sits at the visible top at any playfield aspect (Tab cycles
-        // 3:2 → 16:9 → 4:3 → 1:1). kx/ky letterbox the playfield into the
-        // window, preserving its aspect.
-        let letterbox = mat_scale(kx / CANVAS_W, ky / CANVAS_W);
+        // The RPE canvas (1350×900) is scaled UNIFORMLY by S to fit the
+        // playfield box (1350 × 1350/aspect px): y=1 (450 px) maps to the
+        // box's visible top at any aspect (16:9 shrinks the canvas with side
+        // bars; 3:2 fills it), sprites never distort, and nothing clips.
+        // kx/ky then letterbox the playfield into the window.
+        let fit = (1350.0 / aspect).min(900.0) / 900.0; // uniform canvas scale
+        let letterbox = mat_scale(kx * fit / CANVAS_W, ky * aspect * fit / CANVAS_W);
 
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame
@@ -752,7 +752,7 @@ impl Renderer {
             };
             // Cover the full RPE canvas (1350×900): it stretches to the
             // playfield box at any aspect.
-            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 1350.0));
+            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 1350.0 / aspect));
             cmds.push(DrawCmd {
                 uniform: DrawUniform { model: bg_m, color: [d, d, d, 1.0], uv_rect: uv },
                 tex: bg,
@@ -776,7 +776,7 @@ impl Renderer {
             // [E] CtrlObject: ctrl_pos is a multiplier (phira applies to incline);
             // ctrl_size scales the line.
             let ctrl_px = line.position[0] * CANVAS_W;
-            let ctrl_py = line.position[1] * CANVAS_H * Y_STRETCH;
+            let ctrl_py = line.position[1] * CANVAS_H;
             let line_m = mat_mul(
                 &letterbox,
                 &mat_mul(
@@ -894,7 +894,7 @@ impl Renderer {
                     let ctrl_y = line.ctrl_y;
                     let x = note.relative[0] * CANVAS_W;
                     // [E] ctrl_y scales the note's relative Y position
-                    let y = note.relative[1] * CANVAS_H * Y_STRETCH * ctrl_y;
+                    let y = note.relative[1] * CANVAS_H * ctrl_y;
                     let note_base = mat_mul(&note_m, &mat_translate(x, y));
 
                     match (note.kind, sprite) {
@@ -932,7 +932,7 @@ impl Renderer {
                                 &mat_translate(x, cy), &mat_scale(w, w),
                             ));
                             if let Some(end_y) = note.hold_end_y {
-                                let y1 = end_y as f32 * CANVAS_H * Y_STRETCH * ctrl_y;
+                                let y1 = end_y as f32 * CANVAS_H * ctrl_y;
                                 let (head_y, tail_y) = (y, y1);
                                 let h = (tail_y - head_y).abs();
                                 if h > 1e-5 {
@@ -975,7 +975,7 @@ impl Renderer {
                             let nb = || mat_mul(&note_m, &mat_translate(x, y));
                             if note.kind == 2 {
                                 if let Some(end_y) = note.hold_end_y {
-                                let y1 = end_y as f32 * CANVAS_H * Y_STRETCH * ctrl_y;
+                                let y1 = end_y as f32 * CANVAS_H * ctrl_y;
                                     let h = (y1 - y).abs();
                                     if h > 1e-5 {
                                         cmds.push(DrawCmd {
@@ -1011,7 +1011,7 @@ impl Renderer {
         for line in frame.lines.iter() {
             let Some(ui) = line.attach_ui.as_deref() else { continue };
             if ui == "bar" || line.pe_hide || line.alpha <= 0.0 { continue; }
-            let pos = [line.position[0] * CANVAS_W, line.position[1] * CANVAS_H * Y_STRETCH];
+            let pos = [line.position[0] * CANVAS_W, line.position[1] * CANVAS_H];
             let a = line.alpha * line.ctrl_alpha;
             text::draw_text_world(
                 &mut self.text,
@@ -1033,7 +1033,7 @@ impl Renderer {
         // canvas top edge otherwise.
         if self.progress > 0.0 {
             let bar_h = 5.0;
-            let top = CANVAS_W; // visible canvas y at the top (+y = up) (+y = up)
+            let top = CANVAS_H; // canvas top: y=450 maps to the playfield top at any aspect
             let bar_w = 1350.0 * self.progress;
             if let Some(bl) = frame.lines.iter().find(|l| l.attach_ui.as_deref() == Some("bar")) {
                 if !bl.pe_hide && bl.alpha > 0.0 {
@@ -1049,7 +1049,7 @@ impl Renderer {
                         &letterbox,
                         &mat_mul(
                             &mat_mul(
-                                &mat_translate(bl.position[0] * CANVAS_W, bl.position[1] * CANVAS_H * Y_STRETCH),
+                                &mat_translate(bl.position[0] * CANVAS_W, bl.position[1] * CANVAS_H),
                                 &mat_rotate(bl.rotation),
                             ),
                             &mat_mul(
