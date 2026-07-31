@@ -71,14 +71,21 @@ pub struct LineState {
     /// Visible notes for this frame, in draw order.
     pub notes: Vec<NoteState>,
     /// `[E]` CtrlObject: pos / size / alpha / y control values for this frame.
-    pub ctrl_pos: f32,
-    pub ctrl_size: f32,
+    pub ctrl_pos_x: f32,
+    pub ctrl_pos_y: f32,
+    pub ctrl_size_x: f32,
+    pub ctrl_size_y: f32,
     pub ctrl_alpha: f32,
     pub ctrl_y: f32,
     /// `father` index into `judgeLineList`.
     pub parent: Option<usize>,
     /// PE extension: alpha < 0 hides line + notes.
     pub pe_hide: bool,
+    /// Sine of the incline angle (perspective X distortion).
+    pub incline_sin: f32,
+    /// attachUI lines are not rendered as judge lines (phira removes them
+    /// from the render order); they only position game UI elements.
+    pub attach_ui: Option<String>,
 }
 
 /// Evaluated per-note state for one frame.
@@ -169,11 +176,16 @@ struct LineData {
     parent: Option<usize>,
     /// prpr `show_below` (`isCover != 1`): keep drawing notes past their time.
     show_below: bool,
+    /// attachUI binding (e.g. "pause", "score"); such lines are not rendered.
+    attach_ui: Option<String>,
     /// [E] CtrlObject animatable values (parsed from pos/size/alpha/y control).
-    ctrl_pos: AnimFloat,
-    ctrl_size: AnimFloat,
+    ctrl_pos_x: AnimFloat,
+    ctrl_pos_y: AnimFloat,
+    ctrl_size_x: AnimFloat,
+    ctrl_size_y: AnimFloat,
     ctrl_alpha: AnimFloat,
     ctrl_y: AnimFloat,
+    incline: AnimFloat,
 }
 
 // ---------------------------------------------------------------------------
@@ -458,6 +470,33 @@ fn parse_notes(r: &mut BpmList, rpe: Vec<RPENote>, height: &mut AnimFloat) -> Re
     Ok(notes)
 }
 
+fn parse_ctrl_events(events: &[super::model::RPECtrlEvent], key: &str) -> AnimFloat {
+    use super::easing::{RPE_TWEEN_MAP, StaticTween, TweenFunction};
+    use std::rc::Rc;
+    let vals: Vec<f32> = events.iter().map(|it| it.value[key]).collect();
+    // phira: 2 default events (easing=1, value≈1.0) → identity (no control).
+    if events.is_empty() || (events.len() == 2 && events[0].easing == 1 && (vals[0] - 1.0).abs() < 1e-4) {
+        return AnimFloat::default();
+    }
+    // Shift tween: kf[i] gets the tween of event[i+1].
+    let tweens: Vec<Rc<dyn TweenFunction>> = events
+        .iter()
+        .skip(1)
+        .map(|it| {
+            let idx = (it.easing as usize).max(1).min(RPE_TWEEN_MAP.len() - 1);
+            StaticTween::get_rc(RPE_TWEEN_MAP[idx])
+        })
+        .chain(std::iter::once(StaticTween::get_rc(0)))
+        .collect();
+    AnimFloat::new(
+        events.iter().zip(vals).zip(tweens).map(|((it, val), tween)| Keyframe {
+            time: it.x,
+            value: val,
+            tween,
+        }).collect(),
+    )
+}
+
 fn parse_judge_line(
     r: &mut BpmList,
     rpe: RPEJudgeLine,
@@ -468,6 +507,10 @@ fn parse_judge_line(
 ) -> Result<LineData> {
     // null event layers are skipped
     let event_layers: Vec<_> = rpe.event_layers.into_iter().flatten().collect();
+    let pos_control = rpe.pos_control.clone();
+    let size_control = rpe.size_control.clone();
+    let alpha_control = rpe.alpha_control.clone();
+    let y_control = rpe.y_control.clone();
     fn events_with_factor(
         r: &mut BpmList,
         event_layers: &[RPEEventLayer],
@@ -542,6 +585,10 @@ fn parse_judge_line(
     } else {
         Anim::default()
     };
+    let incline = match rpe.extended.as_ref().and_then(|e| e.incline_events.as_ref()) {
+        Some(events) => parse_events(r, events, Some(0.), bezier_map)?,
+        None => AnimFloat::default(),
+    };
 
     // ponytail: M3 — incline/text/paint/gif events, attachUI, ctrl events
     // (posControl etc.) and rotateWithFather are parsed but not lowered.
@@ -574,11 +621,20 @@ fn parse_judge_line(
         z_order: rpe.z_order,
         parent,
         show_below: rpe.is_cover != 1,
-        // [E] CtrlObject: defaults to 1.0 (identity). Parse y_control etc.
-        ctrl_pos: AnimFloat::fixed(1.0),
-        ctrl_size: AnimFloat::fixed(1.0),
-        ctrl_alpha: AnimFloat::fixed(1.0),
-        ctrl_y: AnimFloat::fixed(1.0),
+        attach_ui: rpe.attach_ui.clone(),
+        // [E] CtrlObject: parse pos/size/alpha/y control events.
+        // posControl uses key "pos" (single f32, factor 2/RPE_WIDTH for x, 2/RPE_HEIGHT for y).
+        // sizeControl uses key "size" (single f32, factor 1.0).
+        // alphaControl uses key "alpha" (0-1 range, factor 1.0).
+        // yControl uses key "y" (factor 1.0).
+        // phira: CtrlObject uses raw values (no factor), x is in beats.
+        ctrl_pos_x: parse_ctrl_events(&pos_control, "pos"),
+        ctrl_pos_y: parse_ctrl_events(&pos_control, "pos"),
+        ctrl_size_x: parse_ctrl_events(&size_control, "size"),
+        ctrl_size_y: parse_ctrl_events(&size_control, "size"),
+        ctrl_alpha: parse_ctrl_events(&alpha_control, "alpha"),
+        ctrl_y: parse_ctrl_events(&y_control, "y"),
+        incline,
     })
 }
 
@@ -796,7 +852,9 @@ impl Chart {
                 z_order: line.z_order,
                 notes: Vec::new(),
                 parent: line.parent,
-                ctrl_pos: 1.0, ctrl_size: 1.0, ctrl_alpha: 1.0, ctrl_y: 1.0, pe_hide: false,
+                ctrl_pos_x: 0.0, ctrl_pos_y: 0.0, ctrl_size_x: 1.0, ctrl_size_y: 1.0,
+                ctrl_alpha: 1.0, ctrl_y: 1.0, pe_hide: false, incline_sin: 0.0,
+                attach_ui: None,
             })
             .collect();
         Ok(Chart {
@@ -920,14 +978,22 @@ impl Chart {
             line.color.set_time(time);
             line.height.set_time(time);
             // [E] CtrlObject evaluation
-            line.ctrl_pos.set_time(time);
-            line.ctrl_size.set_time(time);
+            line.ctrl_pos_x.set_time(time);
+            line.ctrl_pos_y.set_time(time);
+            line.ctrl_size_x.set_time(time);
+            line.ctrl_size_y.set_time(time);
             line.ctrl_alpha.set_time(time);
             line.ctrl_y.set_time(time);
-            out.ctrl_pos = line.ctrl_pos.now_opt().unwrap_or(1.0);
-            out.ctrl_size = line.ctrl_size.now_opt().unwrap_or(1.0);
+            line.incline.set_time(time);
+            // phira: CtrlObject values are multipliers with default 1.0.
+            out.ctrl_pos_x = line.ctrl_pos_x.now_opt().unwrap_or(1.0);
+            out.ctrl_pos_y = line.ctrl_pos_y.now_opt().unwrap_or(1.0);
+            out.ctrl_size_x = line.ctrl_size_x.now_opt().unwrap_or(1.0);
+            out.ctrl_size_y = line.ctrl_size_y.now_opt().unwrap_or(1.0);
             out.ctrl_alpha = line.ctrl_alpha.now_opt().unwrap_or(1.0);
             out.ctrl_y = line.ctrl_y.now_opt().unwrap_or(1.0);
+            let incline_deg = line.incline.now_opt().unwrap_or(0.0);
+            out.incline_sin = incline_deg.to_radians().sin();
             let raw_alpha = line.alpha.now_opt().unwrap_or(1.0);
             out.alpha = raw_alpha.max(0.);
             out.pe_hide = raw_alpha < 0.0; // PE extension: -1 hides everything
@@ -940,6 +1006,9 @@ impl Chart {
             }
             out.z_order = line.z_order;
             out.parent = line.parent;
+            if out.attach_ui != line.attach_ui {
+                out.attach_ui.clone_from(&line.attach_ui);
+            }
             out.notes.clear();
         }
         // [parent] Second pass: propagate parent transforms (rotation + position + alpha)
@@ -1115,6 +1184,35 @@ impl Chart {
 mod tests {
     use super::*;
     use crate::core::bpm::Triple;
+
+    fn beat_to_time(chart: &mut Chart, beat: f64) -> f64 {
+        let mut lo = 0.0;
+        let mut hi = chart.duration();
+        for _ in 0..60 {
+            let mid = (lo + hi) / 2.0;
+            if chart.time_to_beat(mid) < beat {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        (lo + hi) / 2.0
+    }
+
+    #[test]
+    fn rainshower_l75_flicker() {
+        let dir = r"D:\phimakor\example_chart\RainShower";
+        let (_info, mut chart) = Chart::load(std::path::Path::new(dir)).unwrap();
+        for beat in [68.5, 69.05, 69.15, 69.20, 69.30, 69.40, 70.5] {
+            let t = beat_to_time(&mut chart, beat);
+            let state = chart.state_at(t);
+            let line = &state.lines[75];
+            println!(
+                "beat {beat:5.2} (t={t:7.3}s): line75 alpha={:.4} pe_hide={}",
+                line.alpha, line.pe_hide
+            );
+        }
+    }
 
     const MINIMAL: &str = r#"{
         "META": { "offset": 100, "RPEVersion": 160 },

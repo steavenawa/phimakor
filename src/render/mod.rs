@@ -763,15 +763,21 @@ impl Renderer {
         lines.sort_by_key(|(_, l)| l.z_order);
 
         for (_orig_i, line) in &lines {
-            if line.pe_hide { continue; }
+            if line.pe_hide || line.attach_ui.is_some() { continue; }
+            // [E] CtrlObject: ctrl_alpha scales the line's final alpha.
+            let line_alpha = line.alpha * line.ctrl_alpha;
             // T * R * S: translate to position, rotate around self, scale
+            // [E] CtrlObject: ctrl_pos is a multiplier (phira applies to incline);
+            // ctrl_size scales the line.
+            let ctrl_px = line.position[0] * CANVAS_W;
+            let ctrl_py = line.position[1] * CANVAS_H;
             let line_m = mat_mul(
                 &letterbox,
                 &mat_mul(
-                    &mat_translate(line.position[0] * CANVAS_W, line.position[1] * CANVAS_H),
+                    &mat_translate(ctrl_px, ctrl_py),
                     &mat_mul(
                         &mat_rotate(line.rotation),
-                        &mat_scale(line.scale[0], line.scale[1]),
+                        &mat_scale(line.scale[0] * line.ctrl_size_x, line.scale[1] * line.ctrl_size_y),
                     ),
                 ),
             );
@@ -783,7 +789,7 @@ impl Renderer {
                     cmds.push(DrawCmd {
                         uniform: DrawUniform {
                             model: mat_mul(&line_m, &mat_scale(LINE_LEN, LINE_THICK)),
-                            color: [c[0], c[1], c[2], c[3] * line.alpha],
+                            color: [c[0], c[1], c[2], c[3] * line_alpha],
                             uv_rect: [0., 0., 1., 1.],
                         },
                         tex: &self.white,
@@ -802,14 +808,14 @@ impl Renderer {
                         let tex_m = mat_mul(
                             &letterbox,
                             &mat_mul(
-                                &mat_translate(line.position[0] * CANVAS_W, line.position[1] * CANVAS_H),
+                                &mat_translate(ctrl_px, ctrl_py),
                                 &mat_mul(&mat_rotate(line.rotation), &mat_scale(tw, th)),
                             ),
                         );
                         cmds.push(DrawCmd {
                             uniform: DrawUniform {
                                 model: tex_m,
-                                color: [c[0], c[1], c[2], c[3] * line.alpha],
+                                color: [c[0], c[1], c[2], c[3] * line_alpha],
                                 uv_rect: [0., 0., 1., 1.],
                             },
                             tex: &t.bind_group,
@@ -819,7 +825,7 @@ impl Renderer {
                         cmds.push(DrawCmd {
                             uniform: DrawUniform {
                                 model: mat_mul(&line_m, &mat_scale(LINE_LEN, LINE_THICK)),
-                                color: [c[0], c[1], c[2], c[3] * line.alpha],
+                                color: [c[0], c[1], c[2], c[3] * line_alpha],
                                 uv_rect: [0., 0., 1., 1.],
                             },
                             tex: &self.white,
@@ -835,7 +841,7 @@ impl Renderer {
             let note_m = mat_mul(
                 &letterbox,
                 &mat_mul(
-                    &mat_translate(line.position[0] * CANVAS_W, line.position[1] * CANVAS_H),
+                    &mat_translate(ctrl_px, ctrl_py),
                     &mat_rotate(line.rotation),
                 ),
             );
@@ -876,9 +882,8 @@ impl Renderer {
                     if alpha <= 0.0 {
                         continue;
                     }
-                    // prpr mirrors below notes under a scale(1, -1); CoreEval
-                    // [F] Incline: sinusoidal X distortion (not yet implemented)
-                    let _incline = 0.0f32;
+                    // [F] Incline: perspective X distortion based on note Y position
+                    let incline_factor = 1.0 - line.incline_sin * note.relative[1] * 0.5;
                     // [E] CtrlObject from LineState (evaluated in state_at)
                     let ctrl_y = line.ctrl_y;
                     let x = note.relative[0] * CANVAS_W;
@@ -888,7 +893,7 @@ impl Renderer {
 
                     match (note.kind, sprite) {
                         (1 | 3 | 4, Some(t)) => {
-                            let w = NOTE_SPRITE_W * note.scale * mh_factor;
+                            let w = NOTE_SPRITE_W * note.scale * mh_factor * incline_factor;
                             let h = w * t.size[1] / t.size[0];
                             cmds.push(DrawCmd {
                                 uniform: DrawUniform {
@@ -904,7 +909,7 @@ impl Renderer {
                         // head (holdAtlasMH = [50 tail, 95 head]). Textures are
                         // flipped at upload: head = v0, tail = v1. body→head→tail.
                         (2, Some(t)) => {
-                            let w = NOTE_SPRITE_W * note.scale * mh_factor;
+                            let w = NOTE_SPRITE_W * note.scale * mh_factor * incline_factor;
                             let (tail_px, head_px) = if is_mh { (50.0, 95.0) } else { (HOLD_CAP_PX, HOLD_CAP_PX) };
                             let head_uv = head_px / t.size[1]; // v0-fraction for head
                             let tail_uv = tail_px / t.size[1];
@@ -969,7 +974,7 @@ impl Renderer {
                                     if h > 1e-5 {
                                         cmds.push(DrawCmd {
                                             uniform: DrawUniform {
-                                                model: mat_mul(&nb(), &mat_scale(HOLD_BODY_W * note.scale, h)),
+                                                model: mat_mul(&nb(), &mat_scale(HOLD_BODY_W * note.scale * incline_factor, h)),
                                                 color: [rgb[0], rgb[1], rgb[2], alpha],
                                                 uv_rect: [0., 0., 1., 1.],
                                             },
@@ -980,7 +985,7 @@ impl Renderer {
                             }
                             cmds.push(DrawCmd {
                                 uniform: DrawUniform {
-                                    model: mat_mul(&nb(), &mat_scale(NOTE_W * note.scale, NOTE_H * note.scale)),
+                                    model: mat_mul(&nb(), &mat_scale(NOTE_W * note.scale * incline_factor, NOTE_H * note.scale)),
                                     color: [rgb[0], rgb[1], rgb[2], alpha],
                                     uv_rect: [0., 0., 1., 1.],
                                 },
