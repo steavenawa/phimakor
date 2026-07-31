@@ -36,6 +36,11 @@ const ASPECT: f32 = 3.0 / 2.0;
 // Contract render-semantics constants, in RPE CANVAS pixels (1350×900).
 const CANVAS_W: f32 = 675.0; // world x ±1 ↔ ±675 canvas px
 const CANVAS_H: f32 = 450.0; // world y ±1 ↔ ±450 canvas px
+/// Event-position x offset: positions (not sprites) are scaled by
+/// aspect/1.5 so they stretch from the 3:2 canvas width to fill the
+/// playfield box at any aspect (16:9 → ×1.19, 4:3 → ×0.89, 1:1 → ×0.67).
+/// y positions need no offset: y×aspect×fit is already constant (×1.5).
+const EVENT_X_OFFSET: f32 = 1.0;
 /// Positions (not sizes!) are stretched ×1.5 vertically so the RPE canvas
 /// (900 px tall) fills the playfield at any aspect, while sprites keep a
 /// uniform pixel scale (no texture distortion).
@@ -729,6 +734,11 @@ impl Renderer {
         // kx/ky letterbox the playfield into the window.
         let fit = (1.5 / aspect).min(1.0);
         let letterbox = mat_scale(kx * fit / CANVAS_W, ky * aspect * fit / CANVAS_W);
+        // Event-position x offset: x positions stretch by aspect/1.5 so the
+        // canvas fills the playfield box width at any aspect (3:2 → ×1.0,
+        // 16:9 → ×1.19, 4:3 → ×0.89, 1:1 → ×0.67). Sprites (sizes) are NOT
+        // affected — they keep the uniform letterbox scale.
+        let ev_x = aspect / 1.5;
 
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame
@@ -778,7 +788,7 @@ impl Renderer {
             // T * R * S: translate to position, rotate around self, scale
             // [E] CtrlObject: ctrl_pos is a multiplier (phira applies to incline);
             // ctrl_size scales the line.
-            let ctrl_px = line.position[0] * CANVAS_W;
+            let ctrl_px = line.position[0] * CANVAS_W * ev_x;
             let ctrl_py = line.position[1] * CANVAS_H;
             let line_m = mat_mul(
                 &letterbox,
@@ -895,7 +905,7 @@ impl Renderer {
                     let incline_factor = 1.0 - line.incline_sin * note.relative[1] * 0.5;
                     // [E] CtrlObject from LineState (evaluated in state_at)
                     let ctrl_y = line.ctrl_y;
-                    let x = note.relative[0] * CANVAS_W;
+                    let x = note.relative[0] * CANVAS_W * ev_x;
                     // [E] ctrl_y scales the note's relative Y position
                     let y = note.relative[1] * CANVAS_H * ctrl_y;
                     let note_base = mat_mul(&note_m, &mat_translate(x, y));
@@ -1014,7 +1024,7 @@ impl Renderer {
         for line in frame.lines.iter() {
             let Some(ui) = line.attach_ui.as_deref() else { continue };
             if ui == "bar" || line.pe_hide || line.alpha <= 0.0 { continue; }
-            let pos = [line.position[0] * CANVAS_W, line.position[1] * CANVAS_H];
+            let pos = [line.position[0] * CANVAS_W * ev_x, line.position[1] * CANVAS_H];
             let a = line.alpha * line.ctrl_alpha;
             text::draw_text_world(
                 &mut self.text,
@@ -1053,7 +1063,7 @@ impl Renderer {
                         &letterbox,
                         &mat_mul(
                             &mat_mul(
-                                &mat_translate(bl.position[0] * CANVAS_W, bl.position[1] * CANVAS_H),
+                                &mat_translate(bl.position[0] * CANVAS_W * ev_x, bl.position[1] * CANVAS_H),
                                 &mat_rotate(bl.rotation),
                             ),
                             &mat_mul(
@@ -1090,7 +1100,7 @@ impl Renderer {
         }
 
         // Field-split call: `cmds` already borrows `self.textures`/`self.white`.
-        Self::push_hit_fx(&mut self.hit_fx, &self.textures, &mut cmds, &letterbox);
+        Self::push_hit_fx(&mut self.hit_fx, &self.textures, &mut cmds, &letterbox, ev_x);
 
         // Text overlay (Phaser UI), on top of everything; queue is per-frame.
         text::push_text(
