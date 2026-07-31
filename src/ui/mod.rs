@@ -37,6 +37,7 @@ pub struct IcedOverlay {
     tree: Tree,
     theme: Theme,
     pixmap: tiny_skia::Pixmap,          // timeline + overlay working pixmap
+    base_pixmap: tiny_skia::Pixmap,     // timeline content WITHOUT playhead (per-frame redraw source)
     iced_cache: tiny_skia::Pixmap,      // cached Iced UI, same size
     iced_tex: wgpu::Texture,            // GPU texture for Iced cache
     iced_bg: wgpu::BindGroup,           // bind group for Iced cache
@@ -90,6 +91,7 @@ impl IcedOverlay {
         let tree = Tree::new(&root);
         Self { renderer, tree, theme: Theme::Dark,
             pixmap: tiny_skia::Pixmap::new(w.max(1), h.max(1)).unwrap(),
+            base_pixmap: tiny_skia::Pixmap::new(w.max(1), h.max(1)).unwrap(),
             iced_cache: tiny_skia::Pixmap::new(w.max(1), h.max(1)).unwrap(),
             texture, bind_group, iced_tex, iced_bg, timeline_tex, timeline_bg,
             clip_mask: tiny_skia::Mask::new(w.max(1), h.max(1)).unwrap(),
@@ -543,19 +545,65 @@ impl IcedOverlay {
         );
     }
 
-    /// Timeline-only redraw: draw on pixmap, upload to timeline texture.
-    /// NO copy from iced_cache — GPU composites both textures.
+    /// Timeline-only per-frame redraw: restore the playhead-free base pixmap,
+    /// draw the current-time lines, upload. No tiny_skia content rebuild.
     pub fn redraw_timeline(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let _s = trace_span!("redraw_timeline");
         self.show_overlay = info.show_overlay;
         self.tl_visible = info.show_events || info.show_notes;
         self.gui_scale = info.gui_scale;
-        self.notes_cache = info.notes.clone();
         self.panel_progress = self.approach(self.panel_progress, if info.show_properties { 1.0 } else { 0.0 });
         self.events_progress = self.approach(self.events_progress, if info.show_events { 1.0 } else { 0.0 });
         self.notes_progress = self.approach(self.notes_progress, if info.show_notes { 1.0 } else { 0.0 });
-        self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
-        self.upload_timeline_to(queue, info)
+        self.animate_all();
+        // Restore base content (no playhead) — memcpy, much cheaper than redraw.
+        self.pixmap.data_mut().copy_from_slice(self.base_pixmap.data());
+        self.draw_playhead(info);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            self.pixmap.data(),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
+            wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+        );
+    }
+
+    /// Draw the current-time playhead lines on `pixmap` (assumes base content).
+    fn draw_playhead(&mut self, info: &GameInfo) {
+        let s = self.gui_scale;
+        let vw = self.w as f32;
+        let vh = self.h as f32;
+        let ep = self.events_progress;
+        let np = self.notes_progress;
+        let pp = self.panel_progress;
+        let pan_w = PANEL_W * s;
+        let props_x = vw - pp * pan_w;
+        let events_x = props_x - ep * TL_W * s;
+        let notes_x = events_x - np * NT_W * s;
+        if self.tl_visible {
+            self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
+            let (scroll, zoom) = (self.tl_scroll as f64, self.tl_zoom as f64);
+            let (min_b, max_b) = (scroll, scroll + zoom);
+            let head_h = HEADER_H * s;
+            let py = head_h + 4.0 * s;
+            let ph = (vh - 56.0 * s - py) as f64;
+            let to_y = |b: f64| py as f64 + ph - (b - min_b) / zoom * ph;
+            let ct_y = to_y(info.chart_beat).clamp(py as f64, py as f64 + ph) as f32;
+            let mut cp = tiny_skia::Paint::default();
+            cp.set_color_rgba8(255, 200, 80, 230);
+            if info.show_events {
+                let tl_w = TL_W * s;
+                if let Some(r) = tiny_skia::Rect::from_xywh(events_x + 2.0 * s, ct_y - 1.0, tl_w - 4.0 * s, 3.0) {
+                    self.pixmap.as_mut().fill_rect(r, &cp, tiny_skia::Transform::default(), None);
+                }
+            }
+            if info.show_notes {
+                let pad_x = 12.0 * s;
+                let play_w = NT_W * s - pad_x * 2.0;
+                if let Some(r) = tiny_skia::Rect::from_xywh(notes_x + pad_x, ct_y - 1.0, play_w, 3.0) {
+                    self.pixmap.as_mut().fill_rect(r, &cp, tiny_skia::Transform::default(), None);
+                }
+            }
+        }
     }
 
     fn animate_all(&mut self) {
@@ -591,6 +639,7 @@ impl IcedOverlay {
     fn upload_timeline_to(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let _s = trace_span!("upload_timeline");
         self.animate_all();
+        self.notes_cache = info.notes.clone();
         let s = self.gui_scale;
         let vw = self.w as f32;
         let vh = self.h as f32;
@@ -688,6 +737,8 @@ impl IcedOverlay {
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
             wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
         );
+        // Sync the playhead-free base for per-frame redraw_timeline.
+        self.base_pixmap.data_mut().copy_from_slice(self.pixmap.data());
     }
 }
 

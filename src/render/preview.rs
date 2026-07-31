@@ -101,6 +101,11 @@ impl PreviewEngine {
         (self.width, self.height)
     }
 
+    /// Borrow the underlying renderer (device/queue/tex_bgl/sampler access).
+    pub fn renderer(&self) -> &Renderer {
+        &self.renderer
+    }
+
     /// Render one frame offscreen and read back RGBA8, row-major, top-down.
     /// Returns pixel bytes (len = w*h*4, row padding already removed).
     ///

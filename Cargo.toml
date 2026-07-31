@@ -28,7 +28,7 @@ iced = { version = "*", features = ["tiny-skia", "advanced", "image"] }
 iced_tiny_skia = "*"
 tiny-skia = "*"
 tracing = "*"
-tracing-subscriber = { version = "*", features = ["env-filter", "time"] }
+tracing-subscriber = { version = "*", features = ["env-filter", "time", "registry"] }
 tracing-flame = "*"
 dhat = { version = "*", optional = true }
 tracy-client = { version = "*", optional = true }

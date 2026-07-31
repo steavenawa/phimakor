@@ -1107,6 +1107,7 @@ impl Renderer {
         // The overlay is drawn in a separate render pass on the surface view
         // (see Step 4 below).
 
+        let _s1 = crate::trace_span!("draw_cmds_build");
         let instances: Vec<Instance> = cmds
             .iter()
             .map(|cmd| {
@@ -1118,7 +1119,9 @@ impl Renderer {
                 }
             })
             .collect();
+        drop(_s1);
 
+        let _s2 = crate::trace_span!("draw_upload_submit");
         if !instances.is_empty() {
             self.queue.write_buffer(
                 &self.instance_bufs[self.frame_idx],
