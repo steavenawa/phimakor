@@ -591,7 +591,6 @@ impl IcedOverlay {
     fn upload_timeline_to(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let _s = trace_span!("upload_timeline");
         self.animate_all();
-        self.animate_all();
         let s = self.gui_scale;
         let vw = self.w as f32;
         let vh = self.h as f32;
