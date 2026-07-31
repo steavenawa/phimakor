@@ -661,12 +661,16 @@ impl IcedOverlay {
 
         if self.tl_visible {
             self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
+            let _s2 = trace_span!("tl_notes_draw");
             if info.show_notes {
                 draw_notes_timeline(&mut self.pixmap.as_mut(), self.tl_scroll, self.tl_zoom, info, notes_x, vh, s);
             }
+            drop(_s2);
+            let _s3 = trace_span!("tl_events_draw");
             if info.show_events {
                 draw_5col_timeline(&mut self.pixmap.as_mut(), self.tl_scroll, self.tl_zoom, info, events_x, vh, s);
             }
+            drop(_s3);
         }
         // Selection rect (Ctrl+drag) + seek bar + context menu
         {
