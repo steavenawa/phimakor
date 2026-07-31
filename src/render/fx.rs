@@ -36,8 +36,8 @@ impl Renderer {
 
     /// Queue draws for all live bursts (called from `render`, after notes).
     /// `letterbox` is the canvas px → NDC playfield transform.
-    /// `ev_x` = aspect/1.5: event x positions are stretched to fill the box,
-    /// so the fx burst must match (its pos is in canvas px, pre-ev_x).
+    /// `ev_x` = aspect/1.5, `ev_y` = 1.5/aspect: event positions are scaled
+    /// to fill the box (the fx burst pos is in canvas px, pre-ev).
     /// Free function with field-split borrows: `cmds` already holds shared
     /// borrows of `self.textures`, so a `&mut self` method would not compile.
     pub(crate) fn push_hit_fx<'a>(
@@ -46,6 +46,7 @@ impl Renderer {
         cmds: &mut Vec<DrawCmd<'a>>,
         letterbox: &Mat3,
         ev_x: f32,
+        ev_y: f32,
     ) {
         hit_fx.retain(|fx| fx.t0.elapsed().as_secs_f32() < HIT_FX_SECS);
         if hit_fx.is_empty() {
@@ -65,7 +66,7 @@ impl Renderer {
                 uniform: DrawUniform {
                     model: mat_mul(
                         letterbox,
-                        &mat_mul(&mat_translate(fx.pos[0] * ev_x, fx.pos[1]), &mat_scale(side, side)),
+                        &mat_mul(&mat_translate(fx.pos[0] * ev_x, fx.pos[1] * ev_y), &mat_scale(side, side)),
                     ),
                     color: GOLD,
                     // Upload is flipped (v0 = image BOTTOM), so atlas rows index

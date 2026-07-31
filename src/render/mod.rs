@@ -733,15 +733,20 @@ impl Renderer {
         // never clips, never distorts, and 3:2 fills the box exactly.
         // kx/ky letterbox the playfield into the window.
         let fit = (1.5 / aspect).min(1.0);
-        // y maps CONSTANT ×1.5 (450 → 675 → box top): the canvas fills the
-        // box height at every aspect; x shrinks with fit and stretches with
-        // ev_x. Sprites (sizes) keep the uniform letterbox scale.
-        let letterbox = mat_scale(kx * fit / CANVAS_W, ky * 1.5 / CANVAS_W);
+        // Uniform letterbox: canvas px → world /675 (x) and ×aspect/675 (y) —
+        // the y×aspect exactly compensates the window aspect so SPRITES keep
+        // a uniform screen scale at every playfield aspect. Positions get the
+        // per-axis factors separately (ev_x fills the width, ev_y puts y=450
+        // at the box top): see below.
+        let letterbox = mat_scale(kx / CANVAS_W, ky * aspect / CANVAS_W);
         // Event-position x offset: x positions stretch by aspect/1.5 so the
         // canvas fills the playfield box width at any aspect (3:2 → ×1.0,
         // 16:9 → ×1.19, 4:3 → ×0.89, 1:1 → ×0.67). Sprites (sizes) are NOT
         // affected — they keep the uniform letterbox scale.
         let ev_x = aspect / 1.5;
+        // y positions: ×1.5/aspect so y=±450 (the canvas top/bottom) sits at
+        // the box edge at EVERY aspect.
+        let ev_y = 1.5 / aspect;
 
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame
@@ -768,7 +773,7 @@ impl Renderer {
             // Cover-FILL the whole playfield box: the quad is scaled by 1/fit
             // so that, after the fit-scaled letterbox, it spans 2kx×2ky (the
             // full box) at any aspect. The UV crop handles the image aspect.
-            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0 / fit, 900.0));
+            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 1350.0 / aspect));
             cmds.push(DrawCmd {
                 uniform: DrawUniform { model: bg_m, color: [d, d, d, 1.0], uv_rect: uv },
                 tex: bg,
@@ -792,7 +797,7 @@ impl Renderer {
             // [E] CtrlObject: ctrl_pos is a multiplier (phira applies to incline);
             // ctrl_size scales the line.
             let ctrl_px = line.position[0] * CANVAS_W * ev_x;
-            let ctrl_py = line.position[1] * CANVAS_H;
+            let ctrl_py = line.position[1] * CANVAS_H * ev_y;
             let line_m = mat_mul(
                 &letterbox,
                 &mat_mul(
@@ -910,7 +915,7 @@ impl Renderer {
                     let ctrl_y = line.ctrl_y;
                     let x = note.relative[0] * CANVAS_W * ev_x;
                     // [E] ctrl_y scales the note's relative Y position
-                    let y = note.relative[1] * CANVAS_H * ctrl_y;
+                    let y = note.relative[1] * CANVAS_H * ev_y * ctrl_y;
                     let note_base = mat_mul(&note_m, &mat_translate(x, y));
 
                     match (note.kind, sprite) {
@@ -948,7 +953,7 @@ impl Renderer {
                                 &mat_translate(x, cy), &mat_scale(w, w),
                             ));
                             if let Some(end_y) = note.hold_end_y {
-                                let y1 = end_y as f32 * CANVAS_H * ctrl_y;
+                                let y1 = end_y as f32 * CANVAS_H * ev_y * ctrl_y;
                                 let (head_y, tail_y) = (y, y1);
                                 let h = (tail_y - head_y).abs();
                                 if h > 1e-5 {
@@ -991,7 +996,7 @@ impl Renderer {
                             let nb = || mat_mul(&note_m, &mat_translate(x, y));
                             if note.kind == 2 {
                                 if let Some(end_y) = note.hold_end_y {
-                                let y1 = end_y as f32 * CANVAS_H * ctrl_y;
+                                let y1 = end_y as f32 * CANVAS_H * ev_y * ctrl_y;
                                     let h = (y1 - y).abs();
                                     if h > 1e-5 {
                                         cmds.push(DrawCmd {
@@ -1027,7 +1032,7 @@ impl Renderer {
         for line in frame.lines.iter() {
             let Some(ui) = line.attach_ui.as_deref() else { continue };
             if ui == "bar" || line.pe_hide || line.alpha <= 0.0 { continue; }
-            let pos = [line.position[0] * CANVAS_W * ev_x, line.position[1] * CANVAS_H];
+            let pos = [line.position[0] * CANVAS_W * ev_x, line.position[1] * CANVAS_H * ev_y];
             let a = line.alpha * line.ctrl_alpha;
             text::draw_text_world(
                 &mut self.text,
@@ -1050,7 +1055,7 @@ impl Renderer {
         if self.progress > 0.0 {
             let bar_h = 5.0;
             // Visible canvas top: y = 675/(aspect·fit); y=450 at 3:2/16:9.
-            let top = 450.0;
+            let top = CANVAS_H;
             let bar_w = 1350.0 * self.progress;
             if let Some(bl) = frame.lines.iter().find(|l| l.attach_ui.as_deref() == Some("bar")) {
                 if !bl.pe_hide && bl.alpha > 0.0 {
@@ -1066,7 +1071,7 @@ impl Renderer {
                         &letterbox,
                         &mat_mul(
                             &mat_mul(
-                                &mat_translate(bl.position[0] * CANVAS_W * ev_x, bl.position[1] * CANVAS_H),
+                                &mat_translate(bl.position[0] * CANVAS_W * ev_x, bl.position[1] * CANVAS_H * ev_y),
                                 &mat_rotate(bl.rotation),
                             ),
                             &mat_mul(
@@ -1103,7 +1108,7 @@ impl Renderer {
         }
 
         // Field-split call: `cmds` already borrows `self.textures`/`self.white`.
-        Self::push_hit_fx(&mut self.hit_fx, &self.textures, &mut cmds, &letterbox, ev_x);
+        Self::push_hit_fx(&mut self.hit_fx, &self.textures, &mut cmds, &letterbox, ev_x, ev_y);
 
         // Text overlay (Phaser UI), on top of everything; queue is per-frame.
         text::push_text(

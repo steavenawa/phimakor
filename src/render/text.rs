@@ -44,8 +44,8 @@ impl TextAnchor {
     /// "Top" anchors use +y and the "Bottom" anchors -y. The visible canvas
     /// y-range is ±(675/aspect), so anchors follow the playfield aspect.
     fn layout(self, aspect: f32) -> (f32, HAlign, f32) {
-        // y maps constant ×1.5: the canvas top (y=450) is the playfield top
-        // at every aspect.
+        // Positions scale by ev_y = 1.5/aspect, so the canvas top (y=450,
+        // ×ev_y×aspect/675 = 1.0) is the playfield top at every aspect.
         let top = 450.0;
         let bottom = -450.0;
         match self {
