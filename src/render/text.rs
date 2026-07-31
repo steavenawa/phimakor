@@ -327,21 +327,3 @@ pub(crate) fn push_text<'a>(
     }
     pending.clear();
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn combo_layout_sanity() {
-        let font = super::parse_font(std::fs::read(r"D:\phimakor\res\Exo2.ttf").unwrap()).unwrap();
-        for text in ["515", "0778502", "combo"] {
-            let px = 56.0;
-            let glyphs: Vec<_> = text.chars().map(|c| font.rasterize(c, px)).collect();
-            let line_w: f32 = glyphs.iter().map(|(m, _)| m.advance_width).sum();
-            let spans: Vec<_> = glyphs
-                .iter()
-                .map(|(m, _)| (m.xmin, m.width, m.advance_width))
-                .collect();
-            eprintln!("{text:?}: line_w={line_w:.1} spans={spans:?}");
-        }
-    }
-}

@@ -1189,46 +1189,6 @@ mod tests {
     use super::*;
     use crate::core::bpm::Triple;
 
-    fn beat_to_time(chart: &mut Chart, beat: f64) -> f64 {
-        let mut lo = 0.0;
-        let mut hi = chart.duration();
-        for _ in 0..60 {
-            let mid = (lo + hi) / 2.0;
-            if chart.time_to_beat(mid) < beat {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        (lo + hi) / 2.0
-    }
-
-    #[test]
-    fn rainshower_l75_flicker() {
-        let dir = r"D:\phimakor\example_chart\RainShower";
-        let (_info, mut chart) = Chart::load(std::path::Path::new(dir)).unwrap();
-        for beat in [68.5, 69.05, 69.15, 69.20, 69.30, 69.40, 70.5] {
-            let t = beat_to_time(&mut chart, beat);
-            let state = chart.state_at(t);
-            let line = &state.lines[75];
-            println!(
-                "beat {beat:5.2} (t={t:7.3}s): line75 alpha={:.4} pe_hide={}",
-                line.alpha, line.pe_hide
-            );
-        }
-    }
-
-    #[test]
-    fn sanctuary_notes_visible_before_hit() {
-        let dir = r"D:\phimakor\example_chart\Sanctuary";
-        let (_info, mut chart) = Chart::load(std::path::Path::new(dir)).unwrap();
-        let hit = beat_to_time(&mut chart, 279.0);
-        let t = (hit - 0.3).max(0.0);
-        let state = chart.state_at(t);
-        let line = &state.lines[0];
-        assert!(line.notes.iter().any(|n| n.alpha > 0.5), "note should be visible 0.3s before hit");
-    }
-
     const MINIMAL: &str = r#"{
         "META": { "offset": 100, "RPEVersion": 160 },
         "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
