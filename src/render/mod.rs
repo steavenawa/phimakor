@@ -733,7 +733,10 @@ impl Renderer {
         // never clips, never distorts, and 3:2 fills the box exactly.
         // kx/ky letterbox the playfield into the window.
         let fit = (1.5 / aspect).min(1.0);
-        let letterbox = mat_scale(kx * fit / CANVAS_W, ky * aspect * fit / CANVAS_W);
+        // y maps CONSTANT ×1.5 (450 → 675 → box top): the canvas fills the
+        // box height at every aspect; x shrinks with fit and stretches with
+        // ev_x. Sprites (sizes) keep the uniform letterbox scale.
+        let letterbox = mat_scale(kx * fit / CANVAS_W, ky * 1.5 / CANVAS_W);
         // Event-position x offset: x positions stretch by aspect/1.5 so the
         // canvas fills the playfield box width at any aspect (3:2 → ×1.0,
         // 16:9 → ×1.19, 4:3 → ×0.89, 1:1 → ×0.67). Sprites (sizes) are NOT
@@ -765,7 +768,7 @@ impl Renderer {
             // Cover-FILL the whole playfield box: the quad is scaled by 1/fit
             // so that, after the fit-scaled letterbox, it spans 2kx×2ky (the
             // full box) at any aspect. The UV crop handles the image aspect.
-            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0 / fit, 1350.0 / (aspect * fit)));
+            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0 / fit, 900.0));
             cmds.push(DrawCmd {
                 uniform: DrawUniform { model: bg_m, color: [d, d, d, 1.0], uv_rect: uv },
                 tex: bg,
@@ -1047,7 +1050,7 @@ impl Renderer {
         if self.progress > 0.0 {
             let bar_h = 5.0;
             // Visible canvas top: y = 675/(aspect·fit); y=450 at 3:2/16:9.
-            let top = 675.0 / (aspect * (1.5 / aspect).min(1.0));
+            let top = 450.0;
             let bar_w = 1350.0 * self.progress;
             if let Some(bl) = frame.lines.iter().find(|l| l.attach_ui.as_deref() == Some("bar")) {
                 if !bl.pe_hide && bl.alpha > 0.0 {
