@@ -722,11 +722,13 @@ impl Renderer {
         } else {
             (1.0, window_aspect / aspect)
         };
-        // Coordinate mapping (Phigros-style): the y unit adapts to the
-        // playfield aspect. world_x = canvas_x/675, world_y = canvas_y*aspect/675
-        // (so y:1 = 675/aspect px: 3:2→450, 16:9→379, 4:3→507, 1:1→675).
-        // kx/ky letterbox the playfield into the window preserving its aspect.
-        let letterbox = mat_scale(kx / CANVAS_W, ky * aspect / CANVAS_W);
+        // Coordinate mapping from the playfield's x:y ratio: the playfield box
+        // is 1350 × (1350/aspect) px, and the RPE canvas (1350×900) is scaled
+        // UNIFORMLY by fit = min(1, 1.5/aspect) to fit inside it. The canvas
+        // never clips, never distorts, and 3:2 fills the box exactly.
+        // kx/ky letterbox the playfield into the window.
+        let fit = (1.5 / aspect).min(1.0);
+        let letterbox = mat_scale(kx * fit / CANVAS_W, ky * aspect * fit / CANVAS_W);
 
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame
@@ -1031,7 +1033,8 @@ impl Renderer {
         // canvas top edge otherwise.
         if self.progress > 0.0 {
             let bar_h = 5.0;
-            let top = CANVAS_W / aspect; // visible canvas y at the top
+            // Visible canvas top: y = 675/(aspect·fit); y=450 at 3:2/16:9.
+            let top = 675.0 / (aspect * (1.5 / aspect).min(1.0));
             let bar_w = 1350.0 * self.progress;
             if let Some(bl) = frame.lines.iter().find(|l| l.attach_ui.as_deref() == Some("bar")) {
                 if !bl.pe_hide && bl.alpha > 0.0 {
