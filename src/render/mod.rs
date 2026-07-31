@@ -752,7 +752,10 @@ impl Renderer {
             };
             // Cover the full RPE canvas (1350×900): it stretches to the
             // playfield box at any aspect.
-            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 1350.0 / aspect));
+            // Cover-FILL the whole playfield box: the quad is scaled by 1/fit
+            // so that, after the fit-scaled letterbox, it spans 2kx×2ky (the
+            // full box) at any aspect. The UV crop handles the image aspect.
+            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0 / fit, 1350.0 / (aspect * fit)));
             cmds.push(DrawCmd {
                 uniform: DrawUniform { model: bg_m, color: [d, d, d, 1.0], uv_rect: uv },
                 tex: bg,
