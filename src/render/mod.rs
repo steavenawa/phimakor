@@ -1054,17 +1054,20 @@ impl Renderer {
         // canvas top edge otherwise.
         if self.progress > 0.0 {
             let bar_h = 5.0;
-            // Visible canvas top: y = 675/(aspect·fit); y=450 at 3:2/16:9.
-            let top = CANVAS_H;
+            // Bar anchored at the box top-left in the raw letterbox space:
+            // y = 675/aspect maps to the box top at every aspect.
+            let top = 675.0 / aspect;
             let bar_w = 1350.0 * self.progress;
             if let Some(bl) = frame.lines.iter().find(|l| l.attach_ui.as_deref() == Some("bar")) {
                 if !bl.pe_hide && bl.alpha > 0.0 {
                     let bl_alpha = bl.alpha * bl.ctrl_alpha;
-                    // Bar rect lives in viewport space (anchored at the visible
-                    // canvas top-left, like phira's UIElement::Bar Rect(-1, top, ...));
-                    // the attachUI line's transform then moves/rotates/scales it.
+                    // Bar rect anchored at the playfield's top-left in the RAW
+                    // letterbox space: (-675, 675/aspect) maps to the box
+                    // corner (-kx, +ky) at every aspect. The attachUI line's
+                    // transform (ev-mapped position + rotation + scale) then
+                    // moves/rotates/scales it.
                     let bar_local = mat_mul(
-                        &mat_translate(-CANVAS_W + bar_w * 0.5, top - bar_h * 0.5),
+                        &mat_translate(-CANVAS_W + bar_w * 0.5, 675.0 / aspect - bar_h * 0.5),
                         &mat_scale(bar_w, bar_h),
                     );
                     let bar_m = mat_mul(
