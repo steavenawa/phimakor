@@ -131,6 +131,7 @@ impl IcedOverlay {
         let (w, h) = (w.max(1), h.max(1)); if (w, h) == (self.w, self.h) { return; }
         (self.w, self.h) = (w, h);
         self.pixmap = tiny_skia::Pixmap::new(w, h).unwrap();
+        self.base_pixmap = tiny_skia::Pixmap::new(w, h).unwrap();
         self.iced_cache = tiny_skia::Pixmap::new(w, h).unwrap();
         self.clip_mask = tiny_skia::Mask::new(w, h).unwrap();
         (self.texture, self.bind_group) = Self::make_texture(device, tex_bgl, sampler, w, h, "overlay");
