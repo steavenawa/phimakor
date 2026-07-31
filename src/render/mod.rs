@@ -739,13 +739,15 @@ impl Renderer {
         // per-axis factors separately (ev_x/ev_y fill the box at every aspect,
         // and the y stretch overflows the box at wide aspects): see below.
         let letterbox = mat_scale(kx / CANVAS_W, ky * aspect / CANVAS_W);
-        // Event positions: both axes stretch by aspect/1.5 so the canvas
-        // fills the playfield box at any aspect (3:2 → ×1.0, 16:9 → ×1.19,
-        // 4:3 → ×0.89, 1:1 → ×0.67). At wide aspects the y content overflows
-        // the box top/bottom — the playfield edge is the box edge. Sprites
-        // (sizes) are NOT affected — they keep the uniform letterbox scale.
-        let ev_x = aspect / 1.5;
-        let ev_y = aspect / 1.5;
+        // Event-position factors: stretch to FILL the playfield box at every
+        // aspect — canvas half-width 675 lands on world ±kx, half-height 450
+        // on ±ky (the box edge), with the distortion absorbed by the mapping.
+        // Sprites (sizes) are NOT affected — they keep the uniform letterbox
+        // scale below, so notes never stretch, only their positions do.
+        // 3:2 → (1.185, 1.0), 16:9 → (1.0, 0.844), 4:3 → (1.333, 1.125),
+        // 1:1 → (1.778, 1.5).
+        let ev_x = 1.0 / kx;
+        let ev_y = 1.5 / (ky * aspect);
 
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame

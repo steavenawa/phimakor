@@ -303,12 +303,17 @@ impl State {
         let line_name = if self.selected_line < line_count { self.chart.line_name(self.selected_line).to_string() } else { "?".to_string() };
         let frame = self.chart.state_at(chart_time);
 
+        let size = self.window.inner_size();
+        let win_aspect = size.width as f32 / size.height.max(1) as f32;
         for fired in &frame.fired {
             let line = &frame.lines[fired.line];
             let t = line.rotation;
             let x = fired.x as f32;
             let cx = (line.position[0] + t.cos() * x) * 675.0;
-            let cy = (line.position[1] + t.sin() * x * 1.5) * 450.0;
+            // Rotation term ×win_aspect: the fx is spawned in canvas px but
+            // x rotates in canvas-X px (675) while the y applies ev_y — under
+            // the fill mapping ev_x/ev_y = aspect/1.5×… = win_aspect constant.
+            let cy = (line.position[1] + t.sin() * x * win_aspect) * 450.0;
             if fired.hold_tail { if !fired.fake { self.combo += 1; self.hits += 1; } continue; }
             if fired.tick { self.renderer.spawn_hit_fx([cx, cy]); continue; }
             if fired.fake { continue; }
