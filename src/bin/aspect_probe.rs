@@ -13,11 +13,11 @@ fn main() {
     for (name, aspect) in [("3:2", 1.5f32), ("16:9", 16.0 / 9.0), ("4:3", 4.0 / 3.0), ("1:1", 1.0)] {
         let (kx, ky) = if window_aspect >= aspect { (aspect / window_aspect, 1.0) } else { (1.0, window_aspect / aspect) };
         let fit = (1.5 / aspect).min(1.0);
-        // Fill mapping: event positions stretch so the canvas (1350×900)
-        // exactly covers the playfield box (±kx, ±ky) at every aspect.
-        // Sprites keep the uniform letterbox scale (sx/sy below).
-        let ev_x = 1.0 / kx;
-        let ev_y = 1.5 / (ky * aspect);
+        // Event positions depend ONLY on the playfield aspect (never the
+        // window): the canvas edges (675/450) land on the box edges (±kx, ±ky)
+        // at any window. Sprites keep the uniform letterbox scale (sx/sy).
+        let ev_x = 1.0;
+        let ev_y = 1.5 / aspect;
         // Uniform letterbox: (kx/675, ky*aspect/675); positions ×(ev_x, ev_y)
         let lx = kx / 675.0;
         let ly = ky * aspect / 675.0;
@@ -41,9 +41,9 @@ fn main() {
         let nwx = lx * (ctrl_px + cos * nx - sin * ny);
         let nwy = ly * (ctrl_py + sin * nx + cos * ny);
         // fx world pos: letterbox * T(cx*ev_x, cy*ev_y); cy uses the canvas-X
-        // rotation term ×win_aspect so the burst lands on the note center.
+        // rotation term ×playfield aspect so the burst lands on the note center.
         let cx = (line.position[0] + cos * note.relative[0]) * 675.0;
-        let cy = (line.position[1] + sin * note.relative[0] * window_aspect) * 450.0;
+        let cy = (line.position[1] + sin * note.relative[0] * aspect) * 450.0;
         let fwx = lx * cx * ev_x;
         let fwy = ly * cy * ev_y;
         println!(

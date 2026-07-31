@@ -212,6 +212,11 @@ impl PreviewEngine {
         self.renderer.set_playfield_aspect(aspect);
     }
 
+    /// Current playfield canvas aspect ratio.
+    pub fn playfield_aspect(&self) -> f32 {
+        self.renderer.playfield_aspect()
+    }
+
     /// Update playback progress for the top progress bar (delegates to [`Renderer::set_progress`]).
     pub fn set_progress(&mut self, progress: f32) {
         self.renderer.set_progress(progress);

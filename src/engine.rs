@@ -136,10 +136,10 @@ impl ChartSession {
                 let t = line.rotation;
                 let x = fired.x as f32;
                 let cx = (line.position[0] + t.cos() * x) * 675.0;
-                // Rotation term ×win_aspect: see main.rs — under the fill
-                // mapping (ev_x = 1/kx, ev_y = 1.5/(ky·P)) the canvas-X rotation
-                // px and the canvas-Y ev scale meet at exactly the window aspect.
-                let cy = (line.position[1] + t.sin() * x * (self.width as f32 / self.height.max(1) as f32)) * 450.0;
+                // Rotation term ×playfield aspect: ev_x/ev_y = P/1.5, so the
+                // canvas-X rotation px (675) meets the canvas-Y ev scale at P
+                // (independent of the offscreen window aspect).
+                let cy = (line.position[1] + t.sin() * x * self.engine.playfield_aspect()) * 450.0;
                 self.engine.spawn_hit_fx([cx, cy]);
             }
         }

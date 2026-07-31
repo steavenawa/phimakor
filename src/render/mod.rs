@@ -655,6 +655,11 @@ impl Renderer {
         self.playfield_aspect = aspect;
     }
 
+    /// Current playfield canvas aspect (w/h).
+    pub fn playfield_aspect(&self) -> f32 {
+        self.playfield_aspect
+    }
+
     /// Update the top progress bar (0..1).
     pub fn set_progress(&mut self, progress: f32) {
         self.progress = progress.clamp(0.0, 1.0);
@@ -739,15 +744,17 @@ impl Renderer {
         // per-axis factors separately (ev_x/ev_y fill the box at every aspect,
         // and the y stretch overflows the box at wide aspects): see below.
         let letterbox = mat_scale(kx / CANVAS_W, ky * aspect / CANVAS_W);
-        // Event-position factors: stretch to FILL the playfield box at every
-        // aspect — canvas half-width 675 lands on world ±kx, half-height 450
-        // on ±ky (the box edge), with the distortion absorbed by the mapping.
-        // Sprites (sizes) are NOT affected — they keep the uniform letterbox
-        // scale below, so notes never stretch, only their positions do.
-        // 3:2 → (1.185, 1.0), 16:9 → (1.0, 0.844), 4:3 → (1.333, 1.125),
-        // 1:1 → (1.778, 1.5).
-        let ev_x = 1.0 / kx;
-        let ev_y = 1.5 / (ky * aspect);
+        // Event-position factors: depend ONLY on the playfield aspect P (the
+        // Tab-switchable design ratio), NEVER on the window — the window only
+        // letterboxes (kx/ky) the playfield box uniformly, so note/event
+        // positions keep their shape at any window size.
+        //   ev_x = 1.0:   the letterbox x (kx/675) already fills the box width
+        //   ev_y = 1.5/P: canvas half-height 450 lands on the box edge ±ky
+        //                 (450 × 1.5/P × ky·P/675 = ky)
+        // 3:2 → (1.0, 1.0), 16:9 → (1.0, 0.844), 4:3 → (1.0, 1.125),
+        // 1:1 → (1.0, 1.5). Sprites keep the uniform letterbox scale.
+        let ev_x = 1.0;
+        let ev_y = 1.5 / aspect;
 
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame
