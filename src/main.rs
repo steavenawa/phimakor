@@ -287,9 +287,15 @@ impl State {
             }
         } else { audio_time };
 
+        // Frame-render prediction (notes hit the line when the frame is seen)
+        // minus the audio device output latency (rodio's get_pos counts samples
+        // handed to the device callback, which are heard ~latency ms later).
         let predict = self.frame_latency.min(0.05);
+        let device_latency = std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
+            .ok().and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(15.0) / 1000.0;
         let off = (self.chart.offset() + self.info.offset) as f64;
-        let chart_time = (audio_time + predict - off).max(0.0);
+        let chart_time = (audio_time + predict - device_latency - off).max(0.0);
         self.chart_time_last = chart_time;
         let duration = self.chart.duration();
         let chart_beat = self.chart.time_to_beat(chart_time);

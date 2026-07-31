@@ -94,12 +94,16 @@ impl AudioClock {
     }
 
     /// Seconds into the track, accounting for pauses and seeks.
+    /// While playing, reports the rodio backend's sample position
+    /// (`Player::get_pos`, refreshed every ~5ms from the audio thread) instead
+    /// of wall-clock time — the wall clock drifts from the actual playback
+    /// rate and starts ahead of the audible output (device buffer latency).
     pub fn time(&self) -> f64 {
-        let mut t = self.pos.get();
         if self.playing.get() {
-            t += self.anchor.get().elapsed().as_secs_f64();
+            self.player.get_pos().as_secs_f64()
+        } else {
+            self.pos.get()
         }
-        t
     }
 
     /// Pause or resume playback. No-op if already in the requested state.
