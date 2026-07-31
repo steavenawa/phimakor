@@ -998,27 +998,85 @@ impl Renderer {
         }
         }
 
+        // attachUI labels: show where the game UI elements (score/combo/pause/
+        // name/level) sit, following each line's transform. "bar" is drawn as
+        // the bound progress bar above instead. Field borrows only — `cmds`
+        // still borrows self.background/self.white/self.textures.
+        for line in frame.lines.iter() {
+            let Some(ui) = line.attach_ui.as_deref() else { continue };
+            if ui == "bar" || line.pe_hide || line.alpha <= 0.0 { continue; }
+            let pos = [line.position[0] * CANVAS_W, line.position[1] * CANVAS_H];
+            let a = line.alpha * line.ctrl_alpha;
+            text::draw_text_world(
+                &mut self.text,
+                &self.device,
+                &self.queue,
+                &self.tex_bgl,
+                &self.sampler,
+                aspect,
+                &ui.to_uppercase(),
+                pos,
+                line.rotation,
+                [1.0, 1.0, 1.0, a],
+            );
+        }
+
         // Hit effects: sprite-sheet bursts in canvas-pixel space, after notes.
-        // Top progress bar (Phigros-style): thin white strip hugging the
-        // visible canvas top edge, grows left → right with `progress`.
+        // Progress bar: bound to the attachUI "bar" line when present (phira
+        // UIElement::Bar follows the line transform); falls back to the visible
+        // canvas top edge otherwise.
         if self.progress > 0.0 {
-            let top = CANVAS_W / aspect; // visible canvas y at the top (+y = up)
             let bar_h = 5.0;
+            let top = CANVAS_W / aspect; // visible canvas y at the top (+y = up)
             let bar_w = 1350.0 * self.progress;
-            cmds.push(DrawCmd {
-                uniform: DrawUniform {
-                    model: mat_mul(
+            if let Some(bl) = frame.lines.iter().find(|l| l.attach_ui.as_deref() == Some("bar")) {
+                if !bl.pe_hide && bl.alpha > 0.0 {
+                    let bl_alpha = bl.alpha * bl.ctrl_alpha;
+                    // Bar rect lives in viewport space (anchored at the visible
+                    // canvas top-left, like phira's UIElement::Bar Rect(-1, top, ...));
+                    // the attachUI line's transform then moves/rotates/scales it.
+                    let bar_local = mat_mul(
+                        &mat_translate(-CANVAS_W + bar_w * 0.5, top - bar_h * 0.5),
+                        &mat_scale(bar_w, bar_h),
+                    );
+                    let bar_m = mat_mul(
                         &letterbox,
                         &mat_mul(
-                            &mat_translate(-CANVAS_W + bar_w * 0.5, top - bar_h * 0.5),
-                            &mat_scale(bar_w, bar_h),
+                            &mat_mul(
+                                &mat_translate(bl.position[0] * CANVAS_W, bl.position[1] * CANVAS_H),
+                                &mat_rotate(bl.rotation),
+                            ),
+                            &mat_mul(
+                                &mat_scale(bl.scale[0] * bl.ctrl_size_x, bl.scale[1] * bl.ctrl_size_y),
+                                &bar_local,
+                            ),
                         ),
-                    ),
-                    color: [1.0, 1.0, 1.0, 0.9],
-                    uv_rect: [0., 0., 1., 1.],
-                },
-                tex: &self.white,
-            });
+                    );
+                    cmds.push(DrawCmd {
+                        uniform: DrawUniform {
+                            model: bar_m,
+                            color: [1.0, 1.0, 1.0, 0.9 * bl_alpha],
+                            uv_rect: [0., 0., 1., 1.],
+                        },
+                        tex: &self.white,
+                    });
+                }
+            } else {
+                cmds.push(DrawCmd {
+                    uniform: DrawUniform {
+                        model: mat_mul(
+                            &letterbox,
+                            &mat_mul(
+                                &mat_translate(-CANVAS_W + bar_w * 0.5, top - bar_h * 0.5),
+                                &mat_scale(bar_w, bar_h),
+                            ),
+                        ),
+                        color: [1.0, 1.0, 1.0, 0.9],
+                        uv_rect: [0., 0., 1., 1.],
+                    },
+                    tex: &self.white,
+                });
+            }
         }
 
         // Field-split call: `cmds` already borrows `self.textures`/`self.white`.

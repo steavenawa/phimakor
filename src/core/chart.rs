@@ -429,9 +429,13 @@ fn parse_notes(r: &mut BpmList, rpe: Vec<RPENote>, height: &mut AnimFloat) -> Re
             4 => (4, 0., 0.),
             other => anyhow::bail!("unknown-note-type: type {other}"),
         };
-        // [visible_time] RPE stores visibleTime in milliseconds; convert to seconds.
-        let vt_sec = note.visible_time / 1000.0;
-        let alpha = if vt_sec >= time {
+        // [visible_time] RPE documents visibleTime in ms, but real charts use
+        // sub-second values (e.g. Sanctuary 0.59) that phira treats as seconds
+        // (`note.visible_time >= time` with time in seconds). Match phira:
+        // note is invisible until `time - visible_time`, then appears at full
+        // alpha (TweenId 0 = step; matches phira's keyframe layout).
+        let vt = note.visible_time;
+        let alpha = if vt >= time {
             if note.alpha >= 255 {
                 AnimFloat::default()
             } else {
@@ -439,7 +443,7 @@ fn parse_notes(r: &mut BpmList, rpe: Vec<RPENote>, height: &mut AnimFloat) -> Re
             }
         } else {
             let alpha = note.alpha.min(255) as f32 / 255.;
-            AnimFloat::new(vec![Keyframe::new(time - vt_sec, 0.0, 0), Keyframe::new(time, alpha, 0)])
+            AnimFloat::new(vec![Keyframe::new(0.0, 0.0, 0), Keyframe::new(time - vt, alpha, 0)])
         };
         notes.push(NoteData {
             kind,
@@ -1212,6 +1216,17 @@ mod tests {
                 line.alpha, line.pe_hide
             );
         }
+    }
+
+    #[test]
+    fn sanctuary_notes_visible_before_hit() {
+        let dir = r"D:\phimakor\example_chart\Sanctuary";
+        let (_info, mut chart) = Chart::load(std::path::Path::new(dir)).unwrap();
+        let hit = beat_to_time(&mut chart, 279.0);
+        let t = (hit - 0.3).max(0.0);
+        let state = chart.state_at(t);
+        let line = &state.lines[0];
+        assert!(line.notes.iter().any(|n| n.alpha > 0.5), "note should be visible 0.3s before hit");
     }
 
     const MINIMAL: &str = r#"{

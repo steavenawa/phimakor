@@ -131,7 +131,7 @@ impl ChartSession {
         }));
         // Trigger hit FX for notes that fired since the last state_at call
         for fired in &frame.fired {
-            if fired.hold_tail { continue; }
+            if fired.hold_tail || fired.fake { continue; }
             if let Some(line) = frame.lines.get(fired.line) {
                 let t = line.rotation;
                 let x = fired.x as f32;

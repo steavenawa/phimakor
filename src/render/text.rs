@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use super::{mat_mul, mat_scale, mat_translate, DrawCmd, DrawUniform, Mat3, Renderer};
+use super::{mat_mul, mat_rotate, mat_scale, mat_translate, DrawCmd, DrawUniform, Mat3, Renderer};
 
 /// Anchor presets for [`Renderer::draw_text`]; heights are rasterization px.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -26,6 +26,9 @@ pub enum TextAnchor {
     BottomRightEdge,
     /// Combo caption directly below the TopCenter number, centered, 26 px.
     ComboLabel,
+    /// Free-positioned world text (attachUI labels): 28 px, centered at the
+    /// quad position, rotated with the line.
+    World,
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +56,7 @@ impl TextAnchor {
             Self::BottomRightEdge => (30.0, HAlign::Right(655.0), bottom),
             // Directly below TopCenter on screen (+y = up): 6 px gap, 26 px.
             Self::ComboLabel => (26.0, HAlign::Center, top - 2.0 - 56.0 - 6.0 - 26.0),
+            Self::World => (28.0, HAlign::Center, 0.0),
         }
     }
 
@@ -71,6 +75,8 @@ pub(crate) struct PendingText {
     key: (String, u8),
     /// Quad center, canvas px (unused for viewport-edge anchors).
     pos: [f32; 2],
+    /// Rotation in radians around the quad center (world text only).
+    rotation: f32,
     color: [f32; 4],
     /// Draw in window-px NDC space, hugging the viewport bottom.
     viewport_edge: bool,
@@ -210,7 +216,13 @@ impl Renderer {
             HAlign::Right(r) => r - entry.size[0] * 0.5,
         };
         let pos = [cx, top + entry.size[1] * 0.5];
-        self.text.pending.push(PendingText { key, pos, color, viewport_edge: anchor.is_viewport_edge(), anchor });
+        self.text.pending.push(PendingText { key, pos, rotation: 0.0, color, viewport_edge: anchor.is_viewport_edge(), anchor });
+    }
+
+    /// Queue free-positioned text (attachUI labels): centered at `pos`
+    /// (canvas px), rotated by `rotation` (radians) around its center.
+    pub fn draw_text_world(&mut self, text: &str, pos: [f32; 2], rotation: f32, color: [f32; 4]) {
+        draw_text_world(&mut self.text, &self.device, &self.queue, &self.tex_bgl, &self.sampler, self.playfield_aspect, text, pos, rotation, color);
     }
 
     /// Use a custom font (e.g. res-pack Exo2) for all future rasterizations;
@@ -225,6 +237,40 @@ impl Renderer {
             None => false,
         }
     }
+}
+
+/// Free-positioned text (attachUI labels): centered at `pos` (canvas px),
+/// rotated by `rotation` (radians) around its center. Field-borrow friendly
+/// (takes `&mut TextState` + the renderer's immutable handles separately) so
+/// it can be called while `cmds` holds other renderer borrows.
+pub(crate) fn draw_text_world(
+    text_state: &mut TextState,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex_bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    aspect: f32,
+    text: &str,
+    pos: [f32; 2],
+    rotation: f32,
+    color: [f32; 4],
+) {
+    let anchor = TextAnchor::World;
+    let key = (text.to_string(), anchor as u8);
+    if !text_state.cache.contains_key(&key) {
+        if text_state.font.is_none() {
+            text_state.font = Some(load_font());
+        }
+        let Some(font) = text_state.font.as_ref().and_then(|f| f.as_ref()) else {
+            return;
+        };
+        let (px, _, _) = anchor.layout(aspect);
+        let Some((bind_group, size)) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px) else {
+            return;
+        };
+        text_state.cache.insert(key.clone(), CachedText { bind_group, size });
+    }
+    text_state.pending.push(PendingText { key, pos, rotation, color, viewport_edge: false, anchor });
 }
 
 /// Flush the pending text queue into `cmds` (called from `render`, after hit
@@ -249,6 +295,17 @@ pub(crate) fn push_text<'a>(
                 };
                 let cy = -1.0 + (MARGIN + entry.size[1] * 0.5) * 2.0 / window[1];
                 mat_mul(&mat_translate(cx, cy), &mat_scale(sx, sy))
+            } else if pt.anchor == TextAnchor::World {
+                mat_mul(
+                    letterbox,
+                    &mat_mul(
+                        &mat_translate(pt.pos[0], pt.pos[1]),
+                        &mat_mul(
+                            &mat_rotate(pt.rotation),
+                            &mat_scale(entry.size[0], entry.size[1]),
+                        ),
+                    ),
+                )
             } else {
                 mat_mul(
                     letterbox,
