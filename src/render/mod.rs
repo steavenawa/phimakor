@@ -701,20 +701,16 @@ impl Renderer {
     ) {
         let _s = crate::trace_span!("draw_to_view");
         // ── Coordinate model ──────────────────────────────────────────────
-        // RPE's design canvas is 1350×900 px (3:2). The renderer's "world"
-        // uses a unit square ±1.0 in x. RPE canvas x 675 → world x 1.0.
-        // Canvas y is also mapped to world ±1 (so world is SQUARE, not 3:2).
+        // The RPE canvas is 1350×900 px (x ±675, y ±450). The playfield fills
+        // the window at ANY playfield aspect (Tab cycles 3:2 → 16:9 → 4:3 →
+        // 1:1): the RPE canvas stretches to fill the playfield box, so y=1
+        // (450 px) is always at the visible top. Canvas px → world:
         //
-        //   world_x = canvas_x / 675        [canvas -675..+675 → world -1..+1]
-        //   world_y = canvas_y / 675        [canvas -675..+675 → world -1..+1]
+        //   world_x = canvas_x / 675
+        //   world_y = canvas_y / 450
         //
-        // A 16:9 window shows ±1 horizontally but only ±(9/16) vertically = ±0.5625
-        // of world space. The letterbox matrix below maps the square world into
-        // the window's aspect ratio while preserving uniform pixel scale in both
-        // axes — rotated quads never shear, sprite textures never distort.
-        //
-        // Internal (playfield) aspect defaults to 3:2 but can be switched at
-        // runtime (Tab key cycles 3:2 → 16:9 → 4:3 → 1:1).
+        // kx/ky then letterbox the playfield into the window, preserving the
+        // playfield's aspect ratio (no shear, uniform pixel scale per axis).
         // ──────────────────────────────────────────────────────────────────
         let aspect = self.playfield_aspect;
         let (kx, ky) = if window_aspect >= aspect {
@@ -722,9 +718,12 @@ impl Renderer {
         } else {
             (1.0, window_aspect / aspect)
         };
-        // Square canvas px on screen: canvas x ±675 spans the playfield width;
-        // visible canvas height = 1350/aspect px (y range ±675/aspect).
-        let letterbox = mat_scale(kx / CANVAS_W, ky * aspect / CANVAS_W);
+        // The RPE canvas (1350×900, y ∈ ±450) always maps to the playfield's
+        // full height — y=1 sits at the visible top at ANY playfield aspect
+        // (the canvas stretches to fill; matches Phigros). The letterbox maps
+        // canvas px to world: /675 on x, /450 on y, then kx/ky letterbox the
+        // playfield into the window preserving its aspect.
+        let letterbox = mat_scale(kx / CANVAS_W, ky / CANVAS_H);
 
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame
@@ -746,7 +745,9 @@ impl Renderer {
                 let h = r / aspect;
                 [0.0, (1.0 + h) * 0.5, 1.0, -h]
             };
-            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 1350.0 / aspect));
+            // Cover the full RPE canvas (1350×900): it stretches to the
+            // playfield box at any aspect.
+            let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 900.0));
             cmds.push(DrawCmd {
                 uniform: DrawUniform { model: bg_m, color: [d, d, d, 1.0], uv_rect: uv },
                 tex: bg,
@@ -1027,7 +1028,7 @@ impl Renderer {
         // canvas top edge otherwise.
         if self.progress > 0.0 {
             let bar_h = 5.0;
-            let top = CANVAS_W / aspect; // visible canvas y at the top (+y = up)
+            let top = CANVAS_H; // visible canvas y at the top (+y = up)
             let bar_w = 1350.0 * self.progress;
             if let Some(bl) = frame.lines.iter().find(|l| l.attach_ui.as_deref() == Some("bar")) {
                 if !bl.pe_hide && bl.alpha > 0.0 {

@@ -44,8 +44,11 @@ impl TextAnchor {
     /// "Top" anchors use +y and the "Bottom" anchors -y. The visible canvas
     /// y-range is ±(675/aspect), so anchors follow the playfield aspect.
     fn layout(self, aspect: f32) -> (f32, HAlign, f32) {
-        let top = 675.0 / aspect; // visible canvas y at the playfield top
-        let bottom = -675.0 / aspect;
+        // The RPE canvas (1350×900) fills the playfield height at ANY aspect
+        // (y = ±450 = ±CANVAS_H); the aspect parameter is kept for signature
+        // compatibility but no longer scales the anchors.
+        let top = 450.0; // visible canvas y at the playfield top
+        let bottom = -450.0;
         match self {
             Self::TopLeft => (36.0, HAlign::Left(-655.0), top - 8.0 - 36.0),
             Self::TopCenter => (56.0, HAlign::Center, top - 8.0 - 56.0),
