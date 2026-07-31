@@ -554,7 +554,13 @@ impl IcedOverlay {
         self.show_overlay = info.show_overlay;
         self.tl_visible = info.show_events || info.show_notes;
         self.gui_scale = info.gui_scale;
-        let prev_progress = (self.panel_progress, self.events_progress, self.notes_progress);
+        let prev_anim = (
+            self.panel_progress,
+            self.events_progress,
+            self.notes_progress,
+            self.ctx_progress,
+            self.tool_hover_progress,
+        );
         self.panel_progress = self.approach(self.panel_progress, if info.show_properties { 1.0 } else { 0.0 });
         self.events_progress = self.approach(self.events_progress, if info.show_events { 1.0 } else { 0.0 });
         self.notes_progress = self.approach(self.notes_progress, if info.show_notes { 1.0 } else { 0.0 });
@@ -562,9 +568,18 @@ impl IcedOverlay {
         // During playback the timeline scrolls and the seek bar advances every
         // frame — the base pixmap is stale. Fall back to a full redraw then;
         // the fast path (base copy + playhead) is only valid while static.
+        // Also include the tool-hover / context-menu animations: their values
+        // keep moving while the panels don't, and the fast path would freeze
+        // the hover/menu at its last-synced state (stuck highlight residue).
         let playing = (info.chart_beat - self.last_drawn_beat).abs() > 1e-4;
-        let panels_moving = prev_progress != (self.panel_progress, self.events_progress, self.notes_progress);
-        if playing || panels_moving {
+        let anim_moving = prev_anim != (
+            self.panel_progress,
+            self.events_progress,
+            self.notes_progress,
+            self.ctx_progress,
+            self.tool_hover_progress,
+        );
+        if playing || anim_moving {
             self.upload_timeline_to(queue, info);
             self.last_drawn_beat = info.chart_beat;
             return;
@@ -648,6 +663,11 @@ impl IcedOverlay {
 
     fn upload_timeline_to(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let _s = trace_span!("upload_timeline");
+        // MUST clear first: this runs both from redraw_iced (pre-cleared) and
+        // directly from redraw_timeline's playing/animation path — without the
+        // fill, the previous frame's playhead lines/notes/seek fill would
+        // remain and ghost under the new content.
+        self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
         self.animate_all();
         self.notes_cache = info.notes.clone();
         let s = self.gui_scale;
