@@ -21,8 +21,6 @@ use winit::window::{Window, WindowAttributes, WindowId};
 struct App {
     dir: Option<PathBuf>,
     state: Option<State>,
-    charts: Vec<(String, PathBuf)>,
-    splash_hover: Option<usize>,
 }
 
 // ── Core state ──
@@ -77,7 +75,16 @@ struct State {
 
     // ── Layout / panels ──
     layout: LayoutDef,
-    splash_names: Vec<String>,
+    splash_mode: bool,
+    splash_charts: Vec<ui::ChartEntry>,
+    splash_search: String,
+    splash_sel: Option<usize>,
+    splash_sort: u8,
+    splash_scroll: f32,
+    splash_lib_path: String,
+    splash_hover: ui::SplashHover,
+    show_settings: bool,
+    settings: ui::SettingsData,
 
     // ── Post-processing effects ──
     extra: Option<core::extra::ExtraRoot>,
@@ -88,11 +95,19 @@ impl State {
 }
 
 impl App {
-    fn create_splash_state(&self, event_loop: &ActiveEventLoop, names: Vec<String>) -> Option<State> {
+    fn create_splash_state(&self, event_loop: &ActiveEventLoop, charts: Vec<ui::ChartEntry>) -> Option<State> {
+        // Load persisted settings so the splash respects (and doesn't
+        // clobber) the saved config: scale applies to the splash itself,
+        // fullscreen/vsync apply to the splash window too.
+        let settings = load_settings();
         let window = Arc::new(event_loop.create_window(
             WindowAttributes::default().with_title("phimakor").with_inner_size(LogicalSize::new(800.0, 600.0)),
         ).ok()?);
-        let renderer = pollster::block_on(render::Renderer::new(window.clone())).ok()?;
+        if settings.fullscreen {
+            window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
+        let mut renderer = pollster::block_on(render::Renderer::new(window.clone())).ok()?;
+        renderer.set_vsync(settings.vsync);
         let overlay = ui::IcedOverlay::new(renderer.device(), renderer.tex_bgl(), renderer.sampler(), 800, 600);
         let tmp = std::env::temp_dir().join("phimakor-splash");
         let _ = std::fs::create_dir_all(&tmp);
@@ -112,9 +127,12 @@ impl App {
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
             selected_line: 0, selected_event_idx: None, scroll_target: None,
             pending_seek: None, chart_time_last: 0.0, focused: true, ctrl: false,
-            gui_scale: 1.0, snap: 0.25, selected_layer: 0, event_edit_target: 0,
+            gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0, event_edit_target: 0,
             vertical_split: 14, layout: LayoutDef { panels: vec![] },
-            ui_dirty: true, show_menu: false, splash_names: names,
+            ui_dirty: true, show_menu: false, splash_mode: true, splash_charts: charts,
+            splash_search: String::new(), splash_sel: None, splash_sort: 0, splash_scroll: 0.0,
+            splash_lib_path: charts_dir().display().to_string(),
+            splash_hover: ui::SplashHover::None, show_settings: false, settings,
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()),
             extra: None,
         })
@@ -125,10 +143,19 @@ impl App {
             WindowAttributes::default().with_title("phimakor").with_inner_size(LogicalSize::new(1200.0, 800.0)),
         )?);
         let mut renderer = pollster::block_on(render::Renderer::new(window.clone()))?;
+        // Apply persisted settings (vsync, fullscreen) to the fresh window.
+        let settings = load_settings();
+        renderer.set_vsync(settings.vsync);
+        if settings.fullscreen {
+            window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            // Borderless fullscreen can hide the OS cursor — force it back.
+            window.set_cursor_visible(true);
+        }
         let res_dir = PathBuf::from("res");
 
         let doc = ChartDocument::open(dir)?;
         let info = doc.info().clone();
+        renderer.set_line_length(info.line_length);
         let chart = core::chart::Chart::from_rpe_chart(doc.chart(), info.use_rpe_170_speed == Some(true))?;
         renderer.post.chart_dir = Some(dir.clone());
 
@@ -183,8 +210,11 @@ impl App {
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
             selected_line: 0, selected_event_idx: None, event_edit_target: 0,
             scroll_target: None, pending_seek: None, chart_time_last: 0.0,
-            focused: true, ctrl: false, gui_scale: 1.0, snap: 0.25, selected_layer: 0,
-            vertical_split: 14, layout, ui_dirty: true, show_menu: false, splash_names: vec![],
+            focused: true, ctrl: false, gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0,
+            vertical_split: 14, layout, ui_dirty: true, show_menu: false, splash_mode: false,
+            splash_charts: vec![], splash_search: String::new(), splash_sel: None, splash_sort: 0, splash_scroll: 0.0,
+            splash_lib_path: String::new(), splash_hover: ui::SplashHover::None,
+            show_settings: false, settings,
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()), extra,
         })
     }
@@ -192,6 +222,19 @@ impl App {
     fn rebuild_chart(&mut self) {
         if let Some(state) = &mut self.state {
             state.rebuild_chart();
+        }
+    }
+
+    /// Leave the editor and return to the splash screen: stop the audio
+    /// thread, rescan the library, and swap in a fresh splash state.
+    fn back_to_splash(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(s) = &self.state {
+            if let Some(a) = &s.audio { a.quit(); }
+        }
+        let charts = scan_charts();
+        self.state = None;
+        if let Some(s) = self.create_splash_state(event_loop, charts) {
+            self.state = Some(s);
         }
     }
 }
@@ -241,7 +284,13 @@ impl State {
 
     fn render_frame(&mut self) {
         let _span = trace_span!("render_frame");
-        if !self.focused { return; }
+        // Frame lock: the original code skipped rendering while the window
+        // lost focus (saves GPU/CPU). That is not good for editing — the
+        // view freezes and you can't watch the chart while alt-tabbed or
+        // docked. The lock is disabled for now; WIP: add a proper frame
+        // lock (and a setting to toggle it) here.
+        // if !self.focused { return; }
+        
         // Process note drag (before splash/chart frame to avoid chart borrow conflict)
         if let Some((ni, beat, nx)) = self.overlay.drag_updated.take() {
             if let Ok(old) = self.doc.remove_note(self.selected_line, ni) {
@@ -255,8 +304,20 @@ impl State {
             }
         }
         // Splash mode
-        if !self.splash_names.is_empty() {
-            self.overlay.render_splash(self.renderer.queue(), &self.splash_names, Some(0));
+        if self.splash_mode {
+            let settings_view = if self.show_settings { Some(&self.settings) } else { None };
+            let filtered = ui::filter_charts(&self.splash_charts, &self.splash_search, self.splash_sort);
+            let data = ui::SplashData {
+                charts: &self.splash_charts,
+                filtered: &filtered,
+                filter: &self.splash_search,
+                hover: self.splash_hover,
+                sel: self.splash_sel,
+                sort: self.splash_sort,
+                lib_path: &self.splash_lib_path,
+                scroll: self.splash_scroll,
+            };
+            self.overlay.render_splash(self.renderer.queue(), &data, self.gui_scale, settings_view);
             let ui_bg = Some(self.overlay.bind_group());
             match self.renderer.surface_acquire() {
                 Ok(st) => {
@@ -539,38 +600,123 @@ impl ApplicationHandler for App {
                 Err(e) => { eprintln!("{e:#}"); event_loop.exit(); }
             }
         } else {
-            let names: Vec<String> = self.charts.iter().map(|(n,_)| n.clone()).collect();
-            if !names.is_empty() {
-                if let Some(s) = self.create_splash_state(event_loop, names) {
-                    self.state = Some(s);
-                } else {
-                    eprintln!("splash init failed, use CLI: phimakor <chart-dir>");
-                    event_loop.exit();
-                }
+            let charts = scan_charts();
+            // Empty chart list: still show the splash (with a hint), so the
+            // user can open a settings page / drop charts instead of the app
+            // quitting with a console-only error.
+            if let Some(s) = self.create_splash_state(event_loop, charts) {
+                self.state = Some(s);
             } else {
-                eprintln!("no charts found in current directory");
+                eprintln!("splash init failed, use CLI: phimakor <chart-dir>");
                 event_loop.exit();
             }
         }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // Handle splash screen chart selection (before state guard)
-        if self.dir.is_none() {
+        // Splash-mode interactions (before the state guard). Gated on the
+        // splash *mode flag*, not the CLI `dir` arg — `dir` stays `None`
+        // after a chart was opened from the splash, so `dir.is_none()` would
+        // leave the splash click layer active over the editor.
+        let splash = self.state.as_ref().is_some_and(|s| s.splash_mode);
+        if splash {
+            // Drag & drop a chart folder, its info.json, or a chart .zip to
+            // import + open.
+            if let WindowEvent::DroppedFile(path) = &event {
+                let path = path.clone();
+                let lower = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                let open_path = if lower == "zip" {
+                    // Probe the archive for chart content, then extract.
+                    match import_chart_zip(&path) {
+                        Ok(dir) => {
+                            if let Some(st) = &mut self.state { st.splash_charts = scan_charts(); }
+                            dir
+                        }
+                        Err(e) => {
+                            eprintln!("drop: not a valid chart zip: {e:#}");
+                            return;
+                        }
+                    }
+                } else if is_chart_dir(&path) {
+                    // Folder: copy into the library (unless already inside),
+                    // then open the library copy so the list picks it up.
+                    let mut open_path = path.clone();
+                    if let Some(name) = path.file_name().map(|n| n.to_string_lossy().to_string()) {
+                        let lib = charts_dir();
+                        let dest = lib.join(&name);
+                        let _ = std::fs::create_dir_all(&lib);
+                        if dest != path && !dest.exists() {
+                            if copy_dir_recursive(&path, &dest).is_ok() {
+                                open_path = dest;
+                            } else {
+                                eprintln!("drop: failed to copy {path:?} into {dest:?}");
+                            }
+                        }
+                        if let Some(st) = &mut self.state { st.splash_charts = scan_charts(); }
+                    }
+                    open_path
+                } else if path.is_file() && (path.file_name().is_some_and(|n| n == "info.json" || n == "info.txt")) {
+                    // info.json itself → its parent is the chart dir.
+                    path.parent().map(|p| p.to_path_buf()).unwrap_or(path)
+                } else {
+                    eprintln!("drop: not a chart folder or zip: {path:?}");
+                    return;
+                };
+                // Open the (imported) chart.
+                self.state = None;
+                match self.create_state(event_loop, &open_path) {
+                    Ok(st) => self.state = Some(st),
+                    Err(e) => { eprintln!("failed to load {open_path:?}: {e:#}"); }
+                }
+                return;
+            }
             if let WindowEvent::MouseInput { state: btn_state, button: winit::event::MouseButton::Left, .. } = &event {
                 if *btn_state == ElementState::Released {
-                    let path = {
-                        let st = self.state.as_ref().unwrap();
-                        let (mx, my) = match st.overlay.mouse_pos { Some(p) => p, _ => return };
-                        let gs = st.overlay.gui_scale;
-                        if !(my > 70.0 * gs && my < st.window.inner_size().height as f32 - 60.0 * gs) { return; }
-                        let idx = ((my - 70.0 * gs) / (28.0 * gs + 4.0 * gs)) as usize;
-                        match self.charts.get(idx) { Some((_, p)) => p.clone(), _ => return }
-                    };
-                    self.state = None;
-                    match self.create_state(event_loop, &path) {
-                        Ok(st) => self.state = Some(st),
-                        Err(e) => { eprintln!("failed to load {path:?}: {e:#}"); }
+                    let st = self.state.as_mut().unwrap();
+                    let (mx, my) = match st.overlay.mouse_pos { Some(p) => p, _ => return };
+                    let gs = st.overlay.gui_scale;
+                    let vw = st.window.inner_size().width as f32;
+                    let vh = st.window.inner_size().height as f32;
+                    let filtered_len = ui::filter_charts(&st.splash_charts, &st.splash_search, st.splash_sort).len();
+                    let hover = ui::splash_hit_test(mx, my, vw, vh, gs, filtered_len, st.show_settings, st.splash_scroll);
+                    match hover {
+                        ui::SplashHover::Settings => { st.show_settings = true; }
+                        ui::SplashHover::Back => { st.show_settings = false; }
+                        ui::SplashHover::Vsync => { st.settings.vsync = !st.settings.vsync; st.renderer.set_vsync(st.settings.vsync); save_settings(&st.settings); }
+                        ui::SplashHover::Fullscreen => {
+                            st.settings.fullscreen = !st.settings.fullscreen;
+                            st.window.set_fullscreen(if st.settings.fullscreen { Some(winit::window::Fullscreen::Borderless(None)) } else { None });
+                            // Borderless fullscreen can hide the OS cursor — force it back.
+                            st.window.set_cursor_visible(true);
+                            save_settings(&st.settings);
+                        }
+                        ui::SplashHover::ScaleMinus => { st.settings.gui_scale = (st.settings.gui_scale - 0.1).max(0.5); st.gui_scale = st.settings.gui_scale; save_settings(&st.settings); }
+                        ui::SplashHover::ScalePlus => { st.settings.gui_scale = (st.settings.gui_scale + 0.1).min(2.0); st.gui_scale = st.settings.gui_scale; save_settings(&st.settings); }
+                        ui::SplashHover::Refresh => { st.splash_charts = scan_charts(); st.splash_sel = None; st.splash_scroll = 0.0; }
+                        ui::SplashHover::Sort => { st.splash_sort = (st.splash_sort + 1) % 2; }
+                        ui::SplashHover::OpenFolder => { open_in_explorer(&charts_dir()); }
+                        ui::SplashHover::Chart(fi) => {
+                            let ci = ui::filter_charts(&st.splash_charts, &st.splash_search, st.splash_sort).get(fi).copied();
+                            let Some(ci) = ci else { return };
+                            let path = st.splash_charts[ci].path.clone();
+                            drop(st);
+                            self.state = None;
+                            match self.create_state(event_loop, &path) {
+                                Ok(new_st) => self.state = Some(new_st),
+                                Err(e) => { eprintln!("failed to load {path:?}: {e:#}"); }
+                            }
+                            return;
+                        }
+                        ui::SplashHover::Delete(fi) => {
+                            let ci = ui::filter_charts(&st.splash_charts, &st.splash_search, st.splash_sort).get(fi).copied();
+                            let Some(ci) = ci else { return };
+                            let path = st.splash_charts[ci].path.clone();
+                            let _ = std::fs::remove_dir_all(&path);
+                            st.splash_charts = scan_charts();
+                            st.splash_sel = None;
+                            st.splash_scroll = 0.0;
+                        }
+                        _ => {}
                     }
                     return;
                 }
@@ -586,6 +732,23 @@ impl ApplicationHandler for App {
                 state.render_frame();
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // Splash mode: wheel scrolls the chart list.
+                if state.splash_mode {
+                    let dy = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y * 40.0 * state.overlay.gui_scale,
+                        MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                    };
+                    if dy != 0.0 {
+                        let gs = state.overlay.gui_scale;
+                        let n = ui::filter_charts(&state.splash_charts, &state.splash_search, state.splash_sort).len();
+                        let row_step = 40.0 * gs;
+                        let vh = state.window.inner_size().height as f32;
+                        let view_h = (vh - 96.0 * gs - 96.0 * gs).max(1.0);
+                        let max_scroll = (n as f32 * row_step - view_h).max(0.0);
+                        state.splash_scroll = (state.splash_scroll + dy).clamp(0.0, max_scroll);
+                    }
+                    return;
+                }
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x, y),
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32 * 0.1, p.y as f32 * 0.1),
@@ -616,6 +779,93 @@ impl ApplicationHandler for App {
                 match event.state {
                     ElementState::Pressed if !event.repeat => {
                         if code == KeyCode::ControlLeft || code == KeyCode::ControlRight { state.ctrl = true; }
+                        // Splash mode: search box + keyboard chart navigation.
+                        if state.splash_mode {
+                            if state.show_settings {
+                                if code == KeyCode::Escape { state.show_settings = false; }
+                                return;
+                            }
+                            let mut open_path: Option<PathBuf> = None;
+                            if state.ctrl && code == KeyCode::KeyQ {
+                                event_loop.exit();
+                                return;
+                            }
+                            let filtered = ui::filter_charts(&state.splash_charts, &state.splash_search, state.splash_sort);
+                            let n = filtered.len();
+                            // Keep the selection (and thus the scroll) inside
+                            // the visible list window after nav/filter edits.
+                            let keep_visible = |st: &mut State, n: usize| {
+                                let gs = st.overlay.gui_scale;
+                                let row_step = 40.0 * gs;
+                                let vh = st.window.inner_size().height as f32;
+                                let view_h = (vh - 96.0 * gs - 96.0 * gs).max(1.0);
+                                let max_scroll = (n as f32 * row_step - view_h).max(0.0);
+                                if let Some(i) = st.splash_sel {
+                                    let top = i as f32 * row_step;
+                                    if top < st.splash_scroll { st.splash_scroll = top; }
+                                    if top + row_step > st.splash_scroll + view_h {
+                                        st.splash_scroll = (top + row_step - view_h).max(0.0);
+                                    }
+                                }
+                                st.splash_scroll = st.splash_scroll.clamp(0.0, max_scroll);
+                            };
+                            match code {
+                                KeyCode::Enter => {
+                                    open_path = state.splash_sel.and_then(|i| filtered.get(i).copied())
+                                        .and_then(|ci| state.splash_charts.get(ci))
+                                        .map(|c| c.path.clone());
+                                }
+                                KeyCode::Escape => {
+                                    if state.splash_search.is_empty() { state.splash_sel = None; }
+                                    else { state.splash_search.clear(); state.splash_sel = None; state.splash_scroll = 0.0; }
+                                }
+                                KeyCode::Backspace => {
+                                    if !state.splash_search.is_empty() { state.splash_search.pop(); state.splash_sel = None; state.splash_scroll = 0.0; }
+                                }
+                                KeyCode::ArrowUp => {
+                                    state.splash_sel = Some(state.splash_sel.map_or(0, |i| i.saturating_sub(1)));
+                                    keep_visible(state, n);
+                                }
+                                KeyCode::ArrowDown => {
+                                    state.splash_sel = Some(n.saturating_sub(1).min(state.splash_sel.map_or(0, |i| i + 1)));
+                                    keep_visible(state, n);
+                                }
+                                KeyCode::Delete => {
+                                    if let Some(i) = state.splash_sel {
+                                        if let Some(&ci) = filtered.get(i) {
+                                            let p = state.splash_charts[ci].path.clone();
+                                            let _ = std::fs::remove_dir_all(&p);
+                                            state.splash_charts = scan_charts();
+                                            state.splash_sel = None;
+                                            state.splash_scroll = 0.0;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if !state.ctrl {
+                                        let ch = match &event.logical_key {
+                                            winit::keyboard::Key::Character(s) => s.chars().next(),
+                                            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Space) => Some(' '),
+                                            _ => None,
+                                        };
+                                        if let Some(c) = ch {
+                                            state.splash_search.push(c);
+                                            state.splash_sel = None;
+                                            state.splash_scroll = 0.0;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(path) = open_path {
+                                drop(state);
+                                self.state = None;
+                                match self.create_state(event_loop, &path) {
+                                    Ok(st) => self.state = Some(st),
+                                    Err(e) => { eprintln!("failed to load {path:?}: {e:#}"); }
+                                }
+                            }
+                            return;
+                        }
                         // pre-copy fields to avoid borrow conflicts
                         let has_event = state.selected_event_idx.is_some();
                         let edit_target = state.event_edit_target;
@@ -651,8 +901,18 @@ impl ApplicationHandler for App {
                         // Ctrl+Z = undo, Ctrl+Y = redo
                         KeyCode::KeyZ if state.ctrl => { state.doc.undo(); state.rebuild_chart(); state.ui_dirty = true; }
                         KeyCode::KeyY if state.ctrl => { state.doc.redo(); state.rebuild_chart(); state.ui_dirty = true; }
-                        // Ctrl+Q = quit
-                        KeyCode::KeyQ if state.ctrl => { event_loop.exit(); }
+                        // Ctrl+S = save now
+                        KeyCode::KeyS if state.ctrl => {
+                            if let Err(e) = state.doc.save() { eprintln!("save failed: {e:#}"); }
+                            state.ui_dirty = true;
+                        }
+                        // Ctrl+Q = back to the splash screen (exit the app
+                        // from there with Ctrl+Q again)
+                        KeyCode::KeyQ if state.ctrl => {
+                            drop(state);
+                            self.back_to_splash(event_loop);
+                            return;
+                        }
                         // Event editing (F2 = cycle target, Ctrl+arrows = edit)
                         KeyCode::F2 if has_event => { state.event_edit_target = (state.event_edit_target + 1) % 5; state.ui_dirty = true; }
                         KeyCode::ArrowLeft if ctrl && has_event => {
@@ -731,6 +991,15 @@ impl ApplicationHandler for App {
             }
             WindowEvent::Focused(f) => { state.focused = f; }
             WindowEvent::CursorMoved { position, .. } => {
+                if state.splash_mode {
+                    // Splash hover: chart rows / buttons / settings rows.
+                    let gs = state.overlay.gui_scale;
+                    let vw = state.window.inner_size().width as f32;
+                    let vh = state.window.inner_size().height as f32;
+                    let (mx, my) = (position.x as f32, position.y as f32);
+                    let filtered_len = ui::filter_charts(&state.splash_charts, &state.splash_search, state.splash_sort).len();
+                    state.splash_hover = ui::splash_hit_test(mx, my, vw, vh, gs, filtered_len, state.show_settings, state.splash_scroll);
+                }
                 state.overlay.handle_cursor(position.x, position.y);
                 if state.overlay.seek_dragging && state.show_overlay {
                     let s = state.overlay.gui_scale;
@@ -745,6 +1014,9 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state: btn_state, button: winit::event::MouseButton::Left, .. } => {
+                // Splash presses are handled by the splash block (releases);
+                // skip overlay state here so nothing leaks into the editor.
+                if state.splash_mode { return; }
                 // HUD pause button (window px hit-test against last frame).
                 if btn_state == ElementState::Pressed {
                     if let Some(m) = state.overlay.mouse_pos {
@@ -757,13 +1029,18 @@ impl ApplicationHandler for App {
                 state.overlay.handle_click(btn_state == ElementState::Pressed, state.ctrl);
             }
             WindowEvent::MouseInput { state: btn_state, button: winit::event::MouseButton::Right, .. } => {
+                if state.splash_mode { return; }
                 if btn_state == ElementState::Pressed {
                     state.overlay.handle_right_click(state.overlay.props_progress());
                 }
             }
             WindowEvent::RedrawRequested => {
                 state.render_frame();
-                for msg in state.overlay.messages.drain(..) {
+                // Drain into an owned vec first: MenuQuit drops `state` to
+                // rebuild the splash state, which can't happen while the
+                // drain iterator borrows it.
+                let messages: Vec<ui::OverlayMessage> = state.overlay.messages.drain(..).collect();
+                for msg in messages {
                     match msg {
                         ui::OverlayMessage::ToggleEvents => { state.show_events = !state.show_events; state.ui_dirty = true; }
                         ui::OverlayMessage::SelectLayer(ly) => {
@@ -771,6 +1048,16 @@ impl ApplicationHandler for App {
                             else { state.selected_layer = ly; state.cache_valid = false; state.ui_dirty = true; }
                         }
                         ui::OverlayMessage::ToggleMenu => { state.show_menu = !state.show_menu; state.ui_dirty = true; }
+                        ui::OverlayMessage::MenuSave => {
+                            if let Err(e) = state.doc.save() { eprintln!("save failed: {e:#}"); }
+                            state.show_menu = false;
+                            state.ui_dirty = true;
+                        }
+                        ui::OverlayMessage::MenuQuit => {
+                            drop(state);
+                            self.back_to_splash(event_loop);
+                            break;
+                        }
                         ui::OverlayMessage::ToggleVsync => { state.renderer.set_vsync(!state.renderer.vsync); state.ui_dirty = true; }
                     }
                 }
@@ -789,17 +1076,205 @@ impl ApplicationHandler for App {
     }
 }
 
-fn scan_charts() -> Vec<(String, PathBuf)> {
+/// Settings file lives next to the chart library: `<Documents>/PhiMakor/config.json`.
+/// Falls back to the old executable-dir `config.json` if present (and migrates
+/// it on the next save).
+fn settings_path() -> PathBuf {
+    let mut dir = charts_dir();
+    dir.pop(); // .../PhiMakor/charts → .../PhiMakor
+    dir.join("config.json")
+}
+
+/// Load editor settings from `config.json` in the PhiMakor documents folder.
+/// Missing or invalid files fall back to defaults.
+fn load_settings() -> ui::SettingsData {
+    let path = settings_path();
+    std::fs::read(&path)
+        .or_else(|_| std::fs::read("config.json")) // legacy location
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Persist editor settings to `config.json` in the PhiMakor documents folder.
+/// Also removes the legacy executable-dir file once the new one is written.
+fn save_settings(settings: &ui::SettingsData) {
+    if let Ok(json) = serde_json::to_string_pretty(settings) {
+        let path = settings_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if std::fs::write(&path, json).is_ok() {
+            let _ = std::fs::remove_file("config.json");
+        }
+    }
+}
+
+/// Recursively copy `src` into `dst` (used for drag-and-drop import).
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validate a chart directory: must contain `info.json` or `info.txt`.
+fn is_chart_dir(p: &std::path::Path) -> bool {
+    p.is_dir() && (p.join("info.json").exists() || p.join("info.txt").exists())
+}
+
+/// Probe a `.zip` chart package: it must contain an `info.json` / `info.txt`
+/// entry. Returns `Ok(chart_root)` where `chart_root` is the archive-internal
+/// directory holding the info file (strip a single leading wrapper dir).
+fn probe_chart_zip(zip_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let file = std::fs::File::open(zip_path).map_err(|e| anyhow::anyhow!("open zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| anyhow::anyhow!("zip parse: {e}"))?;
+    // Collect candidate roots: paths of info entries, plus their parent dir.
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for i in 0..archive.len() {
+        let name = archive.by_index(i).map_err(|e| anyhow::anyhow!("zip entry: {e}"))?.name().to_string();
+        let file_name = std::path::Path::new(&name).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        if file_name == "info.json" || file_name == "info.txt" {
+            let p = std::path::Path::new(&name);
+            let root = p.parent().filter(|d| !d.as_os_str().is_empty()).map(|d| d.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::new());
+            roots.push(root);
+        }
+    }
+    if roots.is_empty() {
+        anyhow::bail!("not a chart zip: no info.json/info.txt inside");
+    }
+    // Prefer the shallowest root (root-level info beats a nested one).
+    roots.sort_by_key(|r| r.components().count());
+    Ok(roots.into_iter().next().unwrap())
+}
+
+/// Extract a chart zip into the chart library. `zip_path` must pass
+/// [`probe_chart_zip`] first. Returns the extracted chart directory.
+fn import_chart_zip(zip_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
+    let root = probe_chart_zip(zip_path)?;
+    let stem = zip_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "imported".to_string());
+    let lib = charts_dir();
+    let dest = lib.join(&stem);
+    let _ = std::fs::create_dir_all(&dest);
+
+    let file = std::fs::File::open(zip_path)?;
+    let mut archive = zip::ZipArchive::new(file)?;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let name = entry.name().to_string();
+        if entry.is_dir() { continue; }
+        // Strip the archive-internal chart root prefix.
+        let rel = std::path::Path::new(&name)
+            .strip_prefix(&root)
+            .map(|r| r.to_path_buf())
+            .unwrap_or_else(|_| std::path::PathBuf::from(&name));
+        if rel.as_os_str().is_empty() { continue; }
+        let out = dest.join(&rel);
+        if let Some(parent) = out.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let mut f = std::fs::File::create(&out)?;
+        std::io::copy(&mut entry, &mut f)?;
+    }
+    if !is_chart_dir(&dest) {
+        // Info file was nested deeper than the stripped root — rescan.
+        anyhow::bail!("extracted chart has no info.json/info.txt at root");
+    }
+    Ok(dest)
+}
+
+/// Default chart library: `<Documents>/PhiMakor/charts/`. On Windows the
+/// Documents folder is `%USERPROFILE%\Documents`; other platforms use the
+/// XDG-ish `~/Documents` fallback. The folder is created on first use.
+fn charts_dir() -> PathBuf {
+    let docs = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .map(|h| PathBuf::from(h).join("Documents"))
+        .unwrap_or_else(|_| PathBuf::from("."));
+    docs.join("PhiMakor").join("charts")
+}
+
+fn scan_charts() -> Vec<ui::ChartEntry> {
     let mut charts = Vec::new();
-    if let Ok(readdir) = std::fs::read_dir(".") {
+    let dir = charts_dir();
+    if !dir.exists() {
+        let _ = std::fs::create_dir_all(&dir);
+    }
+    if let Ok(readdir) = std::fs::read_dir(&dir) {
         for e in readdir.flatten() {
-            if e.path().is_dir() && (e.path().join("info.json").exists() || e.path().join("info.txt").exists()) {
-                charts.push((e.file_name().to_string_lossy().to_string(), e.path()));
+            let p = e.path();
+            if p.is_dir() && (p.join("info.json").exists() || p.join("info.txt").exists()) {
+                charts.push(read_chart_entry(&p));
             }
         }
     }
-    charts.sort_by(|a, b| a.0.cmp(&b.0));
+    charts.sort_by(|a, b| a.name.cmp(&b.name));
     charts
+}
+
+/// Read a chart's `info.json` (falling back to RPE `info.txt`), or `None`.
+fn read_chart_info(dir: &std::path::Path) -> Option<core::model::ChartInfo> {
+    if let Ok(src) = std::fs::read_to_string(dir.join("info.json")) {
+        if let Ok(info) = serde_json::from_str::<core::model::ChartInfo>(&src) {
+            return Some(info);
+        }
+    }
+    if let Ok(src) = std::fs::read_to_string(dir.join("info.txt")) {
+        return Some(core::model::parse_info_txt(&src));
+    }
+    None
+}
+
+/// Build a splash list entry: metadata + thumbnail (best effort).
+fn read_chart_entry(dir: &std::path::Path) -> ui::ChartEntry {
+    let folder = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let info = read_chart_info(dir);
+    let (name, composer, charter, level, difficulty, illustration) = info.as_ref().map(|i| (
+        if i.name.is_empty() { folder.clone() } else { i.name.clone() },
+        i.composer.clone(), i.charter.clone(), i.level.clone(), i.difficulty, i.illustration.clone(),
+    )).unwrap_or_else(|| (folder, String::new(), String::new(), String::new(), 0.0, String::new()));
+    let modified = std::fs::metadata(dir).ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs()).unwrap_or(0);
+    let thumb = load_thumb(dir, &illustration);
+    ui::ChartEntry { name, path: dir.to_path_buf(), composer, charter, level, difficulty, modified, thumb }
+}
+
+/// Decode a chart's illustration (or bg fallback) as a small thumbnail.
+fn load_thumb(dir: &std::path::Path, illustration: &str) -> Option<image::RgbaImage> {
+    let mut path = dir.join(illustration);
+    if !path.is_file() { path = dir.join("bg.png"); }
+    if !path.is_file() { path = dir.join("background.png"); }
+    if !path.is_file() { return None; }
+    let bytes = std::fs::read(path).ok()?;
+    let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
+    let (w, h) = (img.width(), img.height());
+    let max_dim = 200u32;
+    if w.max(h) <= max_dim { return Some(img); }
+    let scale = max_dim as f32 / w.max(h) as f32;
+    Some(image::imageops::resize(&img, (w as f32 * scale).max(1.0) as u32, (h as f32 * scale).max(1.0) as u32, image::imageops::FilterType::Triangle))
+}
+
+/// Open a folder in the platform file manager (best effort).
+fn open_in_explorer(path: &std::path::Path) {
+    #[cfg(target_os = "windows")]
+    { let _ = std::process::Command::new("explorer").arg(path).spawn(); }
+    #[cfg(target_os = "macos")]
+    { let _ = std::process::Command::new("open").arg(path).spawn(); }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    { let _ = std::process::Command::new("xdg-open").arg(path).spawn(); }
 }
 
 #[cfg(feature = "profiling")]
@@ -829,7 +1304,55 @@ fn main() -> anyhow::Result<()> {
     };
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
-    let charts = scan_charts();
-    el.run_app(&mut App { dir, state: None, charts, splash_hover: None })?;
+    el.run_app(&mut App { dir, state: None })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod zip_tests {
+    use super::*;
+
+    fn make_zip(path: &std::path::Path, wrapped: bool) {
+        use std::io::Write;
+        let mut z = zip::ZipWriter::new(std::fs::File::create(path).unwrap());
+        let opts = zip::write::SimpleFileOptions::default();
+        let base = if wrapped { "MyChart/" } else { "" };
+        z.start_file(format!("{base}info.json"), opts).unwrap();
+        z.write_all(br#"{"chart":"chart.json","name":"t"}"#).unwrap();
+        z.start_file(format!("{base}chart.json"), opts).unwrap();
+        z.write_all(br#"{"META":{"offset":0},"BPMList":[],"judgeLineList":[]}"#).unwrap();
+        z.start_file(format!("{base}bg.png"), opts).unwrap();
+        z.write_all(&[1, 2, 3]).unwrap();
+        z.finish().unwrap();
+    }
+
+    #[test]
+    fn zip_probe_and_import() {
+        let dir = std::env::temp_dir().join("phimakor-zip-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Root-level info.
+        let root_zip = dir.join("root.zip");
+        make_zip(&root_zip, false);
+        let probe = probe_chart_zip(&root_zip).unwrap();
+        assert_eq!(probe.as_os_str(), "");
+
+        // Wrapped info (common chart-pack pattern).
+        let wrap_zip = dir.join("wrapped.zip");
+        make_zip(&wrap_zip, true);
+        let probe = probe_chart_zip(&wrap_zip).unwrap();
+        assert_eq!(probe.to_string_lossy(), "MyChart");
+
+        // Not a chart zip: no info file.
+        let bad = dir.join("bad.zip");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&bad).unwrap());
+        z.start_file("readme.txt", zip::write::SimpleFileOptions::default()).unwrap();
+        use std::io::Write;
+        z.write_all(b"hi").unwrap();
+        z.finish().unwrap();
+        assert!(probe_chart_zip(&bad).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
