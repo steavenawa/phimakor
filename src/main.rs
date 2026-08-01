@@ -94,6 +94,16 @@ impl State {
     fn placeholder() -> Self { panic!("placeholder State used before init") }
 }
 
+/// Map the `backend` setting to wgpu backends (`None` = all / auto).
+fn backends_from_settings(settings: &ui::SettingsData) -> wgpu::Backends {
+    match settings.backend.as_deref() {
+        Some("dx12") => wgpu::Backends::DX12,
+        Some("vulkan") => wgpu::Backends::VULKAN,
+        Some("gl") => wgpu::Backends::GL,
+        _ => wgpu::Backends::all(),
+    }
+}
+
 impl App {
     fn create_splash_state(&self, event_loop: &ActiveEventLoop, charts: Vec<ui::ChartEntry>) -> Option<State> {
         // Load persisted settings so the splash respects (and doesn't
@@ -106,7 +116,7 @@ impl App {
         if settings.fullscreen {
             window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
-        let mut renderer = pollster::block_on(render::Renderer::new(window.clone())).ok()?;
+        let mut renderer = pollster::block_on(render::Renderer::new(window.clone(), backends_from_settings(&settings))).ok()?;
         renderer.set_vsync(settings.vsync);
         let overlay = ui::IcedOverlay::new(renderer.device(), renderer.tex_bgl(), renderer.sampler(), 800, 600);
         let tmp = std::env::temp_dir().join("phimakor-splash");
@@ -142,9 +152,9 @@ impl App {
         let window = Arc::new(event_loop.create_window(
             WindowAttributes::default().with_title("phimakor").with_inner_size(LogicalSize::new(1200.0, 800.0)),
         )?);
-        let mut renderer = pollster::block_on(render::Renderer::new(window.clone()))?;
-        // Apply persisted settings (vsync, fullscreen) to the fresh window.
+        // Apply persisted settings (vsync, fullscreen, backend) to the fresh window.
         let settings = load_settings();
+        let mut renderer = pollster::block_on(render::Renderer::new(window.clone(), backends_from_settings(&settings)))?;
         renderer.set_vsync(settings.vsync);
         if settings.fullscreen {
             window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
@@ -259,6 +269,10 @@ impl State {
         let (text_entries, digit_bytes, font_bytes) = self.renderer.text_mem();
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!("──── memory report ────");
+        if let Some((rss, peak, commit)) = process_mem() {
+            let mb = |b: usize| b as f64 / 1048576.0;
+            eprintln!("RSS {:.1} MB | peak {:.1} MB | commit {:.1} MB", mb(rss), mb(peak), mb(commit));
+        }
         eprintln!("HUD text cache entries : {} (dynamic digits bypass it)", text_entries);
         eprintln!("digit glyph bitmaps    : {:.2} MB", mb(digit_bytes));
         eprintln!("renderer fonts (raw)   : {:.2} MB", mb(font_bytes));
@@ -704,6 +718,10 @@ impl ApplicationHandler for App {
                         ui::SplashHover::Settings => { st.show_settings = true; }
                         ui::SplashHover::Back => { st.show_settings = false; }
                         ui::SplashHover::Vsync => { st.settings.vsync = !st.settings.vsync; st.renderer.set_vsync(st.settings.vsync); save_settings(&st.settings); }
+                        ui::SplashHover::Backend => {
+                            st.settings.backend = ui::backend_cycle(&st.settings.backend);
+                            save_settings(&st.settings);
+                        }
                         ui::SplashHover::Fullscreen => {
                             st.settings.fullscreen = !st.settings.fullscreen;
                             st.window.set_fullscreen(if st.settings.fullscreen { Some(winit::window::Fullscreen::Borderless(None)) } else { None });
@@ -1141,6 +1159,34 @@ fn save_settings(settings: &ui::SettingsData) {
             let _ = std::fs::remove_file("config.json");
         }
     }
+}
+
+/// Process memory snapshot: (current working set, peak working set, commit
+/// pagefile usage) in bytes, or `None` on non-Windows / failure.
+fn process_mem() -> Option<(usize, usize, usize)> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut mci = PROCESS_MEMORY_COUNTERS {
+            cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+            PageFaultCount: 0,
+            PeakWorkingSetSize: 0,
+            WorkingSetSize: 0,
+            QuotaPeakPagedPoolUsage: 0,
+            QuotaPagedPoolUsage: 0,
+            QuotaPeakNonPagedPoolUsage: 0,
+            QuotaNonPagedPoolUsage: 0,
+            PagefileUsage: 0,
+            PeakPagefileUsage: 0,
+        };
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut mci, mci.cb) };
+        if ok != 0 {
+            return Some((mci.WorkingSetSize as usize, mci.PeakWorkingSetSize as usize, mci.PagefileUsage as usize));
+        }
+    }
+    let _ = ();
+    None
 }
 
 /// Recursively copy `src` into `dst` (used for drag-and-drop import).

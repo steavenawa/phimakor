@@ -898,16 +898,39 @@ impl IcedOverlay {
 
 /// Draw splash screen (chart picker) when no chart is loaded.
 /// Editor settings surfaced on the splash screen. Persisted to `config.json`.
-#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct SettingsData {
     pub vsync: bool,
     pub gui_scale: f32,
     pub fullscreen: bool,
+    /// GPU backend: `None` = auto (all), or "dx12" / "vulkan" / "gl".
+    /// On shared-memory GPUs (iGPU) DX12 is the heaviest by far.
+    pub backend: Option<String>,
 }
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None }
+    }
+}
+
+/// Display name for a backend setting value.
+pub fn backend_label(backend: &Option<String>) -> String {
+    match backend.as_deref() {
+        Some("dx12") => "DX12".to_string(),
+        Some("vulkan") => "Vulkan".to_string(),
+        Some("gl") => "GL".to_string(),
+        _ => "Auto".to_string(),
+    }
+}
+
+/// Cycle the backend setting: Auto → DX12 → Vulkan → GL → Auto.
+pub fn backend_cycle(backend: &Option<String>) -> Option<String> {
+    match backend.as_deref() {
+        Some("dx12") => Some("vulkan".to_string()),
+        Some("vulkan") => Some("gl".to_string()),
+        Some("gl") => None,
+        _ => Some("dx12".to_string()),
     }
 }
 
@@ -943,6 +966,7 @@ pub enum SplashHover {
     // Settings page rows
     Vsync,
     Fullscreen,
+    Backend,
     ScaleRow,
     ScaleMinus,
     ScalePlus,
@@ -1012,6 +1036,8 @@ pub fn splash_hit_test(mx: f32, my: f32, vw: f32, vh: f32, s: f32, filtered_len:
         if hit(my, y) { return SplashHover::Vsync; }
         y += row_h + 6.0 * s;
         if hit(my, y) { return SplashHover::Fullscreen; }
+        y += row_h + 6.0 * s;
+        if hit(my, y) { return SplashHover::Backend; }
         y += row_h + 6.0 * s;
         if hit(my, y) { return SplashHover::ScaleRow; }
         y += row_h + 6.0 * s;
@@ -1427,9 +1453,10 @@ fn draw_splash_settings(pm: &mut tiny_skia::PixmapMut, cfg: &SettingsData, hover
         p
     };
 
-    let rows: [(&str, String, SplashHover); 3] = [
+    let rows: [(&str, String, SplashHover); 4] = [
         ("Vsync", format!("{}", if cfg.vsync { "ON" } else { "OFF" }), SplashHover::Vsync),
         ("Fullscreen", format!("{}", if cfg.fullscreen { "ON" } else { "OFF" }), SplashHover::Fullscreen),
+        ("GPU Backend", backend_label(&cfg.backend), SplashHover::Backend),
         ("GUI Scale", format!("{:.1}", cfg.gui_scale), SplashHover::ScaleRow),
     ];
     for (label, value, target) in rows {

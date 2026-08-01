@@ -423,9 +423,15 @@ impl Renderer {
 
     /// Create a new windowed renderer: surface, adapter, device, pipelines,
     /// double-buffered instance storage, white texture, and post-processing pipe.
-    pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
+    /// `backends` selects the wgpu backend (from the `backend` setting;
+    /// [`wgpu::Backends::all`] for auto). On shared-memory GPUs (iGPU) the
+    /// DX12 backend's GPU heaps live in system RAM — Vulkan/GL can be far
+    /// cheaper there.
+    pub async fn new(window: Arc<Window>, backends: wgpu::Backends) -> anyhow::Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+        desc.backends = backends;
+        let instance = wgpu::Instance::new(desc);
         let surface = instance
             .create_surface(window)
             .context("failed to create surface")?;
@@ -454,7 +460,9 @@ impl Renderer {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 4,
+            // 2 buffers max: 4 frames of swapchain at 4K ≈ 100+ MB of GPU
+            // memory accounted against the process — 2 is plenty for vsync.
+            desired_maximum_frame_latency: 2,
             alpha_mode: wgpu::CompositeAlphaMode::Opaque,
             view_formats: vec![],
         };
