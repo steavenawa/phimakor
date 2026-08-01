@@ -17,7 +17,7 @@ use std::{
 
 use super::{
     chart::load_info,
-    model::{ChartInfo, RPEChart, RPEEvent, RPEEventLayer, RPEJudgeLine, RPENote},
+    model::{ChartInfo, RPEBpmItem, RPEChart, RPEEvent, RPEEventLayer, RPEJudgeLine, RPENote},
 };
 use crate::core::bpm::Triple;
 
@@ -181,6 +181,35 @@ enum Inverse {
         /// was `None`; inner `None` per kind = that event list was `None`.
         target_layer_lens: Vec<Option<[Option<usize>; 5]>>,
         /// (line index, old parent) in pre-removal index space.
+        father_remap: Vec<(usize, Option<isize>)>,
+    },
+    /// Op: BPM entry inserted at `index`. Undo removes it; redo re-inserts.
+    AddBpm {
+        index: usize,
+        item: RPEBpmItem,
+    },
+    /// Op: BPM entry removed from `index`. Undo re-inserts; redo removes.
+    RemoveBpm {
+        index: usize,
+        item: RPEBpmItem,
+    },
+    /// Op: BPM entry at `index` replaced. Undo restores `old`; redo `new`.
+    ReplaceBpm {
+        index: usize,
+        old: RPEBpmItem,
+        new: RPEBpmItem,
+    },
+    /// Op: empty judge line inserted at `index`. Undo removes it (fathers
+    /// beyond shift down); redo re-inserts (fathers beyond shift up).
+    AddLine {
+        index: usize,
+        line: RPEJudgeLine,
+    },
+    /// Op: judge line removed from `index`. Undo re-inserts and restores the
+    /// recorded father indices; redo re-removes with the same remap.
+    RemoveLine {
+        index: usize,
+        line: RPEJudgeLine,
         father_remap: Vec<(usize, Option<isize>)>,
     },
 }
@@ -564,6 +593,116 @@ impl ChartDocument {
         let inverse = self.bind_raw(target, source)?;
         self.record(inverse);
         Ok(())
+    }
+
+    /// 加线: appends a new empty judge line (no notes/events) at the end of
+    /// the list, with z-order one above the current top. Returns its index.
+    pub fn add_line(&mut self, name: String, texture: String) -> Result<usize, EditError> {
+        let max_z = self.chart.judge_line_list.iter().map(|l| l.z_order).max().unwrap_or(0);
+        let line = RPEJudgeLine {
+            name,
+            texture,
+            parent: None,
+            rotate_with_father: None,
+            event_layers: vec![None],
+            extended: None,
+            notes: None,
+            is_cover: 0,
+            z_order: max_z + 1,
+            attach_ui: None,
+            pos_control: vec![],
+            size_control: vec![],
+            alpha_control: vec![],
+            y_control: vec![],
+        };
+        let index = self.chart.judge_line_list.len();
+        self.chart.judge_line_list.push(line.clone());
+        self.record(Inverse::AddLine { index, line });
+        Ok(index)
+    }
+
+    /// 删线: removes the judge line at `index`, returning it. Father links
+    /// are remapped: lines fathered to it become fatherless (-1), lines
+    /// beyond it shift down one.
+    pub fn remove_line(&mut self, index: usize) -> Result<RPEJudgeLine, EditError> {
+        let lines = &mut self.chart.judge_line_list;
+        if lines.len() <= 1 {
+            return Err(EditError::BadOp("cannot remove the last judge line".into()));
+        }
+        if index >= lines.len() {
+            return Err(EditError::BadOp(format!(
+                "line index {index} out of range ({} lines)",
+                lines.len()
+            )));
+        }
+        let line = lines[index].clone();
+        let father_remap = remap_parents_remove(lines, index);
+        lines.remove(index);
+        self.record(Inverse::RemoveLine {
+            index,
+            line: line.clone(),
+            father_remap,
+        });
+        Ok(line)
+    }
+
+    // --- bpm ops ---
+
+    /// Inserts a BPM change point at `beat`, keeping the list sorted by
+    /// start time. Returns the inserted index.
+    pub fn add_bpm(&mut self, bpm: f64, beat: f64) -> Result<usize, EditError> {
+        let list = &mut self.chart.bpm_list;
+        let index = list.partition_point(|b| b.start_time.beats() <= beat);
+        let item = RPEBpmItem {
+            bpm,
+            start_time: Triple::from_beats(beat),
+        };
+        list.insert(index, item.clone());
+        self.record(Inverse::AddBpm { index, item });
+        Ok(index)
+    }
+
+    /// Removes the BPM entry at `index`, returning it. Refuses to remove
+    /// the last remaining entry (charts must keep at least one).
+    pub fn remove_bpm(&mut self, index: usize) -> Result<RPEBpmItem, EditError> {
+        let list = &mut self.chart.bpm_list;
+        if list.len() <= 1 {
+            return Err(EditError::BadOp("cannot remove the last BPM entry".into()));
+        }
+        if index >= list.len() {
+            return Err(EditError::BadOp(format!(
+                "bpm index {index} out of range ({} entries)",
+                list.len()
+            )));
+        }
+        let item = list.remove(index);
+        self.record(Inverse::RemoveBpm {
+            index,
+            item: item.clone(),
+        });
+        Ok(item)
+    }
+
+    /// Replaces the BPM entry at `index` with a new value/beat, returning
+    /// the old one. Does not re-sort: the new entry keeps the slot.
+    pub fn replace_bpm(&mut self, index: usize, bpm: f64, beat: f64) -> Result<RPEBpmItem, EditError> {
+        let old = self.chart.bpm_list.get(index).cloned().ok_or_else(|| {
+            EditError::BadOp(format!(
+                "bpm index {index} out of range ({} entries)",
+                self.chart.bpm_list.len()
+            ))
+        })?;
+        let new = RPEBpmItem {
+            bpm,
+            start_time: Triple::from_beats(beat),
+        };
+        self.chart.bpm_list[index] = new.clone();
+        self.record(Inverse::ReplaceBpm {
+            index,
+            old: old.clone(),
+            new,
+        });
+        Ok(old)
     }
 
     // --- history ---
@@ -958,6 +1097,44 @@ impl ChartDocument {
                     }
                 }
             }
+            Inverse::AddBpm { index, .. } => {
+                let list = &mut self.chart.bpm_list;
+                if list.is_empty() {
+                    return Err(EditError::BadOp("undo: no BPM entries to remove".into()));
+                }
+                list.remove((*index).min(list.len() - 1));
+            }
+            Inverse::RemoveBpm { index, item } => {
+                let list = &mut self.chart.bpm_list;
+                list.insert((*index).min(list.len()), item.clone());
+            }
+            Inverse::ReplaceBpm { index, old, .. } => {
+                if let Some(slot) = self.chart.bpm_list.get_mut(*index) {
+                    *slot = old.clone();
+                }
+            }
+            Inverse::AddLine { index, .. } => {
+                let lines = &mut self.chart.judge_line_list;
+                if lines.is_empty() {
+                    return Err(EditError::BadOp("undo: no judge lines to remove".into()));
+                }
+                let index = (*index).min(lines.len() - 1);
+                remap_parents_remove(lines, index);
+                lines.remove(index);
+            }
+            Inverse::RemoveLine {
+                index,
+                line,
+                father_remap,
+            } => {
+                let lines = &mut self.chart.judge_line_list;
+                lines.insert((*index).min(lines.len()), line.clone());
+                for (i, old) in father_remap {
+                    if let Some(l) = lines.get_mut(*i) {
+                        l.parent = *old;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -1015,6 +1192,37 @@ impl ChartDocument {
             }
             Inverse::BindLines { target, source, .. } => {
                 self.bind_raw(*target, *source)?;
+            }
+            Inverse::AddBpm { index, item } => {
+                let list = &mut self.chart.bpm_list;
+                list.insert((*index).min(list.len()), item.clone());
+            }
+            Inverse::RemoveBpm { index, .. } => {
+                let list = &mut self.chart.bpm_list;
+                if list.is_empty() {
+                    return Err(EditError::BadOp("redo: no BPM entries to remove".into()));
+                }
+                list.remove((*index).min(list.len() - 1));
+            }
+            Inverse::ReplaceBpm { index, new, .. } => {
+                if let Some(slot) = self.chart.bpm_list.get_mut(*index) {
+                    *slot = new.clone();
+                }
+            }
+            Inverse::AddLine { index, line } => {
+                let lines = &mut self.chart.judge_line_list;
+                let index = (*index).min(lines.len());
+                lines.insert(index, line.clone());
+                remap_parents_insert(lines, index);
+            }
+            Inverse::RemoveLine { index, .. } => {
+                let lines = &mut self.chart.judge_line_list;
+                if lines.is_empty() {
+                    return Err(EditError::BadOp("redo: no judge lines to remove".into()));
+                }
+                let index = (*index).min(lines.len() - 1);
+                remap_parents_remove(lines, index);
+                lines.remove(index);
             }
         }
         Ok(())
@@ -1357,6 +1565,104 @@ mod tests {
         assert!(doc.redo());
         assert_eq!(doc.chart().judge_line_list.len(), 2);
         assert_eq!(note_beats(&doc, 0), vec![1., 2., 3., 4., 5., 6.]);
+
+        drop(doc);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn add_remove_line_undo_redo_roundtrip() {
+        let dir = temp_chart_dir();
+        let mut doc = ChartDocument::open(&dir).unwrap();
+
+        // add: appended at the end with z-order above the current top
+        let idx = doc.add_line("D".into(), "custom.png".into()).unwrap();
+        assert_eq!(idx, 3);
+        assert_eq!(doc.chart().judge_line_list[3].name, "D");
+        assert_eq!(doc.chart().judge_line_list[3].texture, "custom.png");
+        assert_eq!(doc.chart().judge_line_list[3].z_order, 1);
+        assert!(doc.undo());
+        assert_eq!(doc.chart().judge_line_list.len(), 3);
+        assert!(doc.redo());
+        assert_eq!(doc.chart().judge_line_list.len(), 4);
+
+        // remove: father remap — C (fathered to B at 1) becomes fatherless
+        let removed = doc.remove_line(1).unwrap();
+        assert_eq!(removed.name, "B");
+        assert_eq!(doc.chart().judge_line_list.len(), 3);
+        assert_eq!(doc.chart().judge_line_list[1].name, "C");
+        assert_eq!(doc.chart().judge_line_list[1].parent, Some(-1));
+
+        // undo: B restored, C re-fathered
+        assert!(doc.undo());
+        assert_eq!(doc.chart().judge_line_list.len(), 4);
+        assert_eq!(doc.chart().judge_line_list[1].name, "B");
+        assert_eq!(doc.chart().judge_line_list[2].parent, Some(1));
+
+        // redo: removed again, remap identical
+        assert!(doc.redo());
+        assert_eq!(doc.chart().judge_line_list.len(), 3);
+        assert_eq!(doc.chart().judge_line_list[1].parent, Some(-1));
+
+        // cannot remove the last line
+        while doc.chart().judge_line_list.len() > 1 {
+            doc.remove_line(0).unwrap();
+        }
+        assert!(doc.remove_line(0).is_err());
+
+        drop(doc);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bpm_ops_undo_redo_roundtrip() {
+        let dir = temp_chart_dir();
+        let mut doc = ChartDocument::open(&dir).unwrap();
+        assert_eq!(doc.chart().bpm_list.len(), 1);
+
+        // add: sorted insertion between the fixture's 120 BPM
+        let idx = doc.add_bpm(160.0, 4.0).unwrap();
+        assert_eq!(idx, 1);
+        let idx = doc.add_bpm(90.0, 2.0).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(doc.chart().bpm_list[1].bpm, 90.0);
+        assert_eq!(doc.chart().bpm_list[2].bpm, 160.0);
+
+        // undo both, redo both
+        assert!(doc.undo());
+        assert_eq!(doc.chart().bpm_list.len(), 2);
+        assert_eq!(doc.chart().bpm_list[1].bpm, 160.0);
+        assert!(doc.undo());
+        assert_eq!(doc.chart().bpm_list.len(), 1);
+        assert!(doc.redo());
+        assert!(doc.redo());
+        assert_eq!(doc.chart().bpm_list.len(), 3);
+        assert_eq!(doc.chart().bpm_list[1].bpm, 90.0);
+        assert_eq!(doc.chart().bpm_list[2].bpm, 160.0);
+
+        // replace roundtrip
+        let old = doc.replace_bpm(1, 100.0, 2.5).unwrap();
+        assert_eq!(old.bpm, 90.0);
+        assert_eq!(doc.chart().bpm_list[1].bpm, 100.0);
+        assert_eq!(doc.chart().bpm_list[1].start_time.beats(), 2.5);
+        assert!(doc.undo());
+        assert_eq!(doc.chart().bpm_list[1].bpm, 90.0);
+        assert!(doc.redo());
+        assert_eq!(doc.chart().bpm_list[1].bpm, 100.0);
+
+        // remove roundtrip
+        let removed = doc.remove_bpm(1).unwrap();
+        assert_eq!(removed.bpm, 100.0);
+        assert!(doc.undo());
+        assert_eq!(doc.chart().bpm_list.len(), 3);
+        assert!(doc.redo());
+        assert_eq!(doc.chart().bpm_list.len(), 2);
+
+        // cannot remove the last BPM
+        while doc.chart().bpm_list.len() > 1 {
+            doc.remove_bpm(0).unwrap();
+        }
+        assert!(doc.remove_bpm(0).is_err());
 
         drop(doc);
         fs::remove_dir_all(&dir).ok();

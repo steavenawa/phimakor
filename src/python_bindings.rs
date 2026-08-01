@@ -17,7 +17,7 @@
 //!     print(f"  Line {line.name}: {line.note_count()} notes")
 //!
 //! # Edit
-//! note = pk.Note(kind=1, start_beat=4.0, position_x=0.3)
+//! note = pk.Note(kind=1, start_beat=4.0, position_x=0.3, end_beat=6.0, alpha=255)
 //! doc.add_note(line=0, note=note)
 //! doc.undo()
 //! doc.save()
@@ -27,6 +27,31 @@
 //! state = chart.state_at(time=10.5)
 //! for ls in state.lines:
 //!     print(f"  alpha={ls.alpha:.2f}, rotation={ls.rotation:.2f}")
+//! ```
+//!
+//! # Beyond files: pure in-memory scripting
+//!
+//! Everything works without a chart directory — build charts from JSON
+//! strings, analyze them, and evaluate them headlessly:
+//!
+//! ```text
+//! rpe = pk.RPEChart.from_json(json_str)     # parse RPE JSON
+//! rpe2 = pk.RPEChart.from_pss(pss_bytes)    # parse PSS stream bytes
+//! pk.detect_format_bytes(raw_bytes)         # probe a format
+//! pk.parse_chart_bytes("rpe", raw_bytes)    # parse raw bytes
+//!
+//! chart = pk.Chart.from_rpe_chart(rpe)      # evaluation engine in memory
+//! chart.max_combo()                         # analysis helpers
+//! chart.hits_before(t)
+//! chart.textures()
+//!
+//! doc.add_line("Canton", "tower.png")       # line-level editing
+//! doc.remove_line(0)
+//! doc.split_line(0, 8.0)                    # 拆线 / 绑线
+//! doc.bind_lines(0, 1)
+//! doc.add_bpm(180.0, 4.0)                   # BPM timeline editing
+//! doc.remove_bpm(1)
+//! doc.replace_bpm(1, 90.0, 2.0)
 //! ```
 
 use crate::core::{
@@ -71,6 +96,12 @@ impl PyChartInfo {
     #[getter]
     fn offset(&self) -> f32 { self.0.offset }
     fn __repr__(&self) -> String { format!("ChartInfo({})", self.0.name) }
+
+    /// Parse chart metadata from an RPE-export `info.txt` source string.
+    #[staticmethod]
+    fn from_info_txt(source: &str) -> Self {
+        PyChartInfo(crate::core::model::parse_info_txt(source))
+    }
 }
 
 /// BPM timeline for beat <-> time conversion.
@@ -104,21 +135,26 @@ struct PyRPEEvent {
 #[pymethods]
 impl PyRPEEvent {
     #[new]
-    #[pyo3(signature = (start=0.0, end=0.0, start_beat=0.0, end_beat=1.0, easing_type=1))]
-    fn new(start: f32, end: f32, start_beat: f64, end_beat: f64, easing_type: i32) -> Self {
-        Self {
+    #[pyo3(signature = (start=0.0, end=0.0, start_beat=0.0, end_beat=1.0, easing_type=1, easing_left=0.0, easing_right=1.0, bezier=0, bezier_points=None))]
+    fn new(start: f32, end: f32, start_beat: f64, end_beat: f64, easing_type: i32, easing_left: f32, easing_right: f32, bezier: u8, bezier_points: Option<Vec<f32>>) -> PyResult<Self> {
+        let bezier_points = match bezier_points {
+            Some(v) if v.len() == 4 => [v[0], v[1], v[2], v[3]],
+            Some(_) => return Err(EditError::BadOp("bezier_points must be a list of 4 floats".into()).into()),
+            None => [0.0; 4],
+        };
+        Ok(Self {
             inner: RPEEvent {
                 start,
                 end,
                 start_time: Triple::from_beats(start_beat),
                 end_time: Triple::from_beats(end_beat),
                 easing_type,
-                easing_left: 0.0,
-                easing_right: 1.0,
-                bezier: 0,
-                bezier_points: [0.0; 4],
+                easing_left,
+                easing_right,
+                bezier,
+                bezier_points,
             },
-        }
+        })
     }
 
     #[getter]
@@ -141,6 +177,28 @@ impl PyRPEEvent {
     fn easing_type(&self) -> i32 { self.inner.easing_type }
     #[setter]
     fn set_easing_type(&mut self, v: i32) { self.inner.easing_type = v; }
+    #[getter]
+    fn easing_left(&self) -> f32 { self.inner.easing_left }
+    #[setter]
+    fn set_easing_left(&mut self, v: f32) { self.inner.easing_left = v; }
+    #[getter]
+    fn easing_right(&self) -> f32 { self.inner.easing_right }
+    #[setter]
+    fn set_easing_right(&mut self, v: f32) { self.inner.easing_right = v; }
+    #[getter]
+    fn bezier(&self) -> u8 { self.inner.bezier }
+    #[setter]
+    fn set_bezier(&mut self, v: u8) { self.inner.bezier = v; }
+    #[getter]
+    fn bezier_points(&self) -> [f32; 4] { self.inner.bezier_points }
+    #[setter]
+    fn set_bezier_points(&mut self, v: Vec<f32>) -> PyResult<()> {
+        if v.len() != 4 {
+            return Err(EditError::BadOp("bezier_points must be a list of 4 floats".into()).into());
+        }
+        self.inner.bezier_points = [v[0], v[1], v[2], v[3]];
+        Ok(())
+    }
     fn __repr__(&self) -> String {
         format!("Event({}->{} @ {:.2}-{:.2})", self.inner.start, self.inner.end,
                 self.inner.start_time.beats(), self.inner.end_time.beats())
@@ -162,20 +220,29 @@ struct PyRPENote {
 #[pymethods]
 impl PyRPENote {
     #[new]
-    #[pyo3(signature = (kind=1, start_beat=0.0, position_x=0.0, above=true, speed=1.0, size=1.0, is_fake=false))]
-    fn new(kind: u8, start_beat: f64, position_x: f32, above: bool, speed: f32, size: f32, is_fake: bool) -> Self {
-        Self {
+    #[pyo3(signature = (kind=1, start_beat=0.0, position_x=0.0, above=true, speed=1.0, size=1.0, is_fake=false, end_beat=0.0, alpha=255, hitsound=None, tint=None))]
+    fn new(kind: u8, start_beat: f64, position_x: f32, above: bool, speed: f32, size: f32, is_fake: bool, end_beat: f64, alpha: u16, hitsound: Option<String>, tint: Option<Vec<u8>>) -> PyResult<Self> {
+        let tint = match tint {
+            Some(v) if v.len() == 3 => Some([v[0], v[1], v[2]]),
+            Some(_) => return Err(EditError::BadOp("tint must be a list of 3 bytes (r, g, b)".into()).into()),
+            None => None,
+        };
+        Ok(Self {
             inner: RPENote {
                 kind,
                 start_time: Triple::from_beats(start_beat),
+                end_time: Triple::from_beats(end_beat),
                 position_x,
                 above: if above { 1 } else { 0 },
                 speed,
                 size,
                 is_fake: if is_fake { 1 } else { 0 },
+                alpha,
+                hitsound,
+                tint,
                 ..Default::default()
             },
-        }
+        })
     }
 
     #[getter]
@@ -186,6 +253,10 @@ impl PyRPENote {
     fn beat(&self) -> f64 { self.inner.start_time.beats() }
     #[setter]
     fn set_beat(&mut self, v: f64) { self.inner.start_time = Triple::from_beats(v); }
+    #[getter]
+    fn end_beat(&self) -> f64 { self.inner.end_time.beats() }
+    #[setter]
+    fn set_end_beat(&mut self, v: f64) { self.inner.end_time = Triple::from_beats(v); }
     #[getter]
     fn position_x(&self) -> f32 { self.inner.position_x }
     #[setter]
@@ -210,6 +281,25 @@ impl PyRPENote {
     fn is_fake(&self) -> bool { self.inner.is_fake != 0 }
     #[setter]
     fn set_is_fake(&mut self, v: bool) { self.inner.is_fake = if v { 1 } else { 0 }; }
+    #[getter]
+    fn alpha(&self) -> u16 { self.inner.alpha }
+    #[setter]
+    fn set_alpha(&mut self, v: u16) { self.inner.alpha = v; }
+    #[getter]
+    fn hitsound(&self) -> Option<String> { self.inner.hitsound.clone() }
+    #[setter]
+    fn set_hitsound(&mut self, v: Option<String>) { self.inner.hitsound = v; }
+    #[getter]
+    fn tint(&self) -> Option<[u8; 3]> { self.inner.tint }
+    #[setter]
+    fn set_tint(&mut self, v: Option<Vec<u8>>) -> PyResult<()> {
+        self.inner.tint = match v {
+            Some(v) if v.len() == 3 => Some([v[0], v[1], v[2]]),
+            Some(_) => return Err(EditError::BadOp("tint must be a list of 3 bytes (r, g, b)".into()).into()),
+            None => None,
+        };
+        Ok(())
+    }
     #[getter]
     fn visible_time(&self) -> f64 { self.inner.visible_time }
     #[setter]
@@ -298,6 +388,47 @@ impl PyRPEChart {
             .map(|jl| PyRPEJudgeLine { inner: jl.clone() })
             .collect()
     }
+
+    /// Serialize to RPE JSON (the standard Phigros chart format).
+    fn to_json(&self) -> PyResult<String> {
+        Ok(serde_json::to_string(&self.inner).map_err(EditError::from)?)
+    }
+
+    /// Parse from an RPE JSON string.
+    #[staticmethod]
+    fn from_json(json: &str) -> PyResult<Self> {
+        let chart: RPEChart = serde_json::from_str(json).map_err(EditError::from)?;
+        Ok(Self { inner: chart })
+    }
+
+    /// Serialize to PSS stream bytes (Phimakor Streamable Sheet, NDJSON).
+    fn to_pss(&self) -> PyResult<Vec<u8>> {
+        Ok(crate::core::stream::to_stream_bytes(&self.inner, &ChartInfo::default())
+            .map_err(|e| EditError::BadOp(format!("{e}")))?)
+    }
+
+    /// Parse from PSS stream bytes.
+    #[staticmethod]
+    fn from_pss(bytes: Vec<u8>) -> PyResult<Self> {
+        let (chart, _info) = crate::core::stream::from_stream_bytes(&bytes)
+            .map_err(|e| EditError::BadOp(format!("{e}")))?;
+        Ok(Self { inner: chart })
+    }
+
+    /// BPM timeline as `(bpm, beat)` pairs, sorted by beat.
+    fn bpm_list(&self) -> Vec<(f64, f64)> {
+        self.inner.bpm_list.iter()
+            .map(|b| (b.bpm, b.start_time.beats()))
+            .collect()
+    }
+
+    /// Chart offset in milliseconds.
+    #[getter]
+    fn offset(&self) -> i32 { self.inner.meta.offset }
+
+    /// RPE version of this chart (160 / 170).
+    #[getter]
+    fn rpe_version(&self) -> i32 { self.inner.meta.rpe_version }
 }
 
 /// One frame of evaluated chart state.
@@ -413,6 +544,16 @@ impl PyChart {
         Ok(Self { inner: chart })
     }
 
+    /// Build an evaluation engine from an in-memory [`RPEChart`] — no chart
+    /// directory needed. Perfect for programmatically generated charts.
+    #[staticmethod]
+    #[pyo3(signature = (rpe, use_rpe_170_speed=false))]
+    fn from_rpe_chart(rpe: &PyRPEChart, use_rpe_170_speed: bool) -> PyResult<Self> {
+        let chart = Chart::from_rpe_chart(&rpe.inner, use_rpe_170_speed)
+            .map_err(|e| EditError::BadOp(format!("{e}")))?;
+        Ok(Self { inner: chart })
+    }
+
     fn state_at(&mut self, time: f64) -> PyFrameState {
         let s = self.inner.state_at(time);
         PyFrameState {
@@ -437,6 +578,15 @@ impl PyChart {
     fn line_name(&self, i: usize) -> Option<&str> {
         if i < self.inner.line_count() { Some(self.inner.line_name(i)) } else { None }
     }
+
+    /// Maximum combo: every non-fake note's head, plus every non-fake hold's tail.
+    fn max_combo(&self) -> usize { self.inner.max_combo() }
+
+    /// Notes (and hold tails) with time <= `time` — cumulative hit count.
+    fn hits_before(&self, time: f64) -> usize { self.inner.hits_before(time) }
+
+    /// Distinct non-`line.png` texture filenames used by the judge lines.
+    fn textures(&self) -> Vec<String> { self.inner.textures() }
 }
 
 /// Editor session with undo/redo and background autosave.
@@ -497,6 +647,73 @@ impl PyChartDocument {
             .map(|e| PyRPEEvent { inner: e }).map_err(|e| PyErr::from(e))
     }
 
+    /// Replaces the note at (line, index), returning the old one.
+    fn replace_note(&mut self, line: usize, index: usize, note: &PyRPENote) -> PyResult<PyRPENote> {
+        self.inner.replace_note(line, index, note.inner.clone())
+            .map(PyRPENote::from).map_err(|e| PyErr::from(e))
+    }
+
+    /// 拆线: splits `line` at `at_beats` — notes/events at/after the point
+    /// move to a new line inserted right after it. Returns the new line's index.
+    fn split_line(&mut self, line: usize, at_beats: f64) -> PyResult<usize> {
+        self.inner.split_line(line, at_beats).map_err(|e| PyErr::from(e))
+    }
+
+    /// 绑线: merges `source`'s notes and events into `target`, then removes `source`.
+    fn bind_lines(&mut self, target: usize, source: usize) -> PyResult<()> {
+        self.inner.bind_lines(target, source).map_err(|e| PyErr::from(e))
+    }
+
+    /// Appends a new empty judge line. Returns its index.
+    #[pyo3(signature = (name, texture="line.png"))]
+    fn add_line(&mut self, name: String, texture: &str) -> PyResult<usize> {
+        self.inner.add_line(name, texture.to_string()).map_err(|e| PyErr::from(e))
+    }
+
+    /// Removes the judge line at `index`, returning it. Lines fathered to it
+    /// become fatherless; lines beyond it shift down one.
+    fn remove_line(&mut self, index: usize) -> PyResult<PyRPEJudgeLine> {
+        self.inner.remove_line(index)
+            .map(|l| PyRPEJudgeLine { inner: l })
+            .map_err(|e| PyErr::from(e))
+    }
+
+    /// Inserts a BPM change point at `beat`, keeping the list sorted.
+    /// Returns the inserted index.
+    fn add_bpm(&mut self, bpm: f64, beat: f64) -> PyResult<usize> {
+        self.inner.add_bpm(bpm, beat).map_err(|e| PyErr::from(e))
+    }
+
+    /// Removes the BPM entry at `index`, returning it as `(bpm, beat)`.
+    /// Refuses to remove the last remaining entry.
+    fn remove_bpm(&mut self, index: usize) -> PyResult<(f64, f64)> {
+        self.inner.remove_bpm(index)
+            .map(|it| (it.bpm, it.start_time.beats()))
+            .map_err(|e| PyErr::from(e))
+    }
+
+    /// Replaces the BPM entry at `index`, returning the old `(bpm, beat)`.
+    fn replace_bpm(&mut self, index: usize, bpm: f64, beat: f64) -> PyResult<(f64, f64)> {
+        self.inner.replace_bpm(index, bpm, beat)
+            .map(|it| (it.bpm, it.start_time.beats()))
+            .map_err(|e| PyErr::from(e))
+    }
+
+    /// Current BPM timeline as `(bpm, beat)` pairs.
+    fn bpm_list(&self) -> Vec<(f64, f64)> {
+        self.inner.chart().bpm_list.iter()
+            .map(|b| (b.bpm, b.start_time.beats()))
+            .collect()
+    }
+
+    /// Hand the current chart to the background save thread (written within ~1s).
+    fn save_background(&mut self) { self.inner.save_background(); }
+
+    /// Block until the last background save has been written to disk.
+    fn flush(&mut self) -> PyResult<()> {
+        self.inner.flush().map_err(|e| PyErr::from(e))
+    }
+
     fn undo(&mut self) -> bool { self.inner.undo() }
     fn redo(&mut self) -> bool { self.inner.redo() }
     fn can_undo(&self) -> bool { self.inner.can_undo() }
@@ -551,11 +768,26 @@ fn detect_format(path: &str) -> PyResult<String> {
     Ok(crate::core::chart_format::detect_format(&bytes).to_string())
 }
 
+/// Detect chart format from raw bytes (no file system needed).
+#[pyfunction]
+fn detect_format_bytes(bytes: Vec<u8>) -> String {
+    crate::core::chart_format::detect_format(&bytes).to_string()
+}
+
 /// Parse a chart file (raw RPE/PEC/PGR/PSS bytes) into an [`RPEChart`].
 #[pyfunction]
 fn parse_chart(format: &str, path: &str) -> PyResult<PyRPEChart> {
     let bytes = std::fs::read(std::path::Path::new(path))
         .map_err(|e| EditError::BadOp(format!("{e}")))?;
+    let info = ChartInfo::default();
+    let chart = crate::core::chart_format::parse_chart(format, &bytes, &info)
+        .map_err(|e| EditError::BadOp(format!("{e}")))?;
+    Ok(PyRPEChart { inner: chart })
+}
+
+/// Parse chart bytes into an [`RPEChart`] (no file system needed).
+#[pyfunction]
+fn parse_chart_bytes(format: &str, bytes: Vec<u8>) -> PyResult<PyRPEChart> {
     let info = ChartInfo::default();
     let chart = crate::core::chart_format::parse_chart(format, &bytes, &info)
         .map_err(|e| EditError::BadOp(format!("{e}")))?;
@@ -578,6 +810,8 @@ pub fn register(m: &Bound<'_, pyo3::types::PyModule>) -> PyResult<()> {
     m.add_class::<PyExtraRoot>()?;
     m.add_class::<PyEvalEffect>()?;
     m.add_function(wrap_pyfunction!(detect_format, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_format_bytes, m)?)?;
     m.add_function(wrap_pyfunction!(parse_chart, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_chart_bytes, m)?)?;
     Ok(())
 }
