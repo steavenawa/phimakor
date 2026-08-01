@@ -38,6 +38,9 @@ pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }
 [dev-dependencies]
 criterion = "*"
 
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
 [[bench]]
 name = "extract"
 harness = false
