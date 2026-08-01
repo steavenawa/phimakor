@@ -76,8 +76,14 @@ pub(crate) struct CachedText {
     size: [f32; 2],
 }
 
+impl Clone for CachedText {
+    fn clone(&self) -> Self {
+        Self { bind_group: self.bind_group.clone(), size: self.size }
+    }
+}
+
 pub(crate) struct PendingText {
-    key: (String, u8),
+    entry: CachedText,
     /// Quad center, canvas px (unused for viewport-edge anchors).
     pos: [f32; 2],
     /// Rotation in radians around the quad center (world text only).
@@ -90,6 +96,15 @@ pub(crate) struct PendingText {
     anchor: TextAnchor,
 }
 
+/// Pre-rasterized digit glyphs (0-9) for one px size. Dynamic numbers
+/// (score / combo) are composed per frame by blitting these bitmaps — no
+/// per-string GPU textures, so playback/seek can't leak memory.
+struct DigitGlyphs {
+    /// `(metrics, bitmap)` for '0'..='9', in order.
+    glyphs: Vec<(fontdue::Metrics, Vec<u8>)>,
+    line_h: usize,
+    baseline: f32,
+}
 /// Font handle + line cache + per-frame pending queue.
 pub(crate) struct TextState {
     /// `None` = load not attempted; `Some(None)` = failed (permanent no-op).
@@ -100,6 +115,8 @@ pub(crate) struct TextState {
     cjk_font: Option<Option<fontdue::Font>>,
     /// Field-split with `pending` for `push_text`; pub(crate) for mod.rs.
     pub(crate) cache: HashMap<(String, u8), CachedText>,
+    /// Digit sprite sets by rasterization px (`(px*100) as u32`).
+    digits: HashMap<u32, DigitGlyphs>,
     pub(crate) pending: Vec<PendingText>,
 }
 
@@ -109,6 +126,7 @@ impl TextState {
             font: None,
             cjk_font: None,
             cache: HashMap::new(),
+            digits: HashMap::new(),
             pending: Vec::new(),
         }
     }
@@ -175,8 +193,7 @@ fn rasterize_line(
 
     // Pick the font per glyph: fall back to the CJK font when the main font
     // has no glyph for the character (lookup_glyph_index == 0 = missing).
-    let mut glyphs: Vec<(fontdue::Metrics, Vec<u8>, &fontdue::Font)> = Vec::with_capacity(text.len());
-    for c in text.chars() {
+    let glyphs: Vec<(fontdue::Metrics, Vec<u8>)> = text.chars().map(|c| {
         let f = if font.lookup_glyph_index(c) == 0 {
             match cjk {
                 Some(cjk) if cjk.lookup_glyph_index(c) != 0 => cjk,
@@ -185,21 +202,37 @@ fn rasterize_line(
         } else {
             font
         };
-        glyphs.push((f.rasterize(c, px).0, f.rasterize(c, px).1, f));
-    }
+        f.rasterize(c, px)
+    }).collect();
     let line_w = glyphs
         .iter()
-        .map(|(m, _, _)| m.advance_width)
+        .map(|(m, _)| m.advance_width)
         .sum::<f32>()
         .ceil()
         .max(1.0) as usize;
+    let gray = blit_glyphs(glyphs.iter().map(|(m, b)| (m, b.as_slice())), line_h, baseline);
+    Some(upload_gray_line(device, queue, tex_bgl, sampler, gray, line_w, line_h))
+}
 
-    // fontdue Metrics: xmin = bitmap left edge from pen origin; ymin = bitmap
-    // BOTTOM edge above the baseline (y up). In image space (y down):
-    // bitmap top = baseline - ymin - height.
+/// Blit glyph bitmaps into a line-height gray buffer (max coverage, so
+/// overlapping glyphs merge). fontdue Metrics: xmin = bitmap left edge from
+/// pen origin; ymin = bitmap BOTTOM edge above the baseline (y up). In
+/// image space (y down): bitmap top = baseline - ymin - height.
+fn blit_glyphs<'a>(
+    glyphs: impl IntoIterator<Item = (&'a fontdue::Metrics, &'a [u8])>,
+    line_h: usize,
+    baseline: f32,
+) -> Vec<u8> {
+    let glyphs: Vec<(&'a fontdue::Metrics, &'a [u8])> = glyphs.into_iter().collect();
+    let line_w = glyphs
+        .iter()
+        .map(|(m, _)| m.advance_width)
+        .sum::<f32>()
+        .ceil()
+        .max(1.0) as usize;
     let mut gray = vec![0u8; line_w * line_h];
     let mut pen_x = 0.0f32;
-    for (m, bitmap, _) in &glyphs {
+    for (m, bitmap) in &glyphs {
         let gx0 = pen_x.round() as i32 + m.xmin;
         let gy0 = (baseline - m.ymin as f32 - m.height as f32).round() as i32;
         for gy in 0..m.height as i32 {
@@ -221,21 +254,99 @@ fn rasterize_line(
         }
         pen_x += m.advance_width;
     }
+    gray
+}
 
+/// Turn a gray line buffer into a white×alpha texture + bind group (rows
+/// flipped: the quad pipeline expects v=0 = image bottom).
+fn upload_gray_line(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex_bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    gray: Vec<u8>,
+    line_w: usize,
+    line_h: usize,
+) -> (wgpu::BindGroup, [f32; 2]) {
     let rgba: Vec<u8> = gray.iter().flat_map(|a| [255, 255, 255, *a]).collect();
-    // create_texture uploads raw (no flip), but the quad pipeline expects
-    // v=0 = image bottom (everywhere else uses upload_image's flip): flip rows.
     let row = line_w * 4;
     let flipped: Vec<u8> = rgba.chunks(row).rev().flat_map(|r| r.iter().copied()).collect();
     let texture = Renderer::create_texture(device, queue, &flipped, line_w as u32, line_h as u32);
     let bind_group = Renderer::texture_bind_group(device, tex_bgl, sampler, &texture);
-    Some((bind_group, [line_w as f32, line_h as f32]))
+    (bind_group, [line_w as f32, line_h as f32])
+}
+
+/// All-ASCII-digits string (score / combo numbers).
+fn is_digits(text: &str) -> bool {
+    !text.is_empty() && text.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Compose a digit string from pre-rasterized 0-9 glyphs into one texture.
+/// Loads fonts / builds the glyph set lazily from `state` (no external font
+/// borrows), and never caches per-string textures — cheap per-frame blits,
+/// so dynamic numbers (score/combo) can't leak GPU memory.
+fn compose_digits(
+    state: &mut TextState,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex_bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    px: f32,
+    text: &str,
+) -> Option<(wgpu::BindGroup, [f32; 2])> {
+    if state.font.is_none() {
+        state.font = Some(load_font());
+    }
+    let font = state.font.as_ref().and_then(|f| f.as_ref())?;
+    if state.cjk_font.is_none() {
+        state.cjk_font = Some(load_cjk_font());
+    }
+    let cjk = state.cjk_font.as_ref().and_then(|f| f.as_ref());
+    let key = (px * 100.0) as u32;
+    if !state.digits.contains_key(&key) {
+        let lm = font.horizontal_line_metrics(px)?;
+        let (mut line_h, mut baseline) = ((lm.ascent - lm.descent).ceil().max(1.0) as usize, lm.ascent);
+        if let Some(cjk) = cjk {
+            if let Some(clm) = cjk.horizontal_line_metrics(px) {
+                let clm_h = (clm.ascent - clm.descent).ceil().max(1.0) as usize;
+                if clm_h > line_h {
+                    baseline += (clm_h - line_h) as f32;
+                    line_h = clm_h;
+                }
+            }
+        }
+        let mut glyphs = Vec::with_capacity(10);
+        for c in '0'..='9' {
+            let f = if font.lookup_glyph_index(c) == 0 {
+                match cjk {
+                    Some(cjk) if cjk.lookup_glyph_index(c) != 0 => cjk,
+                    _ => font,
+                }
+            } else {
+                font
+            };
+            glyphs.push(f.rasterize(c, px));
+        }
+        state.digits.insert(key, DigitGlyphs { glyphs, line_h, baseline });
+    }
+    let ds = &state.digits[&key];
+    let line_w = text.chars()
+        .map(|c| ds.glyphs[(c as u8 - b'0') as usize].0.advance_width)
+        .sum::<f32>()
+        .ceil()
+        .max(1.0) as usize;
+    let gray = blit_glyphs(text.chars().map(|c| {
+        let i = (c as u8 - b'0') as usize;
+        (&ds.glyphs[i].0, ds.glyphs[i].1.as_slice())
+    }), ds.line_h, ds.baseline);
+    Some(upload_gray_line(device, queue, tex_bgl, sampler, gray, line_w, ds.line_h))
 }
 
 impl Renderer {
     /// Queue a text line for this frame. First call with a given
     /// `(text, anchor)` rasterizes and caches; repeats are cache hits.
-    /// Silent no-op if no usable font was found.
+    /// Digit-only strings are composed per frame from pre-rasterized glyphs
+    /// (no caching). Silent no-op if no usable font was found.
     pub fn draw_text(&mut self, text: &str, anchor: TextAnchor, color: [f32; 4]) {
         draw_text_queued(
             &mut self.text,
@@ -293,25 +404,38 @@ pub(crate) fn draw_text_queued(
     scale: f32,
     color: [f32; 4],
 ) {
-    let key = (text.to_string(), anchor as u8);
-    if !text_state.cache.contains_key(&key) {
-        if text_state.font.is_none() {
-            text_state.font = Some(load_font());
-        }
-        let Some(font) = text_state.font.as_ref().and_then(|f| f.as_ref()) else {
-            return;
-        };
-        if text_state.cjk_font.is_none() {
-            text_state.cjk_font = Some(load_cjk_font());
-        }
-        let cjk = text_state.cjk_font.as_ref().and_then(|f| f.as_ref());
-        let (px, _, _) = anchor.layout(aspect);
-        let Some((bind_group, size)) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px, cjk) else {
-            return;
-        };
-        text_state.cache.insert(key.clone(), CachedText { bind_group, size });
+    if text_state.font.is_none() {
+        text_state.font = Some(load_font());
     }
-    let entry = &text_state.cache[&key];
+    let Some(font) = text_state.font.as_ref().and_then(|f| f.as_ref()) else {
+        return;
+    };
+    if text_state.cjk_font.is_none() {
+        text_state.cjk_font = Some(load_cjk_font());
+    }
+    let cjk = text_state.cjk_font.as_ref().and_then(|f| f.as_ref());
+    let (px, _, _) = anchor.layout(aspect);
+    let entry = if is_digits(text) {
+        // Dynamic numbers: compose from pre-rasterized digits, no cache.
+        let Some((bind_group, size)) = compose_digits(text_state, device, queue, tex_bgl, sampler, px, text) else {
+            return;
+        };
+        CachedText { bind_group, size }
+    } else {
+        // Static text: rasterize once and cache (capped as a safety net).
+        let key = (text.to_string(), anchor as u8);
+        if !text_state.cache.contains_key(&key) {
+            let Some((bind_group, size)) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px, cjk) else {
+                return;
+            };
+            text_state.cache.insert(key.clone(), CachedText { bind_group, size });
+            if text_state.cache.len() > 1024 {
+                let keep = key.clone();
+                text_state.cache.retain(|k, _| k == &keep);
+            }
+        }
+        text_state.cache[&key].clone()
+    };
     let (_, halign, top) = anchor.layout(aspect);
     let cx = match halign {
         HAlign::Left(l) => l + entry.size[0] * 0.5,
@@ -319,7 +443,7 @@ pub(crate) fn draw_text_queued(
         HAlign::Right(r) => r - entry.size[0] * 0.5,
     };
     let pos = [cx + offset[0], top + entry.size[1] * 0.5 + offset[1]];
-    text_state.pending.push(PendingText { key, pos, rotation, scale, color, viewport_edge: anchor.is_viewport_edge(), anchor });
+    text_state.pending.push(PendingText { entry, pos, rotation, scale, color, viewport_edge: anchor.is_viewport_edge(), anchor });
 }
 
 /// Free-positioned text (attachUI labels): centered at `pos` (canvas px),
@@ -339,8 +463,13 @@ pub(crate) fn draw_text_world(
     color: [f32; 4],
 ) {
     let anchor = TextAnchor::World;
-    let key = (text.to_string(), anchor as u8);
-    if !text_state.cache.contains_key(&key) {
+    let (px, _, _) = anchor.layout(aspect);
+    let entry = if is_digits(text) {
+        let Some((bind_group, size)) = compose_digits(text_state, device, queue, tex_bgl, sampler, px, text) else {
+            return;
+        };
+        CachedText { bind_group, size }
+    } else {
         if text_state.font.is_none() {
             text_state.font = Some(load_font());
         }
@@ -351,71 +480,64 @@ pub(crate) fn draw_text_world(
             text_state.cjk_font = Some(load_cjk_font());
         }
         let cjk = text_state.cjk_font.as_ref().and_then(|f| f.as_ref());
-        let (px, _, _) = anchor.layout(aspect);
-        let Some((bind_group, size)) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px, cjk) else {
-            return;
-        };
-        text_state.cache.insert(key.clone(), CachedText { bind_group, size });
-    }
-    text_state.pending.push(PendingText { key, pos, rotation, scale: 1.0, color, viewport_edge: false, anchor });
+        let key = (text.to_string(), anchor as u8);
+        if !text_state.cache.contains_key(&key) {
+            let Some((bind_group, size)) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px, cjk) else {
+                return;
+            };
+            text_state.cache.insert(key.clone(), CachedText { bind_group, size });
+            if text_state.cache.len() > 1024 {
+                let keep = key.clone();
+                text_state.cache.retain(|k, _| k == &keep);
+            }
+        }
+        text_state.cache[&key].clone()
+    };
+    text_state.pending.push(PendingText { entry, pos, rotation, scale: 1.0, color, viewport_edge: false, anchor });
 }
 
-/// Flush the pending text queue into `cmds` (called from `render`, after hit
-/// effects). Field-split borrows: `cmds` may hold shared borrows of `cache`.
+/// Flush the pending text queue into `cmds` (called at the end of
+/// `draw_to_view`, after hit effects). The queue was cleared at the START of
+/// the frame (before any text was queued), so every entry here is current.
 /// `window` = surface size in px, for viewport-edge anchors.
 pub(crate) fn push_text<'a>(
-    pending: &mut Vec<PendingText>,
-    cache: &'a HashMap<(String, u8), CachedText>,
+    pending: &'a mut Vec<PendingText>,
     cmds: &mut Vec<DrawCmd<'a>>,
     letterbox: &Mat3,
     window: [f32; 2],
 ) {
     const MARGIN: f32 = 16.0; // px from viewport edges
     for pt in pending.iter() {
-        if let Some(entry) = cache.get(&pt.key) {
-            let sx = entry.size[0] * pt.scale;
-            let sy = entry.size[1] * pt.scale;
-            let model = if pt.viewport_edge {
-                let sx = sx * 2.0 / window[0];
-                let sy = sy * 2.0 / window[1];
-                let cx = match pt.anchor {
-                    TextAnchor::BottomLeftEdge => -1.0 + (MARGIN + sx * 0.5) * 2.0 / window[0],
-                    _ => 1.0 - (MARGIN + sx * 0.5) * 2.0 / window[0],
-                };
-                let cy = -1.0 + (MARGIN + sy * 0.5) * 2.0 / window[1];
-                mat_mul(&mat_translate(cx, cy), &mat_scale(sx, sy))
-            } else if pt.anchor == TextAnchor::World {
-                mat_mul(
-                    letterbox,
-                    &mat_mul(
-                        &mat_translate(pt.pos[0], pt.pos[1]),
-                        &mat_mul(
-                            &mat_rotate(pt.rotation),
-                            &mat_scale(sx, sy),
-                        ),
-                    ),
-                )
-            } else {
-                mat_mul(
-                    letterbox,
-                    &mat_mul(
-                        &mat_translate(pt.pos[0], pt.pos[1]),
-                        &mat_mul(
-                            &mat_rotate(pt.rotation),
-                            &mat_scale(sx, sy),
-                        ),
-                    ),
-                )
+        let sx = pt.entry.size[0] * pt.scale;
+        let sy = pt.entry.size[1] * pt.scale;
+        let model = if pt.viewport_edge {
+            let sx = sx * 2.0 / window[0];
+            let sy = sy * 2.0 / window[1];
+            let cx = match pt.anchor {
+                TextAnchor::BottomLeftEdge => -1.0 + (MARGIN + sx * 0.5) * 2.0 / window[0],
+                _ => 1.0 - (MARGIN + sx * 0.5) * 2.0 / window[0],
             };
-            cmds.push(DrawCmd {
-                uniform: DrawUniform {
-                    model,
-                    color: pt.color,
-                    uv_rect: [0., 0., 1., 1.],
-                },
-                tex: &entry.bind_group,
-            });
-        }
+            let cy = -1.0 + (MARGIN + sy * 0.5) * 2.0 / window[1];
+            mat_mul(&mat_translate(cx, cy), &mat_scale(sx, sy))
+        } else {
+            mat_mul(
+                letterbox,
+                &mat_mul(
+                    &mat_translate(pt.pos[0], pt.pos[1]),
+                    &mat_mul(
+                        &mat_rotate(pt.rotation),
+                        &mat_scale(sx, sy),
+                    ),
+                ),
+            )
+        };
+        cmds.push(DrawCmd {
+            uniform: DrawUniform {
+                model,
+                color: pt.color,
+                uv_rect: [0., 0., 1., 1.],
+            },
+            tex: &pt.entry.bind_group,
+        });
     }
-    pending.clear();
 }

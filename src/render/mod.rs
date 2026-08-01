@@ -833,6 +833,10 @@ impl Renderer {
         ui_iced: Option<&wgpu::BindGroup>,
     ) {
         let _s = crate::trace_span!("draw_to_view");
+        // Text queue is per-frame: drop last frame's entries before any new
+        // text is queued (push_text borrows them for the frame's cmds, so
+        // they can't be cleared after).
+        self.text.pending.clear();
         // ── Coordinate model ──────────────────────────────────────────────
         // The RPE canvas is 1350×900 px (x ±675, y ±450). The playfield fills
         // the window at ANY playfield aspect (Tab cycles 3:2 → 16:9 → 4:3 →
@@ -1198,8 +1202,9 @@ impl Renderer {
                 );
             };
 
-            // Score (top-left)
-            el("score", &format!("{}", hud.score), TextAnchor::TopLeft);
+            // Score (top-left): fixed 7-digit zero-padded, so it starts at
+            // "0000000" and counts up without shifting.
+            el("score", &format!("{:07}", hud.score), TextAnchor::TopLeft);
             // Combo: number top-center + "COMBO" caption below, only >= 3
             // (RPE/Phigros behavior: combo hidden until the 3rd).
             if hud.combo >= 3 {
@@ -1371,7 +1376,6 @@ impl Renderer {
         // Text overlay (Phaser UI), on top of everything; queue is per-frame.
         text::push_text(
             &mut self.text.pending,
-            &self.text.cache,
             &mut cmds,
             &letterbox,
             [self.size[0] as f32, self.size[1] as f32],
