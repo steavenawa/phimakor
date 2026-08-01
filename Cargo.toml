@@ -16,6 +16,7 @@ crate-type = ["cdylib", "rlib"]
 anyhow = "*"
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
+serde_yaml = "0.9"
 winit = "*"
 wgpu = "*"
 pollster = "*"
@@ -30,6 +31,7 @@ tiny-skia = "*"
 tracing = "*"
 tracing-subscriber = { version = "*", features = ["env-filter", "time", "registry"] }
 tracing-flame = "*"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 dhat = { version = "*", optional = true }
 tracy-client = { version = "*", optional = true }
 pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }

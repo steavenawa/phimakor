@@ -45,7 +45,11 @@ const EVENT_X_OFFSET: f32 = 1.0;
 /// (900 px tall) fills the playfield at any aspect, while sprites keep a
 /// uniform pixel scale (no texture distortion).
 const Y_STRETCH: f32 = CANVAS_W / CANVAS_H; // = 1.5
-const LINE_LEN: f32 = 6.0 * CANVAS_W; // built-in line quad length
+/// Built-in line quad FULL length at the default `line_length = 6.0`:
+/// phira draws `draw_line(-len, 0, len, 0)` (half-length `len` in world
+/// units, 675 canvas px per world unit) → full length 2×len×675 = 8100 px.
+/// [`Renderer::set_line_length`] scales this per chart (info.yml `lineLength`).
+const LINE_LEN: f32 = 2.0 * 6.0 * CANVAS_W; // built-in line quad length
 const LINE_THICK: f32 = 0.01 * CANVAS_H; // built-in line quad thickness
 const NOTE_W: f32 = 0.22 * CANVAS_W; // note quad width factor (× note.scale)
 const NOTE_H: f32 = 0.03 * CANVAS_H; // note quad height factor (× note.scale)
@@ -371,6 +375,8 @@ pub struct Renderer {
     background_dim: f32,
     /// Playfield canvas aspect (w/h), hotkey-switchable.
     playfield_aspect: f32,
+    /// Judge-line length multiplier (info.yml `lineLength`, default 6.0).
+    line_length: f32,
     /// Playback progress 0..1 for the top progress bar.
     progress: f32,
     /// Phigros-style HUD (song/difficulty/score/combo/pause) drawn each frame.
@@ -579,6 +585,7 @@ impl Renderer {
             background: None,
             background_dim: 1.0,
             playfield_aspect: ASPECT,
+            line_length: 6.0,
             progress: 0.0,
             hud: HudData::default(),
             pause_rect: PauseHitRect::default(),
@@ -747,6 +754,15 @@ impl Renderer {
     /// Update the top progress bar (0..1).
     pub fn set_progress(&mut self, progress: f32) {
         self.progress = progress.clamp(0.0, 1.0);
+    }
+
+    /// Set the judge-line length multiplier (info.yml `lineLength`). The
+    /// built-in line's full length = 2 × line_length × 675 canvas px, matching
+    /// phira's `draw_line(-len, 0, len, 0)` under the world scale.
+    pub fn set_line_length(&mut self, length: f32) {
+        if length > 0.0 {
+            self.line_length = length;
+        }
     }
 
     /// Update the HUD contents for this frame (song name / difficulty /
@@ -926,7 +942,7 @@ impl Renderer {
                     let c = line.color;
                     cmds.push(DrawCmd {
                         uniform: DrawUniform {
-                            model: mat_mul(&line_m, &mat_scale(LINE_LEN, LINE_THICK)),
+                                model: mat_mul(&line_m, &mat_scale(LINE_LEN * self.line_length / 6.0, LINE_THICK)),
                             color: [c[0], c[1], c[2], c[3] * line_alpha],
                             uv_rect: [0., 0., 1., 1.],
                         },
@@ -962,7 +978,7 @@ impl Renderer {
                         // Fallback: draw default white bar if texture not found
                         cmds.push(DrawCmd {
                             uniform: DrawUniform {
-                                model: mat_mul(&line_m, &mat_scale(LINE_LEN, LINE_THICK)),
+                            model: mat_mul(&line_m, &mat_scale(LINE_LEN * self.line_length / 6.0, LINE_THICK)),
                                 color: [c[0], c[1], c[2], c[3] * line_alpha],
                                 uv_rect: [0., 0., 1., 1.],
                             },

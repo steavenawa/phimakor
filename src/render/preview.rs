@@ -241,6 +241,11 @@ impl PreviewEngine {
         self.renderer.set_hud(hud);
     }
 
+    /// Set the judge-line length multiplier (delegates to [`Renderer::set_line_length`]).
+    pub fn set_line_length(&mut self, length: f32) {
+        self.renderer.set_line_length(length);
+    }
+
     /// Read-only access to the last rendered RGBA frame.
     pub fn pixels(&self) -> &[u8] { &self.pixels }
 

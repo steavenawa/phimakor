@@ -68,6 +68,7 @@ impl ChartSession {
     pub fn load(&mut self, dir: &std::path::Path) -> Result<()> {
         let res_dir = std::path::PathBuf::from("res");
         let (info, chart) = core::chart::Chart::load(dir)?;
+        self.engine.set_line_length(info.line_length);
 
         // Load textures referenced by the chart
         for name in chart.textures() {

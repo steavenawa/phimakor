@@ -372,6 +372,88 @@ pub struct ChartInfo {
     pub chart_updated: Option<String>,
 }
 
+/// YAML info file (`info.yml`) adapter — the RPE web-export metadata format.
+/// Field names follow the actual `info.yml` convention (a mix of snake_case
+/// and camelCase), so each is renamed explicitly.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct InfoYaml {
+    pub id: Option<i32>,
+    pub uploader: Option<i32>,
+    pub name: String,
+    pub difficulty: f32,
+    pub level: String,
+    pub charter: String,
+    pub composer: String,
+    pub illustrator: String,
+    pub chart: String,
+    pub format: Option<ChartFormat>,
+    pub music: String,
+    pub illustration: String,
+    #[serde(rename = "unlockVideo")]
+    pub unlock_video: Option<String>,
+    #[serde(rename = "previewStart")]
+    pub preview_start: f32,
+    #[serde(rename = "previewEnd")]
+    pub preview_end: Option<f32>,
+    #[serde(rename = "aspectRatio")]
+    pub aspect_ratio: f32,
+    #[serde(rename = "backgroundDim")]
+    pub background_dim: f32,
+    #[serde(rename = "lineLength")]
+    pub line_length: f32,
+    pub offset: f32,
+    pub tip: Option<String>,
+    pub tags: Vec<String>,
+    pub intro: String,
+    #[serde(rename = "holdPartialCover")]
+    pub hold_partial_cover: bool,
+    #[serde(rename = "noteUniformScale")]
+    pub note_uniform_scale: bool,
+    #[serde(rename = "forceAspectRatio")]
+    pub force_aspect_ratio: bool,
+    #[serde(rename = "useRpe170Speed")]
+    pub use_rpe_170_speed: Option<bool>,
+    #[serde(rename = "useAttachUIFix")]
+    pub use_attach_ui_fix: Option<bool>,
+}
+
+impl InfoYaml {
+    /// Convert into the canonical [`ChartInfo`], filling defaults for the
+    /// fields the YAML export omits.
+    pub fn into_chart_info(self) -> ChartInfo {
+        let mut info = ChartInfo::default();
+        info.id = self.id;
+        info.uploader = self.uploader;
+        info.name = self.name;
+        info.difficulty = self.difficulty;
+        info.level = self.level;
+        info.charter = self.charter;
+        info.composer = self.composer;
+        info.illustrator = self.illustrator;
+        if !self.chart.is_empty() { info.chart = self.chart; }
+        info.format = self.format;
+        if !self.music.is_empty() { info.music = self.music; }
+        if !self.illustration.is_empty() { info.illustration = self.illustration; }
+        info.unlock_video = self.unlock_video;
+        if self.preview_start != 0.0 { info.preview_start = self.preview_start; }
+        info.preview_end = self.preview_end;
+        if self.aspect_ratio != 0.0 { info.aspect_ratio = self.aspect_ratio; }
+        info.background_dim = self.background_dim;
+        if self.line_length != 0.0 { info.line_length = self.line_length; }
+        info.offset = self.offset;
+        info.tip = self.tip;
+        if !self.tags.is_empty() { info.tags = self.tags; }
+        if !self.intro.is_empty() { info.intro = self.intro; }
+        info.hold_partial_cover = self.hold_partial_cover;
+        info.note_uniform_scale = self.note_uniform_scale;
+        info.force_aspect_ratio = self.force_aspect_ratio;
+        info.use_rpe_170_speed = self.use_rpe_170_speed;
+        info.use_attach_ui_fix = self.use_attach_ui_fix;
+        info
+    }
+}
+
 /// Parse an RPE-exported `info.txt` (`Key: Value` lines; `#` comments) into a
 /// [`ChartInfo`]. Unmapped keys (e.g. `Path`, unknowns) are silently ignored;
 /// unmapped fields keep [`ChartInfo::default`] values.

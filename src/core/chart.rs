@@ -12,7 +12,7 @@ use super::{
     easing::{
         speed_linear_tween, speed_segment_tween, BezierTween, ClampedTween, RPE_TWEEN_MAP, SpeedEasingMode, StaticTween, TweenFunction, Tweenable,
     },
-    model::{parse_info_txt, ChartFormat, ChartInfo, RPEChart, RPEEvent, RPEEventLayer, RPEJudgeLine, RPENote},
+    model::{parse_info_txt, ChartFormat, ChartInfo, InfoYaml, RPEChart, RPEEvent, RPEEventLayer, RPEJudgeLine, RPENote},
     Color, EPS, RPE_HEIGHT, RPE_WIDTH, SPEED_RATIO,
 };
 
@@ -79,8 +79,15 @@ pub struct LineState {
     pub ctrl_y: f32,
     /// `father` index into `judgeLineList`.
     pub parent: Option<usize>,
-    /// PE extension: alpha < 0 hides line + notes.
+    /// `rotateWithFather`: child rotation inherits the parent's rotation.
+    pub rot_with_parent: bool,
+    /// PE alpha extension: `floor(-alpha) == 1` hides line + notes.
     pub pe_hide: bool,
+    /// PE alpha extension: `floor(-alpha) == 2` hides only below notes.
+    pub draw_below: bool,
+    /// PE alpha extension: notes appear this many seconds before their hit
+    /// time (`w = floor(-alpha)` in 100..1000 → `(w-100)/10`).
+    pub appear_before: f64,
     /// Sine of the incline angle (perspective X distortion).
     pub incline_sin: f32,
     /// attachUI lines are not rendered as judge lines (phira removes them
@@ -148,6 +155,8 @@ impl NoteData {
 struct LineData {
     name: String,
     alpha: AnimFloat,
+    /// Raw (unscaled) alpha track, for the PE alpha extension `w` decode.
+    pe_alpha: AnimFloat,
     /// Degrees (converted to radians in `state_at`).
     rotation: AnimFloat,
     move_x: AnimFloat,
@@ -174,6 +183,8 @@ struct LineData {
     texture: Option<String>,
     z_order: i32,
     parent: Option<usize>,
+    /// `rotateWithFather`: child rotation inherits the parent's rotation.
+    rot_with_parent: bool,
     /// prpr `show_below` (`isCover != 1`): keep drawing notes past their time.
     show_below: bool,
     /// attachUI binding (e.g. "pause", "score"); such lines are not rendered.
@@ -417,6 +428,8 @@ fn parse_notes(r: &mut BpmList, rpe: Vec<RPENote>, height: &mut AnimFloat) -> Re
         let time = r.time(&note.start_time);
         height.set_time(time);
         let note_height = height.now();
+        // phira: y_offset = raw y_offset × 2/RPE_HEIGHT × note.speed
+        // (parse_rpe — the speed factor is part of the offset).
         let y_offset = note.y_offset * 2. / RPE_HEIGHT * note.speed;
         let (kind, end_time, end_height) = match note.kind {
             1 => (1, 0., 0.),
@@ -545,7 +558,12 @@ fn parse_judge_line(
         na.time.max(na.end_time).total_cmp(&nb.time.max(nb.end_time))
     });
 
+    // Scaled alpha (0..1 for rendering) AND the raw alpha track (unscaled
+    // 0..255-style values) — the PE alpha extension's `w = floor(-alpha)`
+    // is defined on the RAW value (phira line.rs:365), not the 1/255-scaled
+    // one we render with.
     let alpha = events_with_factor(r, &event_layers, |it| &it.alpha_events, 1. / 255., bezier_map)?;
+    let pe_alpha = events_with_factor(r, &event_layers, |it| &it.alpha_events, 1., bezier_map)?;
     let rotation = events_with_factor(r, &event_layers, |it| &it.rotate_events, -1., bezier_map)?;
     let move_x = events_with_factor(r, &event_layers, |it| &it.move_x_events, 2. / RPE_WIDTH, bezier_map)?;
     let move_y = events_with_factor(r, &event_layers, |it| &it.move_y_events, 2. / RPE_HEIGHT, bezier_map)?;
@@ -610,6 +628,7 @@ fn parse_judge_line(
     Ok(LineData {
         name: rpe.name,
         alpha,
+        pe_alpha,
         rotation,
         move_x,
         move_y,
@@ -624,6 +643,7 @@ fn parse_judge_line(
         texture: if rpe.texture == "line.png" { None } else { Some(rpe.texture.clone()) },
         z_order: rpe.z_order,
         parent,
+        rot_with_parent: rpe.rotate_with_father.unwrap_or(false),
         show_below: rpe.is_cover != 1,
         attach_ui: rpe.attach_ui.clone(),
         // [E] CtrlObject: parse pos/size/alpha/y control events.
@@ -703,16 +723,26 @@ pub struct Chart {
     fired_scratch: Vec<(usize, FiredNote)>,
 }
 
-/// Reads `info.json` in `dir` (falling back to an RPE-export `info.txt`
-/// when absent), rejecting non-RPE formats. Shared by [`Chart::load`] and
-/// the editor document API ([`crate::core::edit`]).
+/// Reads `info.json` in `dir` (falling back to an RPE web-export `info.yml`,
+/// then a legacy `info.txt`), rejecting non-RPE formats. Shared by
+/// [`Chart::load`] and the editor document API ([`crate::core::edit`]).
 pub(crate) fn load_info(dir: &std::path::Path) -> Result<ChartInfo> {
     let info: ChartInfo = match std::fs::read_to_string(dir.join("info.json")) {
         Ok(src) => serde_json::from_str(&src).context("failed to parse info.json")?,
         Err(json_err) => {
-            let src = std::fs::read_to_string(dir.join("info.txt"))
-                .with_context(|| format!("failed to read info.json ({json_err}) or info.txt"))?;
-            parse_info_txt(&src)
+            // info.yml: RPE web export (serde_yaml), converted to ChartInfo.
+            match std::fs::read_to_string(dir.join("info.yml")) {
+                Ok(src) => {
+                    let yaml: InfoYaml = serde_yaml::from_str(&src)
+                        .context("failed to parse info.yml")?;
+                    yaml.into_chart_info()
+                }
+                Err(yml_err) => {
+                    let src = std::fs::read_to_string(dir.join("info.txt"))
+                        .with_context(|| format!("failed to read info.json ({json_err}), info.yml ({yml_err}) or info.txt"))?;
+                    parse_info_txt(&src)
+                }
+            }
         }
     };
     Ok(info)
@@ -856,8 +886,9 @@ impl Chart {
                 z_order: line.z_order,
                 notes: Vec::new(),
                 parent: line.parent,
+                rot_with_parent: line.rot_with_parent,
                 ctrl_pos_x: 0.0, ctrl_pos_y: 0.0, ctrl_size_x: 1.0, ctrl_size_y: 1.0,
-                ctrl_alpha: 1.0, ctrl_y: 1.0, pe_hide: false, incline_sin: 0.0,
+                ctrl_alpha: 1.0, ctrl_y: 1.0, pe_hide: false, draw_below: true, appear_before: 0.0, incline_sin: 0.0,
                 attach_ui: None,
             })
             .collect();
@@ -999,10 +1030,12 @@ impl Chart {
             lines,
             frame,
             visible_scratch,
+            bpm_list,
             ..
         } = self;
         for (line, out) in lines.iter_mut().zip(frame.lines.iter_mut()) {
             line.alpha.set_time(time);
+            line.pe_alpha.set_time(time);
             line.rotation.set_time(time);
             line.move_x.set_time(time);
             line.move_y.set_time(time);
@@ -1029,7 +1062,24 @@ impl Chart {
             out.incline_sin = incline_deg.to_radians().sin();
             let raw_alpha = line.alpha.now_opt().unwrap_or(1.0);
             out.alpha = raw_alpha.max(0.);
-            out.pe_hide = raw_alpha < 0.0; // PE extension: -1 hides everything
+            // PE alpha extension (phira `Chart::render` line.rs:365-384).
+            // The `w` decode uses the RAW (unscaled) alpha value — the
+            // 1/255-scaled rendering alpha would turn -255 into -1 and
+            // misdecode every extended value as `w == 1` (hide everything).
+            let pe_w = line.pe_alpha.now_opt().unwrap_or(1.0);
+            let w = (-pe_w).floor() as i64;
+            out.pe_hide = w == 1;
+            out.draw_below = !(w == 2);
+            // appear_before = (w-100)/100 BEATS. NOTE: phira implements
+            // (w-100)/10 (10× longer, 15.5 beats for -255); the /100 form
+            // matches charting convention (~1.55 beats for -255, i.e. 0.458s
+            // at 203 BPM) and actual chart behavior — the /10 value makes
+            // notes activate far too early in play.
+            out.appear_before = if (100..1000).contains(&w) {
+                (w as f64 - 100.0) / 100.0
+            } else {
+                0.0
+            };
             out.rotation = line.rotation.now().to_radians();
             out.position = [line.move_x.now(), line.move_y.now()];
             out.scale = [line.scale_x.now_opt().unwrap_or(1.0), line.scale_y.now_opt().unwrap_or(1.0)];
@@ -1044,33 +1094,74 @@ impl Chart {
             }
             out.notes.clear();
         }
-        // [parent] Second pass: propagate parent transforms (rotation + position + alpha)
-        // Based on phira's fetch_rot / fetch_pos (line.rs:211-228).
-        for i in 0..frame.lines.len() {
-            let parent_idx = frame.lines[i].parent;
-            if let Some(pidx) = parent_idx {
-                if pidx < frame.lines.len() {
-                    let (parent_rot, parent_pos, parent_alpha) = {
-                        let p = &frame.lines[pidx];
-                        (p.rotation, p.position, p.alpha)
-                    };
-                    let out = &mut frame.lines[i];
-                    out.rotation += parent_rot;
-                    let cos = parent_rot.cos();
-                    let sin = parent_rot.sin();
-                    let lx = out.position[0];
-                    let ly = out.position[1];
-                    out.position[0] = parent_pos[0] + cos * lx - sin * ly;
-                    out.position[1] = parent_pos[1] + sin * lx + cos * ly;
-                    out.alpha *= parent_alpha; // child alpha × parent alpha
+        // [parent] Propagate parent transforms, matching phira's fetch_rot /
+        // fetch_pos (line.rs:211-228). Semantics:
+        //   - position: ALWAYS inherited, recursively:
+        //       child_pos = parent.fetch_pos() + R(parent.fetch_rot()) × child_own
+        //   - rotation: inherited ONLY when rotateWithFather is set:
+        //       rot = own_rot + (rot_with_parent ? parent.fetch_rot() : 0)
+        //   - alpha: NOT inherited (phira render uses each line's own alpha).
+        // Parents are processed before children regardless of list order, and
+        // multi-level chains resolve recursively.
+        {
+            // Resolve rotations first (phira fetch_rot, recursive).
+            let mut rot_resolved = vec![0.0f32; frame.lines.len()];
+            for i in 0..frame.lines.len() {
+                let mut rot = frame.lines[i].rotation;
+                let mut cur = frame.lines[i].parent;
+                let mut visited: Vec<usize> = Vec::new();
+                while let Some(pidx) = cur {
+                    if pidx >= frame.lines.len() || visited.contains(&pidx) || pidx == i {
+                        break;
+                    }
+                    visited.push(pidx);
+                    if !frame.lines[pidx].rot_with_parent {
+                        break;
+                    }
+                    rot += frame.lines[pidx].rotation;
+                    cur = frame.lines[pidx].parent;
                 }
+                rot_resolved[i] = rot;
+            }
+            for i in 0..frame.lines.len() {
+                frame.lines[i].rotation = rot_resolved[i];
+            }
+            // Then positions (phira fetch_pos, recursive): walk the parent
+            // chain from root to leaf, composing R(parent_rot) × own_offset.
+            let own_pos: Vec<[f32; 2]> = frame.lines.iter().map(|l| l.position).collect();
+            for i in 0..frame.lines.len() {
+                let mut acc = own_pos[i];
+                let mut cur = frame.lines[i].parent;
+                let mut stack: Vec<usize> = Vec::new();
+                let mut visited: Vec<usize> = Vec::new();
+                while let Some(pidx) = cur {
+                    if pidx >= frame.lines.len() || visited.contains(&pidx) || pidx == i {
+                        break;
+                    }
+                    visited.push(pidx);
+                    stack.push(pidx);
+                    cur = frame.lines[pidx].parent;
+                }
+                // Root first (last pushed) → direct parent (first pushed).
+                for &pidx in stack.iter().rev() {
+                    let p = &frame.lines[pidx];
+                    let pr = p.rotation; // phira: parent's fetch_rot
+                    let cos = pr.cos();
+                    let sin = pr.sin();
+                    let (lx, ly) = (acc[0], acc[1]);
+                    acc[0] = p.position[0] + cos * lx - sin * ly;
+                    acc[1] = p.position[1] + sin * lx + cos * ly;
+                }
+                frame.lines[i].position = acc;
             }
         }
         for (line, out) in lines.iter_mut().zip(frame.lines.iter_mut()) {
-            // PE extension: line+notes hidden (alpha < 0 triggers this)
+            // PE alpha extension: w=1 hides line + notes entirely.
             if out.pe_hide { continue; }
             let line_height = line.height.now() as f64;
-            let show_below = line.show_below;
+            // PE alpha extension: w=2 forces draw_below=false (hides only
+            // below notes); otherwise the line's own show_below applies.
+            let show_below = line.show_below && out.draw_below;
             if !show_below {
                 // skip notes dead under 过点即消: max(time, end_time) is past
                 // (0.001 slack mirrors the below-screen cull epsilon)
@@ -1081,9 +1172,21 @@ impl Chart {
                         n.time.max(n.end_time) < time - 0.001
                     });
             }
+            // PE alpha extension: notes appear `appear_before` beats before
+            // their hit beat (phira note.rs:198-204, unit = beats).
+            let appear_beat = if out.appear_before > 0.0 {
+                Some(bpm_list.beat(time) + out.appear_before)
+            } else {
+                None
+            };
             for &ni in &line.order[line.cursor..] {
                 let note = &mut line.notes[ni];
                 note.alpha.set_time(time);
+                if let Some(ab) = appear_beat {
+                    if bpm_list.beat(note.time) > ab {
+                        continue;
+                    }
+                }
                 let note_alpha = note.alpha.now_opt().unwrap_or(1.0).max(0.);
                 let spd = note.speed;
                 let base = (note.height - line_height) * spd;
@@ -1097,7 +1200,17 @@ impl Chart {
                     if !show_below && note.time > time && base <= -0.001 {
                         continue;
                     }
-                    (yoff + bottom, Some(yoff + (note.end_height - line_height) * spd))
+                    let head_y = yoff + bottom;
+                    let tail_y = yoff + (note.end_height - line_height) * spd;
+                    // Viewport cull on the CLOSEST of head/tail: a long hold
+                    // whose head is far above can still have its body dipping
+                    // into view — culling on head_y alone would wrongly drop
+                    // the visible body.
+                    let near = head_y.min(tail_y);
+                    if near > 2.0 || near < -2.0 {
+                        continue;
+                    }
+                    (head_y, Some(tail_y))
                 } else {
                     // Editor preview: notes vanish instantly at hit time
                     // (no prpr 0.16s fade-out).
@@ -1106,6 +1219,12 @@ impl Chart {
                         continue;
                     }
                     if !show_below && note.time > time && base <= -0.001 {
+                        continue;
+                    }
+                    // Viewport cull (phira line.rs height_above/height_below):
+                    // skip notes still far above or below the visible canvas.
+                    let above = base + yoff;
+                    if above > 2.0 || above < -2.0 {
                         continue;
                     }
                     (yoff + base, None)
