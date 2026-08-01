@@ -98,15 +98,23 @@ impl AudioClock {
     /// (`Player::get_pos`, refreshed every ~5ms from the audio thread) instead
     /// of wall-clock time — the wall clock drifts from the actual playback
     /// rate and starts ahead of the audible output (device buffer latency).
+    /// When the queue drains (track finished), `get_pos` freezes; snapshot it
+    /// into `pos` so seeks/restarts from the end work off the real position.
     pub fn time(&self) -> f64 {
         if self.playing.get() {
-            self.player.get_pos().as_secs_f64()
+            let t = self.player.get_pos().as_secs_f64();
+            if self.player.empty() {
+                self.pos.set(t);
+            }
+            t
         } else {
             self.pos.get()
         }
     }
 
     /// Pause or resume playback. No-op if already in the requested state.
+    /// Resuming after the track ended (queue drained) re-creates and
+    /// re-appends the source so playback can restart from the start.
     pub fn set_paused(&self, paused: bool) {
         if paused == !self.playing.get() {
             return;
@@ -116,6 +124,16 @@ impl AudioClock {
             self.playing.set(false);
             self.player.pause();
         } else {
+            if self.player.empty() {
+                // Track ended — re-append so play() has something to play.
+                if let Ok(file) = std::fs::File::open(&self.music_path) {
+                    if let Ok(source) = rodio::Decoder::try_from(file) {
+                        self.player.append(source);
+                        let _ = self.player.try_seek(Duration::ZERO);
+                    }
+                }
+                self.pos.set(0.0);
+            }
             self.anchor.set(Instant::now());
             self.playing.set(true);
             self.player.play();
@@ -128,14 +146,18 @@ impl AudioClock {
     }
 
     /// Seek to `t` seconds from the start, clamped at 0. If the previous
-    /// source has exhausted (track ended), re-create and re-append it so
+    /// source has exhausted (track ended — rodio's `try_seek` returns `Ok`
+    /// without seeking on an empty queue), re-create and re-append it so
     /// seek + playback can restart. If the player was paused before the
     /// seek, pause it again after re-appending.
     pub fn seek(&self, t: f64) {
         let t = t.max(0.0);
         let was_playing = self.playing.get();
-        if self.player.try_seek(Duration::from_secs_f64(t)).is_err() {
-            // Source exhausted — re-create and re-append.
+        // rodio: on an empty queue try_seek() is a silent no-op returning Ok,
+        // so detect exhaustion explicitly and rebuild the source.
+        let empty = self.player.empty();
+        let seeked = self.player.try_seek(Duration::from_secs_f64(t)).is_ok() && !empty;
+        if !seeked {
             if let Ok(file) = std::fs::File::open(&self.music_path) {
                 if let Ok(source) = rodio::Decoder::try_from(file) {
                     self.player.append(source);
