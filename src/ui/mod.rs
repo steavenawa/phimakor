@@ -3,11 +3,17 @@ use iced::advanced::widget::Tree;
 use iced::advanced::{renderer, Renderer as _};
 use iced::{Element, Length, Point, Rectangle, Size, Theme};
 use iced_tiny_skia::Renderer;
+use std::sync::Arc;
 
 pub mod panels;
 use phimakor::trace_span;
 
 static UI_FONT: std::sync::OnceLock<Option<fontdue::Font>> = std::sync::OnceLock::new();
+
+// Debug toggles are read once at startup — probing env vars on every frame
+// costs a syscall + allocation per call.
+static SKIP_GRID: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SKIP_CENTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn load_font_from(path: &str) -> Option<fontdue::Font> {
     std::fs::read(path).ok().and_then(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok())
@@ -22,6 +28,10 @@ fn get_font() -> &'static Option<fontdue::Font> {
             .or_else(|| load_font_from("C:\\Windows\\Fonts\\msyh.ttc"))
             .or_else(|| load_font_from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"))
     })
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name).is_ok()
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -71,8 +81,8 @@ pub struct IcedOverlay {
     pub drag_updated: Option<(usize, f64, f32)>, // (note_index, new_beat, new_x)
     ctx_pos: Option<(f32, f32)>,
     ctx_progress: f32,
-    pub mouse_beat: f64,
-    notes_cache: Vec<NoteEntry>,
+    pub     mouse_beat: f64,
+    notes_cache: Arc<Vec<NoteEntry>>,
     last_drawn_beat: f64,
     pub splash_click: Option<usize>,
 }
@@ -103,7 +113,7 @@ impl IcedOverlay {
             layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, gui_scale: 1.0,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
             drag_note: None, drag_updated: None, ctx_pos: None, ctx_progress: 0.0,
-            mouse_beat: 0.0, notes_cache: Vec::new(), last_drawn_beat: 0.0, splash_click: None,
+            mouse_beat: 0.0, notes_cache: Arc::new(Vec::new()), last_drawn_beat: 0.0, splash_click: None,
         }
     }
 
@@ -318,7 +328,7 @@ impl IcedOverlay {
     }
 
     fn find_nearest_note(&self, beat: f64, mx: f32) -> Option<usize> {
-        let notes = &self.notes_cache;
+        let notes = self.notes_cache.as_slice();
         if notes.is_empty() { return None; }
         let px = self.panel_x(0.0, NT_W, self.notes_progress);
         let rel_x = ((mx - px) / (NT_W * self.gui_scale) * 2.0 - 1.0) * 675.0;
@@ -971,7 +981,7 @@ fn draw_5col_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32,
 
     // Note blocks per column (col 5, only when show_notes)
     if n_cols >= 6 {
-        for note in &info.notes {
+        for note in info.notes.iter() {
             let c = match note.kind { 1 => [50, 150, 255], 2 => [100, 200, 255], 3 => [255, 80, 150], 4 => [255, 220, 60], _ => [180; 3] };
             let y0 = to_y(note.start_beats).clamp(py as f64, py as f64 + ph) as f32;
             let y1 = to_y(note.end_beats).clamp(py as f64, py as f64 + ph) as f32;
@@ -1053,7 +1063,7 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
     let grid = (info.snap as f64).max(0.125);
     let g_start = (min_b / grid).ceil() as i32;
     let g_end = (max_b / grid).floor() as i32;
-    if std::env::var("PHIMAKOR_SKIP_GRID").is_err() {
+    if !*SKIP_GRID.get_or_init(|| env_flag("PHIMAKOR_SKIP_GRID")) {
     for gi in g_start..=g_end {
         let b = gi as f64 * grid;
         let y = to_y(b) as f32;
@@ -1064,7 +1074,7 @@ fn draw_notes_timeline(pixmap: &mut tiny_skia::PixmapMut, scroll: f32, zoom: f32
     }
 
     // Center line
-    if std::env::var("PHIMAKOR_SKIP_CENTER").is_err() {
+    if !*SKIP_CENTER.get_or_init(|| env_flag("PHIMAKOR_SKIP_CENTER")) {
     let cx = to_x(0.0);
     // 1px vertical line: write pixels directly
     {
@@ -1462,8 +1472,8 @@ pub struct GameInfo {
     pub show_notes: bool, pub events_progress: f32, pub notes_progress: f32,
     pub has_custom_tex: bool, pub full_notes: bool,
     pub selected_line: usize, pub line_name: String, pub line_count: usize,
-    pub selected_layer: usize, pub max_layers: usize, pub events: Vec<EventEntry>,
-    pub notes: Vec<NoteEntry>,
+    pub selected_layer: usize, pub max_layers: usize, pub events: Arc<Vec<EventEntry>>,
+    pub notes: Arc<Vec<NoteEntry>>,
     pub gui_scale: f32,
     pub snap: f32,
     pub vsync: bool,

@@ -41,6 +41,7 @@ struct State {
     fps_since: Instant,
     fps: f64,
     frame_latency: f64,
+    device_latency: f64,
     pending_seek: Option<f64>,
     scroll_target: Option<f64>,
     chart_time_last: f64,
@@ -71,8 +72,8 @@ struct State {
     selected_event_idx: Option<usize>,
     event_edit_target: u8, // 0=start_beats, 1=end_beats, 2=start_val, 3=end_val, 4=easing
     cache_valid: bool,
-    cached_events: Vec<ui::EventEntry>,
-    cached_notes: Vec<ui::NoteEntry>,
+    cached_events: Arc<Vec<ui::EventEntry>>,
+    cached_notes: Arc<Vec<ui::NoteEntry>>,
 
     // ── Layout / panels ──
     layout: LayoutDef,
@@ -107,12 +108,14 @@ impl App {
             show_properties: false, show_events: false, show_notes: false, full_notes: false,
             overlay_last_render: Instant::now(), combo: 0, hits: 0, note_count: 0,
             seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016,
+            device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
+                .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
             selected_line: 0, selected_event_idx: None, scroll_target: None,
             pending_seek: None, chart_time_last: 0.0, focused: true, ctrl: false,
             gui_scale: 1.0, snap: 0.25, selected_layer: 0, event_edit_target: 0,
             vertical_split: 14, layout: LayoutDef { panels: vec![] },
             ui_dirty: true, show_menu: false, splash_names: names,
-            cache_valid: false, cached_events: Vec::new(), cached_notes: Vec::new(),
+            cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()),
             extra: None,
         })
     }
@@ -176,11 +179,13 @@ impl App {
             show_overlay: true, show_properties: false, show_events: false, show_notes: false,
             full_notes: false, overlay_last_render: Instant::now(), combo: 0, hits: 0, note_count,
             seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016,
+            device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
+                .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
             selected_line: 0, selected_event_idx: None, event_edit_target: 0,
             scroll_target: None, pending_seek: None, chart_time_last: 0.0,
             focused: true, ctrl: false, gui_scale: 1.0, snap: 0.25, selected_layer: 0,
             vertical_split: 14, layout, ui_dirty: true, show_menu: false, splash_names: vec![],
-            cache_valid: false, cached_events: Vec::new(), cached_notes: Vec::new(), extra,
+            cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()), extra,
         })
     }
 
@@ -291,11 +296,8 @@ impl State {
         // minus the audio device output latency (rodio's get_pos counts samples
         // handed to the device callback, which are heard ~latency ms later).
         let predict = self.frame_latency.min(0.05);
-        let device_latency = std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
-            .ok().and_then(|v| v.parse::<f64>().ok())
-            .unwrap_or(15.0) / 1000.0;
         let off = (self.chart.offset() + self.info.offset) as f64;
-        let chart_time = (audio_time + predict - device_latency - off).max(0.0);
+        let chart_time = (audio_time + predict - self.device_latency - off).max(0.0);
         self.chart_time_last = chart_time;
         let duration = self.chart.duration();
         let chart_beat = self.chart.time_to_beat(chart_time);
@@ -328,15 +330,15 @@ impl State {
         let _s2 = trace_span!("prepare_gameinfo");
         // Extract event data for selected line (cached, rebuild on dirty)
         if !self.cache_valid {
-            self.cached_events = extract_line_events(&self.doc, self.selected_line, self.selected_layer);
-            self.cached_notes = if self.full_notes {
+            self.cached_events = Arc::new(extract_line_events(&self.doc, self.selected_line, self.selected_layer));
+            self.cached_notes = Arc::new(if self.full_notes {
                 let mut all = Vec::new();
                 for li in 0..self.doc.chart().judge_line_list.len() {
                     all.extend(extract_line_notes(&self.doc, li));
                 }
                 all.sort_by(|a, b| a.start_beats.total_cmp(&b.start_beats));
                 all
-            } else { extract_line_notes(&self.doc, self.selected_line) };
+            } else { extract_line_notes(&self.doc, self.selected_line) });
             self.cache_valid = true;
         }
         let line_events = &self.cached_events;

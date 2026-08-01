@@ -261,12 +261,13 @@ pub fn spawn_audio_thread(res_dir: &Path, chart_dir: &Path) -> anyhow::Result<Au
                 let t = clock.time();
                 time2.store(t.to_bits(), Ordering::Relaxed);
                 let chart_time = (t - total_offset).max(0.0);
-                for fired in &chart2.state_at(chart_time).fired {
+                // Lightweight fired-only scan (no animation/visibility work).
+                for fired in chart2.advance_fired(chart_time) {
                     if !fired.fake && !fired.tick && !fired.hold_tail {
                         clock.hit(fired.kind);
                     }
                 }
-                std::thread::sleep(Duration::from_millis(2));
+                std::thread::sleep(Duration::from_millis(5));
             }
         })?;
     // Thread panicked before reporting -> sender dropped -> recv errors.

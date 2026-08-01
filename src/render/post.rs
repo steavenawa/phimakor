@@ -40,6 +40,8 @@ pub struct PostPipe {
     pub chart_dir: Option<std::path::PathBuf>,
     /// Blit pipeline: simple passthrough to copy final result to surface.
     pub blit_pipeline: Option<wgpu::RenderPipeline>,
+    /// Cached blit bind groups keyed by texture-view pointer.
+    pub(crate) blit_bgs: HashMap<usize, wgpu::BindGroup>,
 
     /// Active effects for the current frame.
     pub active: Vec<ActiveEffect>,
@@ -58,6 +60,10 @@ struct EffPipe {
     bgl: wgpu::BindGroupLayout,     // group 1 (uniforms)
     uniform_buf: wgpu::Buffer,
     uniform_size: u64,
+    /// Cached uniform bind group (buffer is reused; content rewritten per frame).
+    uniform_bg: Option<wgpu::BindGroup>,
+    /// Cached screen bind groups keyed by texture-view pointer.
+    screen_bgs: HashMap<usize, wgpu::BindGroup>,
 }
 
 impl PostPipe {
@@ -148,6 +154,7 @@ impl PostPipe {
             screen_bgl,
             sampler,
             blit_pipeline,
+            blit_bgs: HashMap::new(),
             pipelines: HashMap::new(),
             chart_dir: None,
             active: Vec::new(),
@@ -161,6 +168,14 @@ impl PostPipe {
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
+        // Old texture views are being dropped — cached bind groups that
+        // reference them must go too, otherwise the old targets can never
+        // be freed (leak) and stale views could be bound.
+        self.blit_bgs.clear();
+        for ep in self.pipelines.values_mut() {
+            ep.uniform_bg = None;
+            ep.screen_bgs.clear();
+        }
         for (i, (t, v)) in self.targets.iter_mut().zip(self.target_views.iter_mut()).enumerate() {
             *t = Some(Self::make_target(device, self.width, self.height, &format!("post-{i}"), self.tex_format));
             *v = Some(t.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
@@ -252,7 +267,7 @@ impl PostPipe {
             mapped_at_creation: false,
         });
 
-        self.pipelines.insert(def.name.to_string(), EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size });
+        self.pipelines.insert(def.name.to_string(), EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size, uniform_bg: None, screen_bgs: HashMap::new() });
     }
 
     /// Load and compile a custom WGSL shader from the chart directory.
@@ -326,7 +341,7 @@ impl PostPipe {
             mapped_at_creation: false,
         });
 
-        self.pipelines.insert(name, EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size: 256 });
+        self.pipelines.insert(name, EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size: 256, uniform_bg: None, screen_bgs: HashMap::new() });
     }
 
     /// Run all active effects. Reads from `src`, applies each in order.
@@ -365,7 +380,7 @@ impl PostPipe {
         let mut read_view: &wgpu::TextureView = src;
         let mut idx = self.idx;
         for (key, uv, _) in &descriptors {
-            let Some(ep) = self.pipelines.get(key.as_str()) else { continue };
+            let Some(ep) = self.pipelines.get_mut(key.as_str()) else { continue };
             let write_view = self.target_views[idx].as_ref().unwrap();
             idx = 1 - idx;
             // Write uniform buffer (256 bytes)
@@ -377,14 +392,45 @@ impl PostPipe {
                 }
             }
             queue.write_buffer(&ep.uniform_buf, 0, &uniform_data);
-            let screen_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("screen-bg-{key}")),
-                layout: &self.screen_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                ],
-            });
+            // Reuse the uniform bind group — the buffer is stable, only its
+            // contents change per frame.
+            let uniform_bg = match &ep.uniform_bg {
+                Some(bg) => bg,
+                None => {
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("ubg-{key}")),
+                        layout: &ep.bgl,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &ep.uniform_buf,
+                                offset: 0,
+                                size: wgpu::BufferSize::new(ep.uniform_size),
+                            }),
+                        }],
+                    });
+                    ep.uniform_bg = Some(bg);
+                    ep.uniform_bg.as_ref().unwrap()
+                }
+            };
+            // Cache the screen bind group per view; views only change on
+            // resize (ping-pong pair + scene/surface targets are stable).
+            let view_key = read_view as *const wgpu::TextureView as usize;
+            let screen_bg = match ep.screen_bgs.get(&view_key) {
+                Some(bg) => bg,
+                None => {
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("screen-bg-{key}")),
+                        layout: &self.screen_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                        ],
+                    });
+                    ep.screen_bgs.insert(view_key, bg);
+                    ep.screen_bgs.get(&view_key).unwrap()
+                }
+            };
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some(&format!("effect-{key}")),
@@ -399,22 +445,9 @@ impl PostPipe {
                 })],
                 ..Default::default()
             });
-            // Bind group 1: uniforms
-            let uniform_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(&format!("ubg-{key}")),
-                layout: &ep.bgl,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &ep.uniform_buf,
-                        offset: 0,
-                        size: wgpu::BufferSize::new(ep.uniform_size),
-                    }),
-                }],
-            });
             pass.set_pipeline(&ep.pipeline);
-            pass.set_bind_group(0, &screen_bg, &[]);
-            pass.set_bind_group(1, &uniform_bg, &[]);
+            pass.set_bind_group(0, screen_bg, &[]);
+            pass.set_bind_group(1, uniform_bg, &[]);
             pass.draw(0..3, 0..1);
             read_view = write_view;
         }

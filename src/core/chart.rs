@@ -873,23 +873,18 @@ impl Chart {
         })
     }
 
-    /// Evaluates all animations at `time` (seconds on the chart clock) and
-    /// returns the frame. The returned reference is invalidated by the next
-    /// call.
-    ///
-    /// Per line, notes are scanned only from a persistent cursor into the
-    /// load-time `order` index (sorted by `max(time, end_time)`): notes
-    /// behind it are past both their hit and hold end, so under 过点即消
-    /// semantics they can neither be visible nor fire again. Backward seeks
-    /// (`time < previous call`) reset the cursors.
-    pub fn state_at(&mut self, time: f64) -> &FrameState {
-        let _s = crate::trace_span!("state_at");
+    /// Fired-note detection only: advances the `fired_cursor` state and
+    /// returns notes whose hit/sustain/release events crossed since the
+    /// previous call. Skips all animation/visibility evaluation, so it is
+    /// cheap enough for the audio thread's per-tick polling (hitsounds).
+    /// Backward seeks (`time < previous call`) reset the cursors and report
+    /// nothing this call.
+    pub fn advance_fired(&mut self, time: f64) -> &[FiredNote] {
         let Chart {
             lines,
             bpm_list,
             last_state_time,
             frame,
-            visible_scratch,
             fired_scratch,
             ..
         } = self;
@@ -899,7 +894,6 @@ impl Chart {
         if time < last {
             // backward seek — cursors restart from the top
             for line in lines.iter_mut() {
-                line.cursor = 0;
                 line.fired_cursor = 0;
             }
         } else {
@@ -913,6 +907,12 @@ impl Chart {
                     });
                 for &ni in &line.order[line.fired_cursor..] {
                     let note = &line.notes[ni];
+                    // order is sorted by max(time, end_time), so a note's
+                    // start can be before a later-ordered note's start (holds
+                    // with long end_time). Only the three checks below need a
+                    // note whose start has passed — skip future starts cheaply
+                    // instead of running the (hold-expensive) branches.
+                    if note.time > time { continue; }
                     // hit events fire even for notes culled out of the frame
                     if last < note.time && note.time <= time {
                         fired_scratch.push((
@@ -972,6 +972,35 @@ impl Chart {
         }
         // else: seek backward — report nothing this call
         *last_state_time = time;
+        &frame.fired
+    }
+
+    /// Evaluates all animations at `time` (seconds on the chart clock) and
+    /// returns the frame. The returned reference is invalidated by the next
+    /// call.
+    ///
+    /// Per line, notes are scanned only from a persistent cursor into the
+    /// load-time `order` index (sorted by `max(time, end_time)`): notes
+    /// behind it are past both their hit and hold end, so under 过点即消
+    /// semantics they can neither be visible nor fire again. Backward seeks
+    /// (`time < previous call`) reset the cursors.
+    pub fn state_at(&mut self, time: f64) -> &FrameState {
+        let _s = crate::trace_span!("state_at");
+        let seek_back = time < self.last_state_time;
+        self.advance_fired(time);
+        if seek_back {
+            // backward seek — the visibility cursor restarts from the top
+            // too (advance_fired only owns the fired cursor)
+            for line in self.lines.iter_mut() {
+                line.cursor = 0;
+            }
+        }
+        let Chart {
+            lines,
+            frame,
+            visible_scratch,
+            ..
+        } = self;
         for (line, out) in lines.iter_mut().zip(frame.lines.iter_mut()) {
             line.alpha.set_time(time);
             line.rotation.set_time(time);

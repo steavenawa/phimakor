@@ -82,6 +82,7 @@ fn main() {
         #[path = "../ui/mod.rs"]
         mod ui;
         use ui::{GameInfo, IcedOverlay, NoteEntry, EventEntry};
+use std::sync::Arc;
         let r = eng.renderer();
         let (w, h) = (1280u32, 800u32);
         // Build realistic note/event entries from the chart (like main.rs does).
@@ -172,7 +173,7 @@ fn main() {
             show_notes: true, events_progress: 1.0, notes_progress: 1.0,
             has_custom_tex: false, full_notes: false,
             selected_line: 0, line_name: "line0".into(), line_count: 90,
-            selected_layer: 0, max_layers: 1, events, notes,
+            selected_layer: 0, max_layers: 1, events: Arc::new(events), notes: Arc::new(notes),
             gui_scale: 1.0, snap: 0.25, vsync: true, vertical_split: 1,
             selected_tool: 0, show_menu: false, selected_event_idx: None,
             event_edit_target: 0, ev_kind: String::new(),

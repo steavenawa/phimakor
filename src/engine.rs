@@ -152,6 +152,15 @@ impl ChartSession {
         Some(self.engine.render_frame(frame, aspect, dim))
     }
 
+    /// Render one frame, copying pixels into `out` (reused buffer) to avoid
+    /// the per-frame allocation of [`render_frame`](Self::render_frame).
+    /// Returns the frame bytes (len = w*h*4, row-major top-down RGBA).
+    pub fn render_frame_into<'o>(&mut self, time: f64, dim: f32, out: &'o mut Vec<u8>) -> Option<&'o [u8]> {
+        if self.chart.is_none() { return None; }
+        self.render_frame(time, dim)?;
+        Some(self.engine.pixels_reused(out))
+    }
+
     /// Returns the last rendered frame's RGBA pixels (row-major, top-down).
     pub fn pixels(&self) -> &[u8] {
         self.engine.pixels() // PreviewEngine stores pixels in a Vec<u8>

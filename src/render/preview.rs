@@ -197,6 +197,20 @@ impl PreviewEngine {
         &self.pixels
     }
 
+    /// Copy the last rendered frame into `out`, reusing its allocation.
+    /// Avoids the per-frame `Vec::new` + page-fault cost of [`pixels`](Self::pixels)`.
+    pub fn copy_pixels_to(&self, out: &mut Vec<u8>) {
+        out.clear();
+        out.extend_from_slice(&self.pixels);
+    }
+
+    /// Copy the last rendered frame into `out` (reused buffer) and return it.
+    pub fn pixels_reused<'a>(&self, out: &'a mut Vec<u8>) -> &'a [u8] {
+        out.clear();
+        out.extend_from_slice(&self.pixels);
+        out
+    }
+
     /// Set the background image (delegates to [`Renderer::set_background`]).
     pub fn set_background(&mut self, img_bytes: &[u8], dim: f32) -> anyhow::Result<()> {
         self.renderer.set_background(img_bytes, dim)
