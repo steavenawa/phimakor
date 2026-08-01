@@ -38,17 +38,21 @@ pub struct AudioClock {
     hit_flick: Option<SamplesBuffer>,
     /// Path to the music file, stored for re-creating the source after exhaustion.
     music_path: std::path::PathBuf,
+    /// Heap bytes of the preloaded hitsound buffers.
+    hit_bytes: usize,
 }
 
-/// Decode a whole ogg into an in-memory sample buffer.
-fn load_samples(path: &Path) -> Option<SamplesBuffer> {
-    let decode = || -> anyhow::Result<SamplesBuffer> {
+/// Decode a whole ogg into an in-memory sample buffer. Returns the buffer
+/// and its heap byte size (f32 samples).
+fn load_samples(path: &Path) -> Option<(SamplesBuffer, usize)> {
+    let decode = || -> anyhow::Result<(SamplesBuffer, usize)> {
         let decoder = rodio::Decoder::try_from(File::open(path)?)?;
         let channels = decoder.channels();
         let sample_rate = decoder.sample_rate();
         let samples: Vec<f32> = decoder.collect();
+        let bytes = samples.len() * 4;
         // verify: 0.22 SamplesBuffer::new(ChannelCount, SampleRate, Vec<f32>)
-        Ok(SamplesBuffer::new(channels, sample_rate, samples))
+        Ok((SamplesBuffer::new(channels, sample_rate, samples), bytes))
     };
     match decode() {
         Ok(buf) => Some(buf),
@@ -73,10 +77,14 @@ impl AudioClock {
         player.append(source);
 
         let (mut click, mut drag, mut flick) = (None, None, None);
+        let mut hit_bytes = 0usize;
         if let Some(res) = res_dir {
-            click = load_samples(&res.join("click.ogg"));
-            drag = load_samples(&res.join("drag.ogg"));
-            flick = load_samples(&res.join("flick.ogg"));
+            for (slot, name) in [(&mut click, "click.ogg"), (&mut drag, "drag.ogg"), (&mut flick, "flick.ogg")] {
+                if let Some((buf, bytes)) = load_samples(&res.join(name)) {
+                    hit_bytes += bytes;
+                    *slot = Some(buf);
+                }
+            }
         }
 
         let music_path = path.to_path_buf();
@@ -90,7 +98,13 @@ impl AudioClock {
             hit_drag: drag,
             hit_flick: flick,
             music_path,
+            hit_bytes,
         })
+    }
+
+    /// Heap footprint of the preloaded hitsound buffers (f32 samples).
+    pub fn mem_bytes(&self) -> usize {
+        self.hit_bytes
     }
 
     /// Seconds into the track, accounting for pauses and seeks.
@@ -204,6 +218,8 @@ pub struct AudioHandle {
     time: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
     cmd: mpsc::Sender<AudioCmd>,
+    /// Heap bytes of the preloaded hitsounds (set once by the audio thread).
+    mem: Arc<AtomicU64>,
     // ponytail: never joined — process exit reaps the thread; `exiting` sends Quit
     #[allow(dead_code)]
     join: JoinHandle<()>,
@@ -213,6 +229,11 @@ impl AudioHandle {
     /// Current playback position in seconds (read from shared atomic).
     pub fn time(&self) -> f64 {
         f64::from_bits(self.time.load(Ordering::Relaxed))
+    }
+
+    /// Heap footprint of the preloaded hitsound buffers (f32 samples).
+    pub fn mem_bytes(&self) -> usize {
+        self.mem.load(Ordering::Relaxed) as usize
     }
 
     /// Whether the audio thread is currently paused (read from shared atomic).
@@ -246,9 +267,10 @@ pub fn spawn_audio_thread(res_dir: &Path, chart_dir: &Path) -> anyhow::Result<Au
     let chart_dir = chart_dir.to_path_buf();
     let time = Arc::new(AtomicU64::new(0f64.to_bits()));
     let paused = Arc::new(AtomicBool::new(false));
+    let mem = Arc::new(AtomicU64::new(0));
     let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
     let (ready_tx, ready_rx) = mpsc::channel::<anyhow::Result<()>>();
-    let (time2, paused2) = (time.clone(), paused.clone());
+    let (time2, paused2, mem2) = (time.clone(), paused.clone(), mem.clone());
     let join = std::thread::Builder::new()
         .name("hitsound-trigger".into())
         .spawn(move || {
@@ -269,6 +291,7 @@ pub fn spawn_audio_thread(res_dir: &Path, chart_dir: &Path) -> anyhow::Result<Au
                     return;
                 }
             };
+            mem2.store(clock.mem_bytes() as u64, Ordering::Relaxed);
             loop {
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
@@ -294,5 +317,5 @@ pub fn spawn_audio_thread(res_dir: &Path, chart_dir: &Path) -> anyhow::Result<Au
         })?;
     // Thread panicked before reporting -> sender dropped -> recv errors.
     ready_rx.recv()??;
-    Ok(AudioHandle { time, paused, cmd: cmd_tx, join })
+    Ok(AudioHandle { time, paused, cmd: cmd_tx, mem, join })
 }

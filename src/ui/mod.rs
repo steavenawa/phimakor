@@ -11,28 +11,35 @@ use phimakor::trace_span;
 // Global font fallback chain: the first font that has a glyph for a given
 // character wins, so Latin text renders in the primary UI font while CJK /
 // symbols fall through to system fonts (Microsoft YaHei, SimHei, PingFang,
-// Noto CJK, ...). Loaded lazily once, in order.
+// Noto CJK, ...).
+//
+// Latin fonts load eagerly at startup (~2 MB). CJK fonts are heavy to parse
+// (fontdue expands the GSUB tables — hundreds of MB for a full CJK set), so
+// they load LAZILY, one at a time, and only up to the first font that covers
+// the requested glyph: a Chinese chart name touches msyh.ttc and stops there.
 static UI_FONTS: std::sync::OnceLock<Vec<fontdue::Font>> = std::sync::OnceLock::new();
+static UI_FONT_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-const FONT_CANDIDATES: [&str; 18] = [
-    // Primary UI font (shipped with the app).
+/// Eagerly loaded fonts: primary + latin fallbacks (small).
+const FONT_LATIN: [&str; 6] = [
     "res/Exo2.ttf",
     "res.dis/Exo2.ttf",
-    // Latin fallbacks.
     "C:\\Windows\\Fonts\\arial.ttf",
     "C:\\Windows\\Fonts\\segoeui.ttf",
     "/System/Library/Fonts/Helvetica.ttc",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    // CJK fallbacks (Windows).
+];
+
+/// Lazily loaded CJK candidates, best first. Each slot parses its font only
+/// when an earlier font failed to cover a requested glyph.
+const FONT_CJK: [&str; 12] = [
     "C:\\Windows\\Fonts\\msyh.ttc",
     "C:\\Windows\\Fonts\\msyhbd.ttc",
     "C:\\Windows\\Fonts\\simhei.ttf",
     "C:\\Windows\\Fonts\\simsun.ttc",
     "C:\\Windows\\Fonts\\Deng.ttf",
-    // CJK fallbacks (macOS).
     "/System/Library/Fonts/PingFang.ttc",
     "/System/Library/Fonts/Hiragino Sans GB.ttc",
-    // CJK fallbacks (Linux).
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
@@ -40,15 +47,35 @@ const FONT_CANDIDATES: [&str; 18] = [
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
 ];
 
+static CJK_SLOTS: [std::sync::OnceLock<Option<fontdue::Font>>; FONT_CJK.len()] = [const { std::sync::OnceLock::new() }; FONT_CJK.len()];
+static CJK_BYTES: [std::sync::atomic::AtomicUsize; FONT_CJK.len()] = [const { std::sync::atomic::AtomicUsize::new(0) }; FONT_CJK.len()];
+
 fn load_font_from(path: &str) -> Option<fontdue::Font> {
     std::fs::read(path).ok().and_then(|b| fontdue::Font::from_bytes(b, fontdue::FontSettings::default()).ok())
 }
 
-/// All loaded fonts, primary first.
+/// All loaded eager fonts, primary first.
 fn get_fonts() -> &'static Vec<fontdue::Font> {
     UI_FONTS.get_or_init(|| {
-        FONT_CANDIDATES.iter().filter_map(|p| load_font_from(p)).collect()
+        let mut bytes = 0usize;
+        let fonts: Vec<fontdue::Font> = FONT_LATIN.iter().filter_map(|p| {
+            let font = load_font_from(p);
+            if font.is_some() {
+                if let Ok(md) = std::fs::metadata(p) { bytes += md.len() as usize; }
+            }
+            font
+        }).collect();
+        let _ = UI_FONT_BYTES.set(bytes);
+        fonts
     })
+}
+
+/// Raw file bytes of the loaded UI font chain (rough heap footprint).
+pub fn font_mem_bytes() -> usize {
+    use std::sync::atomic::Ordering;
+    let eager = *UI_FONT_BYTES.get().unwrap_or(&0);
+    let cjk: usize = CJK_BYTES.iter().map(|b| b.load(Ordering::Relaxed)).sum();
+    eager + cjk
 }
 
 /// The primary font (or None if nothing loaded).
@@ -58,9 +85,30 @@ fn get_font() -> Option<&'static fontdue::Font> {
 
 /// First font in the chain that contains `ch`; falls back to the primary
 /// font when nothing has the glyph (renders the font's default glyph).
+/// CJK slots load on demand, stopping at the first font covering `ch`.
 fn font_for(ch: char) -> Option<&'static fontdue::Font> {
     let fonts = get_fonts();
-    fonts.iter().find(|f| f.has_glyph(ch)).or_else(|| fonts.first())
+    if let Some(f) = fonts.iter().find(|f| f.has_glyph(ch)) {
+        return Some(f);
+    }
+    for (i, path) in FONT_CJK.iter().enumerate() {
+        let slot = &CJK_SLOTS[i];
+        let font = slot.get_or_init(|| {
+            let font = load_font_from(path);
+            if font.is_some() {
+                if let Ok(md) = std::fs::metadata(path) {
+                    CJK_BYTES[i].store(md.len() as usize, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            font
+        });
+        if let Some(f) = font {
+            if f.has_glyph(ch) {
+                return Some(f);
+            }
+        }
+    }
+    fonts.first()
 }
 
 fn env_flag(name: &str) -> bool {

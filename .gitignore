@@ -2,3 +2,4 @@ res*/
 /target/
 *.lock
 config.json
+dhat-heap.json

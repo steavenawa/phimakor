@@ -118,6 +118,8 @@ pub(crate) struct TextState {
     /// Digit sprite sets by rasterization px (`(px*100) as u32`).
     digits: HashMap<u32, DigitGlyphs>,
     pub(crate) pending: Vec<PendingText>,
+    /// Raw bytes of the loaded font files (rough heap footprint).
+    font_bytes: usize,
 }
 
 impl TextState {
@@ -128,18 +130,57 @@ impl TextState {
             cache: HashMap::new(),
             digits: HashMap::new(),
             pending: Vec::new(),
+            font_bytes: 0,
+        }
+    }
+
+    /// Memory report: (static text cache entries, digit glyph bitmap bytes,
+    /// font file bytes).
+    pub(crate) fn mem_report(&self) -> (usize, usize, usize) {
+        let digits: usize = self.digits.values()
+            .map(|d| d.glyphs.iter().map(|(m, b)| b.len() + m.width as usize * m.height as usize).sum::<usize>())
+            .sum();
+        (self.cache.len(), digits, self.font_bytes)
+    }
+}
+
+/// Lazy-load the main font into `slot` once (tracks raw file bytes).
+/// Field-level helper: borrows only the font slot + byte counter, so it
+/// composes with other field borrows of the same [`TextState`].
+fn load_main_into(slot: &mut Option<Option<fontdue::Font>>, bytes_total: &mut usize) {
+    if slot.is_none() {
+        match load_font() {
+            Some((font, bytes)) => {
+                *bytes_total += bytes;
+                *slot = Some(Some(font));
+            }
+            None => *slot = Some(None),
+        }
+    }
+}
+
+/// Lazy-load the CJK fallback font into `slot` once (tracks raw file bytes).
+fn load_cjk_into(slot: &mut Option<Option<fontdue::Font>>, bytes_total: &mut usize) {
+    if slot.is_none() {
+        match load_cjk_font() {
+            Some((font, bytes)) => {
+                *bytes_total += bytes;
+                *slot = Some(Some(font));
+            }
+            None => *slot = Some(None),
         }
     }
 }
 
 /// Exo2 ships in `res/` (the app's UI font); fall back to system fonts
 /// (msyh.ttc covers latin+CJK) so offscreen renders work without res/.
-/// `None` disables text rendering silently.
-fn load_font() -> Option<fontdue::Font> {
+/// `None` disables text rendering silently. Returns the raw file size too.
+fn load_font() -> Option<(fontdue::Font, usize)> {
     for path in ["res/Exo2.ttf", r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\arial.ttf"] {
         if let Ok(bytes) = std::fs::read(path) {
+            let n = bytes.len();
             if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
-                return Some(font);
+                return Some((font, n));
             }
         }
     }
@@ -148,12 +189,13 @@ fn load_font() -> Option<fontdue::Font> {
 
 /// CJK fallback font for glyphs missing from the main font (e.g. Chinese /
 /// Japanese / Korean song names). msyh.ttc covers latin+CJK; arial is a
-/// last resort for narrow CJK support.
-fn load_cjk_font() -> Option<fontdue::Font> {
+/// last resort for narrow CJK support. Returns the raw file size too.
+fn load_cjk_font() -> Option<(fontdue::Font, usize)> {
     for path in [r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf", r"C:\Windows\Fonts\msyhbd.ttc", r"C:\Windows\Fonts\arial.ttf"] {
         if let Ok(bytes) = std::fs::read(path) {
+            let n = bytes.len();
             if let Ok(font) = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
-                return Some(font);
+                return Some((font, n));
             }
         }
     }
@@ -295,37 +337,19 @@ fn compose_digits(
     text: &str,
 ) -> Option<(wgpu::BindGroup, [f32; 2])> {
     if state.font.is_none() {
-        state.font = Some(load_font());
+        load_main_into(&mut state.font, &mut state.font_bytes);
     }
     let font = state.font.as_ref().and_then(|f| f.as_ref())?;
-    if state.cjk_font.is_none() {
-        state.cjk_font = Some(load_cjk_font());
-    }
-    let cjk = state.cjk_font.as_ref().and_then(|f| f.as_ref());
+    // Digits are always in the main font — never load the heavy CJK
+    // fallback just for score/combo numbers.
     let key = (px * 100.0) as u32;
     if !state.digits.contains_key(&key) {
         let lm = font.horizontal_line_metrics(px)?;
-        let (mut line_h, mut baseline) = ((lm.ascent - lm.descent).ceil().max(1.0) as usize, lm.ascent);
-        if let Some(cjk) = cjk {
-            if let Some(clm) = cjk.horizontal_line_metrics(px) {
-                let clm_h = (clm.ascent - clm.descent).ceil().max(1.0) as usize;
-                if clm_h > line_h {
-                    baseline += (clm_h - line_h) as f32;
-                    line_h = clm_h;
-                }
-            }
-        }
+        let line_h = (lm.ascent - lm.descent).ceil().max(1.0) as usize;
+        let baseline = lm.ascent;
         let mut glyphs = Vec::with_capacity(10);
         for c in '0'..='9' {
-            let f = if font.lookup_glyph_index(c) == 0 {
-                match cjk {
-                    Some(cjk) if cjk.lookup_glyph_index(c) != 0 => cjk,
-                    _ => font,
-                }
-            } else {
-                font
-            };
-            glyphs.push(f.rasterize(c, px));
+            glyphs.push(font.rasterize(c, px));
         }
         state.digits.insert(key, DigitGlyphs { glyphs, line_h, baseline });
     }
@@ -340,6 +364,12 @@ fn compose_digits(
         (&ds.glyphs[i].0, ds.glyphs[i].1.as_slice())
     }), ds.line_h, ds.baseline);
     Some(upload_gray_line(device, queue, tex_bgl, sampler, gray, line_w, ds.line_h))
+}
+
+/// True if `text` has any char the main font lacks (CJK/symbols) — the
+/// signal to load the heavy CJK fallback.
+fn needs_cjk(font: &fontdue::Font, text: &str) -> bool {
+    text.chars().any(|c| font.lookup_glyph_index(c) == 0)
 }
 
 impl Renderer {
@@ -405,15 +435,21 @@ pub(crate) fn draw_text_queued(
     color: [f32; 4],
 ) {
     if text_state.font.is_none() {
-        text_state.font = Some(load_font());
+        load_main_into(&mut text_state.font, &mut text_state.font_bytes);
     }
     let Some(font) = text_state.font.as_ref().and_then(|f| f.as_ref()) else {
         return;
     };
-    if text_state.cjk_font.is_none() {
-        text_state.cjk_font = Some(load_cjk_font());
-    }
-    let cjk = text_state.cjk_font.as_ref().and_then(|f| f.as_ref());
+    // CJK fallback loads only when the text actually needs it (Chinese song
+    // names) — ASCII-only HUDs never touch the ~19 MB msyh.
+    let cjk = if needs_cjk(font, text) {
+        if text_state.cjk_font.is_none() {
+            load_cjk_into(&mut text_state.cjk_font, &mut text_state.font_bytes);
+        }
+        text_state.cjk_font.as_ref().and_then(|f| f.as_ref())
+    } else {
+        None
+    };
     let (px, _, _) = anchor.layout(aspect);
     let entry = if is_digits(text) {
         // Dynamic numbers: compose from pre-rasterized digits, no cache.
@@ -471,15 +507,20 @@ pub(crate) fn draw_text_world(
         CachedText { bind_group, size }
     } else {
         if text_state.font.is_none() {
-            text_state.font = Some(load_font());
+            load_main_into(&mut text_state.font, &mut text_state.font_bytes);
         }
         let Some(font) = text_state.font.as_ref().and_then(|f| f.as_ref()) else {
             return;
         };
-        if text_state.cjk_font.is_none() {
-            text_state.cjk_font = Some(load_cjk_font());
-        }
-        let cjk = text_state.cjk_font.as_ref().and_then(|f| f.as_ref());
+        // CJK fallback loads only when the text actually needs it.
+        let cjk = if needs_cjk(font, text) {
+            if text_state.cjk_font.is_none() {
+                load_cjk_into(&mut text_state.cjk_font, &mut text_state.font_bytes);
+            }
+            text_state.cjk_font.as_ref().and_then(|f| f.as_ref())
+        } else {
+            None
+        };
         let key = (text.to_string(), anchor as u8);
         if !text_state.cache.contains_key(&key) {
             let Some((bind_group, size)) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px, cjk) else {

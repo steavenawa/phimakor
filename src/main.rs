@@ -252,6 +252,27 @@ impl State {
         self.cache_valid = false;
         self.selected_event_idx = None;
     }
+
+    /// Print a memory breakdown to the console (F7, or PHIMAKOR_MEMLOG=1
+    /// every 5 s). Tracks the allocations the app itself controls.
+    fn debug_memory(&self) {
+        let (text_entries, digit_bytes, font_bytes) = self.renderer.text_mem();
+        let mb = |b: usize| b as f64 / 1048576.0;
+        eprintln!("──── memory report ────");
+        eprintln!("HUD text cache entries : {} (dynamic digits bypass it)", text_entries);
+        eprintln!("digit glyph bitmaps    : {:.2} MB", mb(digit_bytes));
+        eprintln!("renderer fonts (raw)   : {:.2} MB", mb(font_bytes));
+        eprintln!("UI font chain (raw)    : {:.2} MB", mb(ui::font_mem_bytes()));
+        eprintln!("audio hitsounds        : {:.2} MB", mb(self.audio.as_ref().map(|a| a.mem_bytes()).unwrap_or(0)));
+        let thumbs = self.splash_charts.iter().filter(|c| c.thumb.is_some()).count();
+        eprintln!("splash thumbnails      : {} (≤200 px each)", thumbs);
+        let notes = self.doc.chart().judge_line_list.iter().map(|l| l.notes.as_ref().map_or(0, |n| n.len())).sum::<usize>();
+        eprintln!("chart notes            : {} (parsed JSON kept in RAM)", notes);
+        if let Some(gpu) = self.renderer.gpu_mem() {
+            eprintln!("wgpu live resources    : {gpu}");
+        }
+    }
+
     fn seek(&mut self, t: f64) {
         let _s = trace_span!("seek");
         let t = t.clamp(0.0, self.chart.duration());
@@ -892,6 +913,7 @@ impl ApplicationHandler for App {
                         KeyCode::F4 => { state.show_events = !state.show_events; state.ui_dirty = true; }
                         KeyCode::F5 => { if state.ctrl { state.full_notes = !state.full_notes; } else { state.show_notes = !state.show_notes; } state.ui_dirty = true; }
                         KeyCode::F6 => { state.renderer.set_vsync(!state.renderer.vsync); state.ui_dirty = true; }
+                        KeyCode::F7 => { state.debug_memory(); }
                         KeyCode::BracketLeft => { state.gui_scale = (state.gui_scale - 0.1).max(0.5); state.ui_dirty = true; }
                         KeyCode::BracketRight => { state.gui_scale = (state.gui_scale + 0.1).min(2.0); state.ui_dirty = true; }
                         KeyCode::Digit1 => { state.snap = 1.0; state.ui_dirty = true; }
@@ -1069,6 +1091,17 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, _: &ActiveEventLoop) {
         #[cfg(feature = "profiling")]
         tracy_client::frame_mark();
+        // PHIMAKOR_MEMLOG=1 → print the memory report every 5 s (watch for
+        // leaks while playing / scrubbing).
+        if std::env::var("PHIMAKOR_MEMLOG").is_ok() {
+            static MEMLOG_LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let now = std::time::Instant::now();
+            let mut last = MEMLOG_LAST.lock().unwrap();
+            if last.map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_secs(5)) {
+                if let Some(s) = &self.state { s.debug_memory(); }
+                *last = Some(now);
+            }
+        }
         if let Some(s) = &self.state { s.window.request_redraw(); }
     }
     fn exiting(&mut self, _: &ActiveEventLoop) {
@@ -1296,7 +1329,13 @@ fn init_tracing() {
 
 fn main() -> anyhow::Result<()> {
     #[cfg(feature = "profiling")]
-    init_profiling();
+    let _heap_profiler = {
+        init_profiling();
+        // Heap profiler: tracks every allocation through the global
+        // allocator and dumps `dhat-heap.json` (CWD) when main returns —
+        // the definitive breakdown when Task Manager shows unexplained RSS.
+        dhat::Profiler::new_heap()
+    };
     init_tracing();
     let dir = match std::env::args_os().nth(1) {
         Some(d) => Some(PathBuf::from(d)),

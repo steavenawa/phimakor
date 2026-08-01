@@ -346,6 +346,8 @@ pub struct HudData {
 }
 
 pub struct Renderer {
+    /// Root instance (kept for `generate_report` memory diagnostics).
+    instance: wgpu::Instance,
     /// Window surface; `None` for surfaceless (offscreen preview) renderers.
     surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
@@ -457,7 +459,7 @@ impl Renderer {
             view_formats: vec![],
         };
         let (width, height) = (config.width, config.height);
-        Self::init(Some((surface, config)), adapter, format, width, height).await
+        Self::init(instance, Some((surface, config)), adapter, format, width, height).await
     }
 
     /// Surfaceless constructor for offscreen rendering (preview / embedding).
@@ -470,13 +472,14 @@ impl Renderer {
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .context("no suitable GPU adapter")?;
-        Self::init(None, adapter, wgpu::TextureFormat::Rgba8Unorm, width.max(1), height.max(1)).await
+        Self::init(instance, None, adapter, wgpu::TextureFormat::Rgba8Unorm, width.max(1), height.max(1)).await
     }
 
     /// Shared construction for the window and surfaceless paths: device/queue,
     /// pipeline (via [`create_pipeline`]), instance double-buffer, white
     /// texture. A passed-in surface is configured with its config here.
     async fn init(
+        instance: wgpu::Instance,
         surface: Option<(wgpu::Surface<'static>, wgpu::SurfaceConfiguration)>,
         adapter: wgpu::Adapter,
         format: wgpu::TextureFormat,
@@ -567,6 +570,7 @@ impl Renderer {
             mapped_at_creation: false,
         });
         Ok(Self {
+            instance,
             surface,
             device,
             queue,
@@ -767,10 +771,29 @@ impl Renderer {
 
     /// Update the HUD contents for this frame (song name / difficulty /
     /// score / combo / pause state). `visible=false` hides the HUD (editor
-    /// panels on screen). Pause button clicks are hit-tested against the
-    /// rect recorded by the previous frame's draw ([`Self::pause_rect`]).
+    /// panels on screen). Pause button clicks are hit-tested against the    /// rect recorded by the previous frame's draw ([`Self::pause_rect`]).
     pub fn set_hud(&mut self, hud: HudData) {
         self.hud = hud;
+    }
+
+    /// Memory report for the HUD text system (see [`TextState::mem_report`]):
+    /// (static cache entries, digit glyph bytes, font file bytes).
+    pub fn text_mem(&self) -> (usize, usize, usize) {
+        self.text.mem_report()
+    }
+
+    /// wgpu-side resource counts from [`wgpu::Instance::generate_report`]
+    /// (wgpu-core 30 dropped byte-level reports; live resource COUNTS are
+    /// the leak detector — textures/views/buffers must stay flat per frame).
+    pub fn gpu_mem(&self) -> Option<String> {
+        let r = self.instance.generate_report()?;
+        let h = r.hub_report();
+        let n = |rr: &wgpu_core::registry::RegistryReport| rr.num_allocated;
+        Some(format!(
+            "textures {} | views {} | buffers {} | bindgroups {} | samplers {} | shaders {} | pipelines {}",
+            n(&h.textures), n(&h.texture_views), n(&h.buffers),
+            n(&h.bind_groups), n(&h.samplers), n(&h.shader_modules), n(&h.render_pipelines),
+        ))
     }
 
     /// Window-px rect of the pause button from the last drawn frame.
