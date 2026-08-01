@@ -313,6 +313,34 @@ pub(crate) fn create_pipeline(
 /// wgpu-based renderer driving the main window (or offscreen preview).
 /// Holds the device, queue, pipelines, double-buffered instance storage,
 /// texture cache, background image, post-processing pipe, and UI overlay state.
+/// Screen-space pause button rect (window px, top-left origin), recorded
+/// while drawing the HUD so the main loop can hit-test clicks.
+#[derive(Clone, Copy, Default)]
+pub struct PauseHitRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// Per-frame HUD (Phigros-style game UI): song name, difficulty, score,
+/// combo and pause button. Drawn inside the render pipeline so exports
+/// (readback / embedded engine) include them. When an `attachUI` line
+/// matches an element ("name"/"level"/"score"/"combo"/"pause"), the element
+/// follows that line's transform (position/rotation/alpha); otherwise the
+/// element sits at its default Phigros layout corner.
+#[derive(Clone, Default)]
+pub struct HudData {
+    pub chart_name: String,
+    pub difficulty: String,
+    pub score: u32,
+    pub combo: u32,
+    /// Paused state: swaps the pause icon (II) for the play icon (▶).
+    pub paused: bool,
+    /// Whether the HUD is visible at all (false = editor panels hide it).
+    pub visible: bool,
+}
+
 pub struct Renderer {
     /// Window surface; `None` for surfaceless (offscreen preview) renderers.
     surface: Option<wgpu::Surface<'static>>,
@@ -334,6 +362,10 @@ pub struct Renderer {
     frame_idx: usize,         // ping-pong 0/1
 
     white: wgpu::BindGroup, // 1×1 white, for all solid quads
+    /// 64×64 white disc (anti-aliased), for the pause button backdrop.
+    disc: wgpu::BindGroup,
+    /// 64×64 white play triangle (▶), shown while paused.
+    play_tri: wgpu::BindGroup,
     textures: HashMap<String, TexEntry>,
     background: Option<(wgpu::BindGroup, [f32; 2])>,
     background_dim: f32,
@@ -341,6 +373,10 @@ pub struct Renderer {
     playfield_aspect: f32,
     /// Playback progress 0..1 for the top progress bar.
     progress: f32,
+    /// Phigros-style HUD (song/difficulty/score/combo/pause) drawn each frame.
+    hud: HudData,
+    /// Screen rect of the pause button (window px), for hit-testing.
+    pause_rect: PauseHitRect,
     pub vsync: bool,
     /// Post-processing pipeline (effects from extra.json).
     pub post: post::PostPipe,
@@ -470,6 +506,50 @@ impl Renderer {
 
         let white_tex = Self::create_texture(&device, &queue, &[255; 4], 1, 1);
         let white = Self::texture_bind_group(&device, &tex_bgl, &sampler, &white_tex);
+        // 64×64 anti-aliased white disc (pause button backdrop / play dot).
+        let disc = {
+            const N: usize = 64;
+            let mut px = [0u8; N * N * 4];
+            let c = (N as f32 - 1.0) * 0.5;
+            for y in 0..N {
+                for x in 0..N {
+                    let d = (((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt() - c) / 2.0;
+                    let a = (0.5 - d).clamp(0.0, 1.0);
+                    let i = (y * N + x) * 4;
+                    px[i] = 255; px[i + 1] = 255; px[i + 2] = 255;
+                    px[i + 3] = (a * 255.0) as u8;
+                }
+            }
+            let tex = Self::create_texture(&device, &queue, &px, N as u32, N as u32);
+            Self::texture_bind_group(&device, &tex_bgl, &sampler, &tex)
+        };
+        // 64×64 anti-aliased white play triangle (▶), shown while paused.
+        let play_tri = {
+            const N: usize = 64;
+            let mut px = [0u8; N * N * 4];
+            // Triangle: top-left (8,10), bottom-left (8,54), right tip (58,32).
+            // Edge SDF: inside = x >= 8 && y between the two slanted edges.
+            let (x0, yt, yb, xt) = (8.0f32, 10.0f32, 54.0f32, 58.0f32);
+            for y in 0..N {
+                for x in 0..N {
+                    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    if fx < x0 || fy < yt || fy > yb { continue; }
+                    let top_slope = (32.0 - yt) / (xt - x0);   // dy/dx of top edge
+                    let bot_slope = (32.0 - yb) / (xt - x0);   // dy/dx of bottom edge
+                    let top_y = yt + (fx - x0) * top_slope;
+                    let bot_y = yb + (fx - x0) * bot_slope;
+                    if fy < top_y || fy > bot_y { continue; }
+                    // AA: distance to the nearest edge (in px).
+                    let d = ((fx - x0).min(fy - top_y).min(bot_y - fy)).min(1.0).max(0.0);
+                    let a = d;
+                    let i = (y * N + x) * 4;
+                    px[i] = 255; px[i + 1] = 255; px[i + 2] = 255;
+                    px[i + 3] = (a * 255.0) as u8;
+                }
+            }
+            let tex = Self::create_texture(&device, &queue, &px, N as u32, N as u32);
+            Self::texture_bind_group(&device, &tex_bgl, &sampler, &tex)
+        };
 
         let post = post::PostPipe::new(&device, width, height, format);
         let scene_tex = Some(post::PostPipe::make_target2(&device, width, height, "scene", format));
@@ -493,11 +573,15 @@ impl Renderer {
             instance_capacity: INITIAL_DRAW_CAPACITY,
             frame_idx: 0,
             white,
+            disc,
+            play_tri,
             textures: HashMap::new(),
             background: None,
             background_dim: 1.0,
             playfield_aspect: ASPECT,
             progress: 0.0,
+            hud: HudData::default(),
+            pause_rect: PauseHitRect::default(),
             post,
             scene_tex,
             scene_view,
@@ -663,6 +747,25 @@ impl Renderer {
     /// Update the top progress bar (0..1).
     pub fn set_progress(&mut self, progress: f32) {
         self.progress = progress.clamp(0.0, 1.0);
+    }
+
+    /// Update the HUD contents for this frame (song name / difficulty /
+    /// score / combo / pause state). `visible=false` hides the HUD (editor
+    /// panels on screen). Pause button clicks are hit-tested against the
+    /// rect recorded by the previous frame's draw ([`Self::pause_rect`]).
+    pub fn set_hud(&mut self, hud: HudData) {
+        self.hud = hud;
+    }
+
+    /// Window-px rect of the pause button from the last drawn frame.
+    pub fn pause_rect(&self) -> PauseHitRect {
+        self.pause_rect
+    }
+
+    /// Hit-test a window-px click against the last frame's pause button.
+    pub fn hit_test_pause(&self, x: f32, y: f32) -> bool {
+        let r = self.pause_rect;
+        r.w > 0.0 && x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
     }
 
     pub fn load_texture(&mut self, name: &str, bytes: &[u8]) -> anyhow::Result<()> {
@@ -1032,34 +1135,162 @@ impl Renderer {
             }
         }
         }
+        // ── Phigros-style HUD ───────────────────────────────────────────
+        // Score (top-left), combo number (top-center) with "COMBO" caption
+        // below it, song name (bottom-left), difficulty (bottom-right), the
+        // pause button (top-right) and the top progress bar.
+        //
+        // attachUI is an RPE format feature: the judge line carries an
+        // `attachUI` binding ("score"/"combonumber"/"combo"/"pause"/"name"/
+        // "level"/"bar") that links it to one game HUD element. The element
+        // sits at its default anchor and the bound line's transform is
+        // applied on top — position/rotation/scale/alpha/color — as a
+        // relative transform, never an absolute position. Drawn through the
+        // scene pipeline so exports (readback / embedded engine) include it.
+        if self.hud.visible {
+            let hud = &self.hud;
+            // attachUI lookup: first matching line per binding.
+            let ui_line = |name: &str| frame.lines.iter().find(|l| l.attach_ui.as_deref() == Some(name));
+            // RPE attachUI transform of the bound line:
+            //   Some(transform) — line exists & visible (alpha > 0): draw at
+            //                     the default anchor + line transform offset.
+            //   None — no bound line: draw at the default anchor, opaque.
+            //   Hidden — line exists but alpha <= 0 (or pe_hide): DON'T draw
+            //            (the element is faded out by the line's alpha).
+            enum HudBind { Hidden, Default, Bound([f32; 2], f32, f32, f32, [f32; 4]) }
+            let bind = |name: &str| -> HudBind {
+                let Some(l) = ui_line(name) else { return HudBind::Default };
+                if l.pe_hide || l.alpha <= 0.0 { return HudBind::Hidden; }
+                // Offset in canvas px (line position is a delta, not absolute).
+                let off = [l.position[0] * CANVAS_W * ev_x, l.position[1] * CANVAS_H * ev_y];
+                let a = l.alpha * l.ctrl_alpha;
+                let c = l.color;
+                HudBind::Bound(off, l.rotation, l.scale[0], a, [c[0], c[1], c[2], c[3]])
+            };
+            // Default: no binding → offset 0, no rotation, scale 1, white.
+            let dflt = ([0.0, 0.0], 0.0, 1.0, 1.0, [1.0, 1.0, 1.0, 1.0]);
+            let mut el = |name: &str, text: &str, anchor: TextAnchor| {
+                let (off, rot, sc, a, c) = match bind(name) {
+                    HudBind::Hidden => return,
+                    HudBind::Default => dflt,
+                    HudBind::Bound(off, rot, sc, a, c) => (off, rot, sc, a, c),
+                };
+                let col = [c[0], c[1], c[2], c[3] * a];
+                text::draw_text_queued(
+                    &mut self.text, &self.device, &self.queue, &self.tex_bgl, &self.sampler,
+                    aspect, text, anchor, off, rot, sc, col,
+                );
+            };
 
-        // attachUI labels: show where the game UI elements (score/combo/pause/
-        // name/level) sit, following each line's transform. "bar" is drawn as
-        // the bound progress bar above instead. Field borrows only — `cmds`
-        // still borrows self.background/self.white/self.textures.
-        for line in frame.lines.iter() {
-            let Some(ui) = line.attach_ui.as_deref() else { continue };
-            if ui == "bar" || line.pe_hide || line.alpha <= 0.0 { continue; }
-            let pos = [line.position[0] * CANVAS_W * ev_x, line.position[1] * CANVAS_H * ev_y];
-            let a = line.alpha * line.ctrl_alpha;
-            text::draw_text_world(
-                &mut self.text,
-                &self.device,
-                &self.queue,
-                &self.tex_bgl,
-                &self.sampler,
-                aspect,
-                &ui.to_uppercase(),
-                pos,
-                line.rotation,
-                [1.0, 1.0, 1.0, a],
-            );
+            // Score (top-left)
+            el("score", &format!("{}", hud.score), TextAnchor::TopLeft);
+            // Combo: number top-center + "COMBO" caption below, only >= 3
+            // (RPE/Phigros behavior: combo hidden until the 3rd).
+            if hud.combo >= 3 {
+                el("combonumber", &format!("{}", hud.combo), TextAnchor::TopCenter);
+                el("combo", "COMBO", TextAnchor::ComboLabel);
+            }
+            // Song name (bottom-left)
+            if !hud.chart_name.is_empty() {
+                el("name", hud.chart_name.as_str(), TextAnchor::BottomLeft);
+            }
+            // Difficulty (bottom-right)
+            if !hud.difficulty.is_empty() {
+                el("level", hud.difficulty.as_str(), TextAnchor::BottomRight);
+            }
+
+            // Pause button (top-right of the playfield box): circular
+            // translucent backdrop with two bars (pause icon); while paused
+            // the bars swap to a play triangle (▶). No glyph font
+            // dependency — all geometry.
+            let btn_size = 44.0; // canvas px backdrop diameter
+            let pause_w = 9.0; // canvas px bar width
+            let pause_h = 22.0; // bar height
+            let box_top = 675.0 / aspect;
+            let default_bc = [CANVAS_W - btn_size * 0.5 - 12.0, box_top - btn_size * 0.5 - 10.0];
+            let (off, rot, _sc, a, c) = match bind("pause") {
+                HudBind::Hidden => ([0.0, 0.0], 0.0, 1.0, 0.0, [1.0, 1.0, 1.0, 1.0]),
+                HudBind::Default => dflt,
+                HudBind::Bound(off, rot, sc, a, c) => (off, rot, sc, a, c),
+            };
+            let bc = [default_bc[0] + off[0], default_bc[1] + off[1]];
+            if a > 0.0 {
+                let col = [c[0], c[1], c[2], c[3] * a];
+                // Circular backdrop (anti-aliased disc texture).
+                let bg_m = mat_mul(
+                    &letterbox,
+                    &mat_mul(
+                        &mat_translate(bc[0], bc[1]),
+                        &mat_mul(&mat_rotate(rot), &mat_scale(btn_size, btn_size)),
+                    ),
+                );
+                cmds.push(DrawCmd {
+                    uniform: DrawUniform { model: bg_m, color: [0.05, 0.05, 0.08, 0.55 * a], uv_rect: [0., 0., 1., 1.] },
+                    tex: &self.disc,
+                });
+                if hud.paused {
+                    // Play icon: triangle (▶), slightly smaller than the bars.
+                    let tri_h = pause_h * 0.95;
+                    let tri_m = mat_mul(
+                        &letterbox,
+                        &mat_mul(
+                            &mat_translate(bc[0], bc[1]),
+                            &mat_mul(
+                                &mat_rotate(rot),
+                                &mat_scale(tri_h * 1.25, tri_h),
+                            ),
+                        ),
+                    );
+                    cmds.push(DrawCmd {
+                        uniform: DrawUniform { model: tri_m, color: col, uv_rect: [0., 0., 1., 1.] },
+                        tex: &self.play_tri,
+                    });
+                } else {
+                    // Pause icon: two bars, tight spacing (±1.1×bar width).
+                    for s in [-1.0f32, 1.0] {
+                        let bar_m = mat_mul(
+                            &letterbox,
+                            &mat_mul(
+                                &mat_translate(bc[0], bc[1]),
+                                &mat_mul(
+                                    &mat_rotate(rot),
+                                    &mat_translate(s * pause_w * 1.1, 0.0),
+                                ),
+                            ),
+                        );
+                        let bar_m = mat_mul(&bar_m, &mat_scale(pause_w, pause_h));
+                        cmds.push(DrawCmd {
+                            uniform: DrawUniform { model: bar_m, color: col, uv_rect: [0., 0., 1., 1.] },
+                            tex: &self.white,
+                        });
+                    }
+                }
+            }
+            // Record the pause hit rect in window px. World text scales with
+            // the letterbox: map the button center through it. Zeroed when
+            // the button is hidden (faded out by its attachUI line) so it
+            // can't be clicked.
+            let win = [self.size[0] as f32, self.size[1] as f32];
+            if a <= 0.0 {
+                self.pause_rect = PauseHitRect::default();
+            } else {
+                let (nx, ny) = (
+                    bc[0] * kx / CANVAS_W,
+                    bc[1] * ky * aspect / CANVAS_W,
+                );
+                self.pause_rect = PauseHitRect {
+                    x: (nx + 1.0) * 0.5 * win[0] - btn_size * kx / CANVAS_W * win[0] * 0.25,
+                    y: (1.0 - ny) * 0.5 * win[1] - btn_size * ky * aspect / CANVAS_W * win[1] * 0.25,
+                    w: btn_size * kx / CANVAS_W * win[0] * 0.5,
+                    h: btn_size * ky * aspect / CANVAS_W * win[1] * 0.5,
+                };
+            }
         }
 
         // Hit effects: sprite-sheet bursts in canvas-pixel space, after notes.
-        // Progress bar: bound to the attachUI "bar" line when present (phira
-        // UIElement::Bar follows the line transform); falls back to the visible
-        // canvas top edge otherwise.
+        // Progress bar: bound to the attachUI "bar" line when present (RPE
+        // attachUI: the bar follows the line transform); falls back to the
+        // visible canvas top edge otherwise.
         if self.progress > 0.0 {
             let bar_h = 5.0;
             // Bar anchored at the box top-left in the raw letterbox space:

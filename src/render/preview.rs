@@ -236,6 +236,11 @@ impl PreviewEngine {
         self.renderer.set_progress(progress);
     }
 
+    /// Set the Phigros-style HUD (delegates to [`Renderer::set_hud`]).
+    pub fn set_hud(&mut self, hud: crate::render::HudData) {
+        self.renderer.set_hud(hud);
+    }
+
     /// Read-only access to the last rendered RGBA frame.
     pub fn pixels(&self) -> &[u8] { &self.pixels }
 

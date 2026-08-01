@@ -451,6 +451,15 @@ impl State {
         let ui_bg = if self.show_overlay { Some(self.overlay.bind_group()) } else { None };
         let ui_iced = if self.show_overlay { Some(self.overlay.iced_bind_group()) } else { None };
 
+        // Phigros-style HUD: hidden while editor panels cover the screen.
+        self.renderer.set_hud(render::HudData {
+            chart_name: self.info.name.clone(),
+            difficulty: self.info.level.clone(),
+            score,
+            combo: self.combo,
+            paused: self.audio.as_ref().is_some_and(|a| a.is_paused()),
+            visible: !self.show_overlay,
+        });
         self.renderer.set_progress(audio_time as f32 / duration as f32);
         match self.renderer.surface_acquire() {
             Ok(st) => {
@@ -736,6 +745,15 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state: btn_state, button: winit::event::MouseButton::Left, .. } => {
+                // HUD pause button (window px hit-test against last frame).
+                if btn_state == ElementState::Pressed {
+                    if let Some(m) = state.overlay.mouse_pos {
+                        if !state.show_overlay && state.renderer.hit_test_pause(m.0, m.1) {
+                            if let Some(a) = &state.audio { a.set_paused(!a.is_paused()); }
+                            return;
+                        }
+                    }
+                }
                 state.overlay.handle_click(btn_state == ElementState::Pressed, state.ctrl);
             }
             WindowEvent::MouseInput { state: btn_state, button: winit::event::MouseButton::Right, .. } => {

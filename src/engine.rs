@@ -176,6 +176,14 @@ impl ChartSession {
         self.chart.as_ref().map(|c| c.max_combo()).unwrap_or(0)
     }
 
+    /// Set the Phigros-style HUD (song name / difficulty / score / combo /
+    /// pause). Drawn inside the render pipeline, so exported frames include
+    /// it; `visible=false` hides it. Pause-button clicks are not interactive
+    /// in the embedded engine (hit-testing is window-side).
+    pub fn set_hud(&mut self, hud: render::HudData) {
+        self.engine.set_hud(hud);
+    }
+
     /// Access the underlying preview renderer for advanced use.
     pub fn engine(&mut self) -> &mut render::preview::PreviewEngine {
         &mut self.engine
