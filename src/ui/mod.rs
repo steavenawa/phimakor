@@ -160,6 +160,9 @@ pub struct IcedOverlay {
     layer_click: Option<f32>,
     pub tl_scroll: f32,
     pub tl_zoom: f32,
+    /// 时间轴是否跟随播放头滚动。手动滚轮滚动会置 false(视图停住),
+    /// seek 时重新置 true。
+    pub tl_follow: bool,
     pub gui_scale: f32,
     select_start: Option<(f32, f32)>,
     select_end: Option<(f32, f32)>,
@@ -198,7 +201,7 @@ impl IcedOverlay {
             notes_progress: 0.0, mouse_pos: None, show_overlay: true, tl_visible: false,
             tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 4],
             panel_defs: Vec::new(), messages: Vec::new(), timeline_click: None,
-            layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, gui_scale: 1.0,
+            layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, gui_scale: 1.0,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
             drag_note: None, drag_updated: None, ctx_pos: None, ctx_progress: 0.0,
             mouse_beat: 0.0, notes_cache: Arc::new(Vec::new()), last_drawn_beat: 0.0, show_menu: false,
@@ -315,8 +318,19 @@ impl IcedOverlay {
     }
 
     /// Scroll the timeline (mouse wheel). `delta` is the notch value.
+    /// Manual scrolling stops the playhead auto-follow (`tl_follow = false`)
+    /// so the view doesn't snap back next frame.
     pub fn timeline_scroll(&mut self, delta: f32) {
+        self.tl_follow = false;
         self.tl_scroll = (self.tl_scroll - delta * self.tl_zoom * 0.15).max(0.0);
+    }
+
+    /// Snap the timeline scroll position to the beat grid (`snap` in beats,
+    /// e.g. 0.25) so the window top aligns with a snap boundary after wheel
+    /// scrolling.
+    pub fn snap_timeline_scroll(&mut self, snap: f32) {
+        let s = snap.max(0.0001);
+        self.tl_scroll = (self.tl_scroll / s).round() * s;
     }
 
     pub fn handle_click(&mut self, pressed: bool, ctrl: bool) {
@@ -632,7 +646,7 @@ impl IcedOverlay {
         let events_x = props_x - ep * TL_W * s;
         let notes_x = events_x - np * NT_W * s;
         if self.tl_visible {
-            self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
+            if self.tl_follow { self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0); }
             let (scroll, zoom) = (self.tl_scroll as f64, self.tl_zoom as f64);
             let (min_b, max_b) = (scroll, scroll + zoom);
             let head_h = HEADER_H * s;
@@ -729,7 +743,7 @@ impl IcedOverlay {
         let events_x = props_x - ep * TL_W * s;
         let notes_x = events_x - np * NT_W * s;
         if self.tl_visible {
-            self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
+            if self.tl_follow { self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0); }
             let (scroll, zoom) = (self.tl_scroll as f64, self.tl_zoom as f64);
             let (min_b, max_b) = (scroll, scroll + zoom);
             let head_h = HEADER_H * s;
@@ -810,7 +824,7 @@ impl IcedOverlay {
         let notes_x = events_x - np * nt_w;  // Notes left of Events
 
         if self.tl_visible {
-            self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
+            if self.tl_follow { self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0); }
             let _s2 = trace_span!("tl_notes_draw");
             if info.show_notes {
                 draw_notes_timeline(&mut self.pixmap.as_mut(), self.tl_scroll, self.tl_zoom, info, notes_x, vh, s);

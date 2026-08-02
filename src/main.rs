@@ -291,6 +291,8 @@ impl State {
         let _s = trace_span!("seek");
         let t = t.clamp(0.0, self.chart.duration());
         if let Some(a) = &self.audio { a.seek(t); }
+        // Seek 回到播放头跟随模式(手动滚动时间轴后 seek 会重新吸附)。
+        self.overlay.tl_follow = true;
         self.pending_seek = Some(t);
         let off = (self.chart.offset() + self.info.offset) as f64;
         let ct = (t - off).max(0.0);
@@ -806,6 +808,8 @@ impl ApplicationHandler for App {
                             state.overlay.timeline_zoom_in(dy);
                         } else if state.overlay.mouse_pos.map_or(false, |(_, my)| my >= 28.0) {
                             state.overlay.timeline_scroll(dy);
+                            // 滚轮滚动时间轴后吸附到拍数网格,窗口顶部对齐 snap 边界。
+                            state.overlay.snap_timeline_scroll(state.snap);
                         }
                     } else {
                         let t = state.audio.as_ref().map(|a| a.time()).unwrap_or(0.0) + dy as f64 * -0.5;
@@ -930,7 +934,7 @@ impl ApplicationHandler for App {
                         KeyCode::F1 => { state.show_overlay = !state.show_overlay; state.ui_dirty = true; }
                         KeyCode::F3 => { state.show_properties = !state.show_properties; state.ui_dirty = true; }
                         KeyCode::F4 => { state.show_events = !state.show_events; state.ui_dirty = true; }
-                        KeyCode::F5 => { if state.ctrl { state.full_notes = !state.full_notes; } else { state.show_notes = !state.show_notes; } state.ui_dirty = true; }
+                        KeyCode::F5 => { if state.ctrl { state.full_notes = !state.full_notes; state.cache_valid = false; } else { state.show_notes = !state.show_notes; } state.ui_dirty = true; }
                         KeyCode::F6 => { state.renderer.set_vsync(!state.renderer.vsync); state.ui_dirty = true; }
                         KeyCode::F7 => { state.debug_memory(); }
                         KeyCode::BracketLeft => { state.gui_scale = (state.gui_scale - 0.1).max(0.5); state.ui_dirty = true; }
