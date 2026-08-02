@@ -144,34 +144,47 @@ fn sanitize_events(events: &mut [PecEvent]) {
 /// conventions (see [`parse_judge_line`] factors):
 /// move_x ×2/1350, move_y ×2/900, rotation ×-1, alpha raw (×1/255), and the
 /// PEC raw domain (x 0..2048, y 0..1400, rotation degrees, alpha 0..255).
+///
+/// Interpolating events (cm/cr/cf) follow prpr's parse_events semantics:
+/// they tween from the PREVIOUS keyframe's value to their end value — the
+/// start value is the last value seen, not their own end.
 fn pec_to_rpe_events(events: Vec<PecEvent>, kind: &str) -> Vec<RPEEvent> {
     let mut out = Vec::with_capacity(events.len());
+    // prpr bails if an interpolating event appears before any concrete value;
+    // here we fall back to the event's own end (no visible transition).
+    let mut prev: Option<f32> = None;
     for e in events {
         let (start, end) = (e.start, e.end.max(e.start));
-        let rpe = |v: f32| -> RPEEvent {
-            RPEEvent {
-                start_time: Triple::from_beats(start),
-                end_time: Triple::from_beats(end),
-                start: v, end: v,
-                easing_type: pec_tween(e.tween) as i32,
-                easing_left: 0.0, easing_right: 1.0,
-                bezier: 0, bezier_points: [0.0; 4],
+        let remap = |v: f32| -> f32 {
+            match kind {
+                // PhiEdit PEC (prpr parse/pec.rs): event x is 0..2048 with
+                // 1024 = center, event y is 0..1400 with 700 = center, both
+                // normalized as (v/half)*2 - 1. Convert to RPE canvas px:
+                // ×675 for x (parse_judge_line applies ×2/1350), ×450 for y.
+                "x" => (v / 1024.0 - 1.0) * 675.0,
+                "y" => (v / 700.0 - 1.0) * 450.0,
+                // Rotation stays raw degrees (RPE's ×-1 restores the sign).
+                "r" => v,
+                // Alpha stays raw (RPE scales alpha by 1/255 itself).
+                _ => v,
             }
         };
-        let v = e.value;
-        let remapped = match kind {
-            // PhiEdit PEC (prpr parse/pec.rs): event x is 0..2048 with
-            // 1024 = center, event y is 0..1400 with 700 = center, both
-            // normalized as (v/half)*2 - 1. Convert to RPE canvas px:
-            // ×675 for x (parse_judge_line applies ×2/1350) and ×450 for y.
-            "x" => (v / 1024.0 - 1.0) * 675.0,
-            "y" => (v / 700.0 - 1.0) * 450.0,
-            // Rotation stays raw degrees (RPE's ×-1 restores the sign).
-            "r" => v,
-            // Alpha stays raw (RPE scales alpha by 1/255 itself).
-            _ => v,
+        let end_v = remap(e.value);
+        let start_v = if start == end {
+            end_v
+        } else {
+            prev.unwrap_or(end_v)
         };
-        out.push(rpe(remapped));
+        out.push(RPEEvent {
+            start_time: Triple::from_beats(start),
+            end_time: Triple::from_beats(end),
+            start: start_v,
+            end: end_v,
+            easing_type: pec_tween(e.tween) as i32,
+            easing_left: 0.0, easing_right: 1.0,
+            bezier: 0, bezier_points: [0.0; 4],
+        });
+        prev = Some(end_v);
     }
     out
 }
