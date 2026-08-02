@@ -361,10 +361,12 @@ impl TweenFunction for IntClampedTween {
 
 impl IntClampedTween {
     /// Create an integrated clamped tween from a standard [`TweenId`] and an
-    /// `x` range; the `y` range is computed automatically.
+    /// `x` range; the `y` range is computed automatically (normalized for
+    /// non-monotone tweens).
     pub fn new(tween_id: TweenId, x_range: Range<f32>) -> Self {
         let tween = TWEEN_FUNCTIONS[tween_id as usize];
-        let y_range = tween(x_range.start)..tween(x_range.end);
+        let (a, b) = (tween(x_range.start), tween(x_range.end));
+        let y_range = a.min(b)..a.max(b);
         let base = INT_TWEEN_FUNCTIONS[tween_id as usize](x_range.start);
         Self {
             tween_id,
@@ -375,12 +377,20 @@ impl IntClampedTween {
     }
 }
 
-// TODO assuming monotone, but actually they're not (e.g. Back tween)
 /// A standard tween clamped to given `x` and `y` ranges.
+///
+/// NOTE: the y range is the interval between the tween's values at the range
+/// endpoints. Non-monotone tweens (Back/Elastic/Bounce) overshoot beyond it
+/// mid-interval; the range is normalized (min..max) so it stays well-formed.
 pub struct ClampedTween(pub TweenId, pub Range<f32>, pub Range<f32>);
 impl TweenFunction for ClampedTween {
     fn y(&self, x: f32) -> f32 {
-        (TWEEN_FUNCTIONS[self.0 as usize](f32::tween(&self.1.start, &self.1.end, x)) - self.2.start) / (self.2.end - self.2.start)
+        let y = TWEEN_FUNCTIONS[self.0 as usize](f32::tween(&self.1.start, &self.1.end, x));
+        let span = self.2.end - self.2.start;
+        if span.abs() < 1e-6 {
+            return 0.5; // degenerate range: no meaningful clamp
+        }
+        (y - self.2.start) / span
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -390,10 +400,11 @@ impl TweenFunction for ClampedTween {
 
 impl ClampedTween {
     /// Create a clamped tween from a [`TweenId`] and `x` range; the `y` range
-    /// is computed automatically.
+    /// is computed automatically (normalized for non-monotone tweens).
     pub fn new(tween: TweenId, range: Range<f32>) -> Self {
         let f = TWEEN_FUNCTIONS[tween as usize];
-        let y_range = f(range.start)..f(range.end);
+        let (a, b) = (f(range.start), f(range.end));
+        let y_range = a.min(b)..a.max(b);
         Self(tween, range, y_range)
     }
 }
@@ -593,8 +604,10 @@ pub const RPE_TWEEN_MAP: [TweenId; 30] = {
 pub trait Tweenable: Clone {
     /// Linearly interpolate between `x` and `y` at parameter `t` ∈ [0, 1].
     fn tween(x: &Self, y: &Self, t: f32) -> Self;
+    /// Combine two values for chained animations (see [`Anim::chain`]);
+    /// usually component-wise addition.
     fn add(_x: &Self, _y: &Self) -> Self {
-        unimplemented!()
+        panic!("Tweenable::add not implemented for {}", std::any::type_name::<Self>())
     }
 }
 
@@ -626,6 +639,11 @@ impl Tweenable for Color {
             b: f32::tween(&x.b, &y.b, t),
             a: f32::tween(&x.a, &y.a, t),
         }
+    }
+
+    /// Component-wise addition for chained color animations.
+    fn add(x: &Self, y: &Self) -> Self {
+        Self { r: x.r + y.r, g: x.g + y.g, b: x.b + y.b, a: x.a + y.a }
     }
 }
 
@@ -733,4 +751,49 @@ pub fn speed_segment_tween(mode: SpeedEasingMode, start_speed: f32, end_speed: f
     }
     .unwrap_or_else(|| (speed_linear_tween(start_speed, end_speed), (start_speed + end_speed) / 2.));
     (tween, total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::anim::{Anim, Keyframe};
+    use crate::core::Color;
+
+    #[test]
+    fn clamped_tween_non_monotone_range_normalized() {
+        // Back tween overshoots: f(0) and f(1) both > 1 or < 1. The y range
+        // must stay well-formed (start <= end) so y() never divides by a
+        // negative span.
+        let id = RPE_TWEEN_MAP[20]; // backOut
+        let c = ClampedTween::new(id, 0.2..0.8);
+        assert!(c.2.start <= c.2.end);
+        for t in [0.0, 0.25, 0.5, 0.75, 1.0] {
+            let y = c.y(t);
+            assert!(y.is_finite(), "y({t}) not finite");
+        }
+        // Degenerate range: no division by zero.
+        let d = ClampedTween::new(id, 0.5..0.5);
+        assert!((d.y(0.0) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn color_chain_does_not_panic() {
+        // Tweenable::add was unimplemented!() for Color; chained color
+        // animations panicked. Component-wise add keeps chains working.
+        let a = Anim::new(vec![Keyframe::new(0.0, Color::WHITE, 0)]);
+        let b = Anim::new(vec![Keyframe::new(0.0, Color::WHITE, 0)]);
+        let mut chained = Anim::chain(vec![a, b]);
+        chained.set_time(0.5);
+        let v = chained.now_opt().expect("chained color anim must resolve");
+        assert!((v.r - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn empty_chain_contributes_nothing() {
+        let a = Anim::new(vec![Keyframe::new(0.0, 1.0f32, 0)]);
+        let empty = Anim::default();
+        let mut chained = Anim::chain(vec![a, empty]);
+        chained.set_time(0.5);
+        assert!((chained.now_opt().unwrap() - 1.0).abs() < 1e-6);
+    }
 }

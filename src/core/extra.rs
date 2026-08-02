@@ -6,6 +6,7 @@
 //! computes their current uniform values.
 
 use crate::core::bpm::Triple;
+use crate::core::easing::{RPE_TWEEN_MAP, TWEEN_FUNCTIONS};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -195,30 +196,21 @@ fn sorted_keys(map: &HashMap<String, serde_json::Value>) -> Vec<String> {
     keys
 }
 
-/// prpr easing types (subset). Ported from prpr easing constants.
+/// RPE `easingType` → engine tween curve.
+///
+/// Single source of truth: the main chart evaluator uses the same table, so
+/// extra.json effects and chart events agree on easing semantics. (This file
+/// used to carry its own table where 1 = quad-in — RPE 1 is linear — giving
+/// two different interpolation results for the same chart.)
 fn apply_easing(t: f32, easing: i32) -> f32 {
-    if t <= 0.0 { return 0.0; }
-    if t >= 1.0 { return 1.0; }
-    match easing {
-        0 => t,                                    // linear
-        1 => t * t,                                // ease_in_quad
-        2 => 1.0 - (1.0 - t) * (1.0 - t),          // ease_out_quad
-        3 => if t < 0.5 { 2.0 * t * t } else { 1.0 - (-2.0 * t + 2.0).powi(2) / 2.0 }, // ease_in_out_quad
-        4 => t * t * t,                            // ease_in_cubic
-        5 => 1.0 - (1.0 - t).powi(3),               // ease_out_cubic
-        6..=19 => ease_smoothstep(t, easing - 6),
-        _ => t,
+    if t <= 0.0 {
+        return 0.0;
     }
-}
-
-/// prpr smoothstep variants (6→0, 7→1, ... 19→13).
-fn ease_smoothstep(t: f32, variant: i32) -> f32 {
-    let s = (variant as f32).max(0.0).min(13.0);
-    if s == 0.0 { return t * t * (3.0 - 2.0 * t); }  // smoothstep
-    // Higher-order smoothsteps: t^(s+2) * poly
-    let n = s + 2.0;
-    let p = t.powf(n);
-    p / (p + (1.0 - t).powf(n))
+    if t >= 1.0 {
+        return 1.0;
+    }
+    let idx = (easing as usize).max(1).min(RPE_TWEEN_MAP.len() - 1);
+    TWEEN_FUNCTIONS[RPE_TWEEN_MAP[idx] as usize](t)
 }
 
 // ── Tests ──
@@ -246,5 +238,20 @@ mod tests {
         assert_eq!(active[0].shader_name, "grayscale");
         assert!((active[0].uniforms[0] - 0.5).abs() < 0.01);
         assert_eq!(active[0].uniforms_names[0], "factor");
+    }
+
+    #[test]
+    fn easing_matches_engine_table() {
+        // RPE easingType 1 is linear (same curve as 0); this file used to map
+        // 1 → quad-in, giving results that disagreed with the chart evaluator.
+        for t in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            assert!((apply_easing(t, 1) - t).abs() < 1e-6, "easing 1 at {t}");
+            assert!((apply_easing(t, 0) - apply_easing(t, 1)).abs() < 1e-6);
+        }
+        // Index 2 is sine-out in RPE_TWEEN_MAP, and 8 is cubic-out.
+        let sine_out = TWEEN_FUNCTIONS[RPE_TWEEN_MAP[2] as usize];
+        let cubic_out = TWEEN_FUNCTIONS[RPE_TWEEN_MAP[8] as usize];
+        assert!((apply_easing(0.5, 2) - sine_out(0.5)).abs() < 1e-6);
+        assert!((apply_easing(0.5, 8) - cubic_out(0.5)).abs() < 1e-6);
     }
 }

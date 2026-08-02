@@ -136,11 +136,15 @@ impl<T: Tweenable> Anim<T> {
     }
 
     /// Interpolate the current value, returning `None` if there are no keyframes.
-    /// Chains into `next` animations, summing their values.
+    /// Chains into `next` animations, summing their values. An empty chained
+    /// animation contributes nothing (instead of panicking).
     pub fn now_opt(&self) -> Option<T> {
         self.now_opt_inner().map(|now| {
             if let Some(next) = &self.next {
-                T::add(&now, &next.now_opt().unwrap())
+                match next.now_opt() {
+                    Some(next_now) => T::add(&now, &next_now),
+                    None => now,
+                }
             } else {
                 now
             }
