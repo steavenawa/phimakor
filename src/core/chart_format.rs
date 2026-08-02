@@ -232,8 +232,20 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
         }
         match cmd {
             "bp" => {
-                let bpm = f64t!();
-                let start_beats = f64t!();
+                let a = f64t!();
+                let b = f64t!();
+                // PEC dialects disagree on the argument order: prpr writes
+                // `bp <bpm> <beats>`, RPE's exporter writes `bp <beats> <bpm>`.
+                // A beat is never a plausible BPM, so use that to disambiguate.
+                let plausible_bpm = |v: f64| v > 0.0 && v <= 999.0;
+                let (bpm, start_beats) = match (plausible_bpm(a), plausible_bpm(b)) {
+                    (true, false) => (a, b),
+                    (false, true) => (b, a),
+                    _ => (a, b),
+                };
+                if bpm <= 0.0 {
+                    return Err(anyhow::anyhow!("{}: `bp`: BPM must be positive, got {bpm}", ctx()));
+                }
                 bpm_list.push(RPEBpmItem { bpm, start_time: Triple::from_beats(start_beats) });
             }
             "n1" | "n2" | "n3" | "n4" => {
@@ -703,6 +715,35 @@ n1 0 1 512 1 0
         assert_eq!(notes.len(), 1);
         assert!((notes[0].speed - 0.8).abs() < 1e-6);
         assert!((notes[0].size - 1.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pec_rpe_export_dialect() {
+        // RPE's PEC exporter writes `bp <beats> <bpm>` (three repeated lines)
+        // and x in the 0..2048 domain (1024 = center). A 0 BPM used to slip
+        // through and poison the BPM list with inf → NaN beats.
+        const SRC: &str = r#"-30
+bp 0.000 320.000
+bp 0.000 320.000
+bp 0.000 320.000
+n1 0 52.000 -269.000 1 0
+n2 0 84.000 84.098 683.000 1 0
+"#;
+        let chart = parse_pec_text(SRC).unwrap();
+        // bp lines disambiguated to bpm=320 @ beat 0
+        assert_eq!(chart.bpm_list.len(), 3);
+        assert!(chart.bpm_list.iter().all(|b| (b.bpm - 320.0).abs() < 1e-9));
+        assert!(chart.bpm_list.iter().all(|b| b.start_time.beats().abs() < 1e-9));
+        let notes = chart.judge_line_list[0].notes.as_ref().unwrap();
+        assert_eq!(notes.len(), 2);
+        // x: 0..2048 domain → /1024 * 675
+        assert!((notes[0].position_x - (-269.0 / 1024.0 * 675.0)).abs() < 1e-3);
+        assert!((notes[1].position_x - (683.0 / 1024.0 * 675.0)).abs() < 1e-3);
+        // Loading through the full pipeline must not produce NaN beats.
+        let mut c = Chart::from_rpe_chart(&chart, false).unwrap();
+        let frame = c.state_at(1.0);
+        assert!(frame.time.is_finite());
+        assert!(frame.lines[0].notes.iter().all(|n| n.time.is_finite()));
     }
 }
 
