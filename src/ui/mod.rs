@@ -28,7 +28,7 @@ pub mod text;
 pub mod timeline;
 
 pub use font::font_mem_bytes;
-pub use model::{gameinfo_values, EventEntry, GameInfo, NoteEntry};
+pub use model::{gameinfo_values, EffectRow, EventEntry, GameInfo, NoteEntry};
 pub use panel_ui::draw_panel_def;
 pub use primitives::fill_rect_clipped;
 pub use settings::{backend_cycle, backend_label, SettingsData};
@@ -39,6 +39,7 @@ use self::font::get_font;
 use self::primitives::hline;
 use self::timeline::{draw_5col_timeline, draw_notes_timeline, COL_GAP, COL_W, HEADER_H, NT_W, TL_W};
 use self::panel_ui::{draw_effects_panel, draw_quick_panel};
+pub(crate) use self::panel_ui::{effects_hit_test, EffHit};
 use self::model::build_ui;
 
 fn env_flag(name: &str) -> bool {
@@ -892,6 +893,8 @@ pub fn draw_menu(pm: &mut tiny_skia::PixmapMut, vw: f32, vh: f32, s: f32) {
 }
 
 // ── 5-column timeline ──
+
+
 
 
 

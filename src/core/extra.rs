@@ -7,13 +7,13 @@
 
 use crate::core::bpm::Triple;
 use crate::core::easing::{RPE_TWEEN_MAP, TWEEN_FUNCTIONS};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 // ── Serde models matching extra.json ──
 
 /// Root data from extra.json, containing BPM overrides and effect definitions.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtraRoot {
     /// BPM override timeline entries.
@@ -25,7 +25,7 @@ pub struct ExtraRoot {
 }
 
 /// A BPM override entry, specifying a new BPM value at a given time signature.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtraBpmItem {
     /// Time signature (measure, beat, division) at which the override takes effect.
@@ -35,7 +35,7 @@ pub struct ExtraBpmItem {
 }
 
 /// A post-processing effect definition loaded from extra.json.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtraEffect {
     /// Start time of the effect (measure, beat, division).
@@ -53,6 +53,15 @@ pub struct ExtraEffect {
     /// Keyframed uniform variable values.
     #[serde(default)]
     pub vars: HashMap<String, serde_json::Value>,
+}
+
+impl ExtraRoot {
+    /// Write the root back to `path` as pretty JSON (used by the editor's
+    /// Eff panel add/edit flows).
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(self).map_err(|e| format!("extra.json serialize: {e}"))?;
+        std::fs::write(path, json).map_err(|e| format!("extra.json write: {e}"))
+    }
 }
 
 // ── Evaluated effect instance ──
@@ -238,6 +247,34 @@ mod tests {
         assert_eq!(active[0].shader_name, "grayscale");
         assert!((active[0].uniforms[0] - 0.5).abs() < 0.01);
         assert_eq!(active[0].uniforms_names[0], "factor");
+    }
+
+    #[test]
+    fn extra_roundtrip_preserves_effects() {
+        // The editor's Eff panel saves edits via serde — the roundtrip must
+        // preserve effect timing/shader/vars.
+        let root = ExtraRoot {
+            bpm: vec![ExtraBpmItem { time: Triple::from_beats(2.0), bpm: 140.0 }],
+            effects: vec![ExtraEffect {
+                start: Triple::from_beats(4.0),
+                end: Triple::from_beats(8.0),
+                shader: "grayscale".to_string(),
+                global: true,
+                priority: 0,
+                vars: HashMap::from([("factor".to_string(), serde_json::json!(0.5))]),
+            }],
+        };
+        let json = serde_json::to_string(&root).unwrap();
+        let back: ExtraRoot = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.bpm.len(), 1);
+        assert!((back.bpm[0].bpm - 140.0).abs() < 1e-9);
+        assert_eq!(back.effects.len(), 1);
+        let e = &back.effects[0];
+        assert_eq!(e.shader, "grayscale");
+        assert!((e.start.beats() - 4.0).abs() < 1e-9);
+        assert!((e.end.beats() - 8.0).abs() < 1e-9);
+        assert!(e.global);
+        assert_eq!(e.vars["factor"], 0.5);
     }
 
     #[test]

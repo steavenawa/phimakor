@@ -54,6 +54,22 @@ pub fn gameinfo_values(info: &GameInfo) -> std::collections::HashMap<&str, Strin
     m
 }
 
+/// One row in the Eff panel's effect list (all effects, sorted by start beat).
+#[derive(Clone)]
+pub struct EffectRow {
+    /// Index of this effect in `ExtraRoot::effects` (edits map back through it).
+    pub index: usize,
+    /// Shader name (built-in or custom file name).
+    pub shader: String,
+    /// Start/end position in beats.
+    pub start_beats: f64,
+    pub end_beats: f64,
+    /// Whether the effect applies to the whole frame.
+    pub global: bool,
+    /// Whether the effect is active at the current playhead beat.
+    pub active: bool,
+}
+
 pub struct GameInfo {
     pub chart_time: f64, pub chart_beat: f64, pub audio_time: f64, pub fps: f64,
     pub combo: u32, pub hits: u32, pub note_count: usize, pub score: u32,
@@ -81,6 +97,12 @@ pub struct GameInfo {
     pub ev_end_val: f32,
     pub ev_easing: i32,
     pub effect_names: Vec<String>,
+    /// All post-processing effects, sorted by start beat (Eff panel list).
+    pub effects: Arc<Vec<EffectRow>>,
+    /// Selected row index into `effects`, plus the edit field under the
+    /// wheel: 0 = shader, 1 = start, 2 = end, 3 = global.
+    pub selected_effect: Option<usize>,
+    pub eff_edit_field: u8,
 }
 
 pub(crate) fn build_ui<'a>(info: &'a GameInfo, panel: f32) -> Element<'a, (), Theme, Renderer> {

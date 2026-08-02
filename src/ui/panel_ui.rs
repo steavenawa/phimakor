@@ -2,9 +2,10 @@
 
 use super::model::{gameinfo_values, GameInfo};
 use super::font::get_font;
-use super::text::draw_text_on_pixmap;
+use super::text::{draw_text_on_pixmap, text_width};
 use super::primitives::fill_rect_clipped;
 use super::panels;
+use super::timeline::PANEL_W;
 use phimakor::trace_span;
 
 
@@ -114,15 +115,67 @@ pub fn draw_panel_def(pixmap: &mut tiny_skia::PixmapMut, def: &panels::PanelDef,
     }
 }
 
-/// [Eff] panel: show currently active post-processing effects.
+/// Eff panel interaction hit targets (geometry shared with
+/// [`draw_effects_panel`] so draw/hit can't drift).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum EffHit {
+    None,
+    List(usize),
+    Add,
+    Del,
+    Field(u8), // 0=shader, 1=start, 2=end, 3=global
+}
+
+/// Panel geometry constants (draw + hit-test share these).
+fn eff_layout(vw: f32, vh: f32, s: f32, pp: f32) -> (f32, f32, f32, f32) {
+    let pan_w = PANEL_W * s;
+    let bar_h = 48.0 * s;
+    let bg_h = (vh - bar_h).max(1.0);
+    let props_x = vw - pp * pan_w;
+    (props_x, pan_w, bg_h, bar_h)
+}
+
+const EFF_ROW_H: f32 = 22.0;
+
+/// Hit-test the Eff panel (editor mode, tool 3). `n_rows` = effect list length.
+pub(crate) fn effects_hit_test(
+    mx: f32, my: f32, vw: f32, vh: f32, s: f32, pp: f32, n_rows: usize,
+) -> EffHit {
+    let (px, pan_w, bg_h, _) = eff_layout(vw, vh, s, pp);
+    if mx < px || mx > px + pan_w { return EffHit::None; }
+    let row_h = EFF_ROW_H * s;
+    let y0 = 52.0 * s;
+    // List rows
+    if my >= y0 && my < y0 + n_rows as f32 * row_h {
+        let ri = ((my - y0) / row_h) as usize;
+        if ri < n_rows { return EffHit::List(ri); }
+    }
+    // Add / Del buttons under the list
+    let by = y0 + n_rows as f32 * row_h + 6.0 * s;
+    if my >= by && my < by + row_h {
+        if mx >= px + 8.0 * s && mx < px + 8.0 * s + 60.0 * s { return EffHit::Add; }
+        if mx >= px + 72.0 * s && mx < px + 72.0 * s + 60.0 * s { return EffHit::Del; }
+    }
+    // Edit fields pinned to the bottom (only reachable when rows don't cover them)
+    let edit_h = 4.0 * row_h + 8.0 * s;
+    let ey = (bg_h - edit_h).max(y0);
+    if my >= ey && my < ey + 4.0 * row_h {
+        let fi = ((my - ey) / row_h) as u8;
+        if fi < 4 { return EffHit::Field(fi); }
+    }
+    EffHit::None
+}
+
+/// [Eff] panel: effect list + add/delete + per-field editing (wheel).
+/// Layout must stay in sync with [`effects_hit_test`].
 pub(crate) fn draw_effects_panel(pixmap: &mut tiny_skia::PixmapMut, info: &GameInfo, px: f32, _vw: f32, vh: f32, s: f32) {
     if !info.show_overlay { return; }
     if vh < 10.0 { return; }
     let font = get_font();
-    let pan_w = 280.0 * s;
+    let pan_w = PANEL_W * s;
     let bar_h = 48.0 * s;
     let bg_h = (vh - bar_h).max(1.0);
-    let cell_h = 22.0 * s;
+    let cell_h = EFF_ROW_H * s;
 
     let mut bg = tiny_skia::Paint::default();
     bg.set_color_rgba8(12, 12, 14, 200);
@@ -132,15 +185,87 @@ pub(crate) fn draw_effects_panel(pixmap: &mut tiny_skia::PixmapMut, info: &GameI
 
     let mut y = 28.0 * s;
     if let Some(font) = font {
-        draw_text_on_pixmap(pixmap, "Active Effects", px + 8.0 * s, y, 12.0 * s, font);
-        y += cell_h * 2.0;
+        draw_text_on_pixmap(pixmap, &format!("Effects ({})", info.effects.len()), px + 8.0 * s, y, 12.0 * s, font);
+    }
+    y += 20.0 * s;
 
-        if info.effect_names.is_empty() {
-            draw_text_on_pixmap(pixmap, "(none)", px + 8.0 * s, y, 10.0 * s, font);
-        } else {
-            for name in &info.effect_names {
-                draw_text_on_pixmap(pixmap, name, px + 12.0 * s, y, 10.0 * s, font);
-                y += cell_h;
+    // List rows (sorted by start beat)
+    let list_top = y;
+    if info.effects.is_empty() {
+        if let Some(font) = font {
+            draw_text_on_pixmap(pixmap, "(no effects — Add)", px + 12.0 * s, y, 10.0 * s, font);
+        }
+        y += cell_h;
+    } else {
+        for (ri, e) in info.effects.iter().enumerate() {
+            let hovered = info.selected_effect == Some(ri);
+            let mut lp = tiny_skia::Paint::default();
+            if hovered {
+                lp.set_color_rgba8(50, 80, 130, 200);
+            } else if e.active {
+                lp.set_color_rgba8(30, 45, 70, 180);
+            } else {
+                lp.set_color_rgba8(20, 20, 25, 120);
+            }
+            if let Some(r) = tiny_skia::Rect::from_xywh(px + 4.0 * s, y, pan_w - 8.0 * s, cell_h) {
+                fill_rect_clipped(pixmap, r, &lp);
+            }
+            if let Some(font) = font {
+                let tag = if e.global { " [G]" } else { "" };
+                let label = format!("{}{}", e.shader, tag);
+                draw_text_on_pixmap(pixmap, &label, px + 10.0 * s, y + cell_h * 0.5, 10.0 * s, font);
+                let range = format!("{:.1}~{:.1}b", e.start_beats, e.end_beats);
+                let tw = text_width(&range, 10.0 * s);
+                draw_text_on_pixmap(pixmap, &range, px + pan_w - tw - 10.0 * s, y + cell_h * 0.5, 10.0 * s, font);
+            }
+            y += cell_h;
+        }
+    }
+
+    // Add / Del buttons
+    let by = y + 6.0 * s;
+    for (idx, label) in [(0usize, "+ Add"), (1usize, "Del")] {
+        let bx = px + 8.0 * s + idx as f32 * (68.0 * s);
+        let mut bp = tiny_skia::Paint::default();
+        bp.set_color_rgba8(40, 55, 75, 200);
+        if let Some(r) = tiny_skia::Rect::from_xywh(bx, by, 60.0 * s, cell_h) {
+            fill_rect_clipped(pixmap, r, &bp);
+        }
+        if let Some(font) = font {
+            draw_text_on_pixmap(pixmap, label, bx + 6.0 * s, by + cell_h * 0.5, 10.0 * s, font);
+        }
+    }
+
+    // Edit fields pinned to the bottom
+    if let Some(sel) = info.selected_effect {
+        if let Some(e) = info.effects.get(sel) {
+            let edit_h = 4.0 * cell_h + 8.0 * s;
+            let ey = (bg_h - edit_h).max(list_top);
+            let mut eb = tiny_skia::Paint::default();
+            eb.set_color_rgba8(30, 32, 40, 230);
+            if let Some(r) = tiny_skia::Rect::from_xywh(px, ey, pan_w, edit_h) {
+                fill_rect_clipped(pixmap, r, &eb);
+            }
+            let rows: [(&str, String, u8); 4] = [
+                ("Shader", e.shader.clone(), 0),
+                ("Start", format!("{:.3}b", e.start_beats), 1),
+                ("End", format!("{:.3}b", e.end_beats), 2),
+                ("Global", if e.global { "ON" } else { "OFF" }.to_string(), 3),
+            ];
+            if let Some(font) = font {
+                let mut ry = ey + 4.0 * s;
+                for (label, val, tgt) in &rows {
+                    if info.eff_edit_field == *tgt {
+                        let mut hp = tiny_skia::Paint::default();
+                        hp.set_color_rgba8(60, 90, 140, 90);
+                        if let Some(r) = tiny_skia::Rect::from_xywh(px + 4.0 * s, ry, pan_w - 8.0 * s, cell_h) {
+                            fill_rect_clipped(pixmap, r, &hp);
+                        }
+                    }
+                    draw_text_on_pixmap(pixmap, label, px + 8.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
+                    draw_text_on_pixmap(pixmap, val, px + pan_w * 0.5 + 4.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
+                    ry += cell_h;
+                }
             }
         }
     }
@@ -199,6 +324,7 @@ pub(crate) fn draw_quick_panel(pixmap: &mut tiny_skia::PixmapMut, _tool_hover: O
 }
 
 // ── Display data ──
+
 
 
 

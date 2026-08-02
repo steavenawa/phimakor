@@ -88,6 +88,10 @@ struct State {
 
     // ── Post-processing effects ──
     extra: Option<core::extra::ExtraRoot>,
+    /// Selected row in the Eff panel list + edit field under the wheel
+    /// (0 = shader, 1 = start, 2 = end, 3 = global).
+    selected_effect: Option<usize>,
+    eff_edit_field: u8,
 }
 
 impl State {
@@ -144,7 +148,7 @@ impl App {
             splash_lib_path: charts_dir().display().to_string(),
             splash_hover: ui::SplashHover::None, show_settings: false, settings,
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()),
-            extra: None,
+            extra: None, selected_effect: None, eff_edit_field: 0,
         })
     }
 
@@ -226,6 +230,7 @@ impl App {
             splash_lib_path: String::new(), splash_hover: ui::SplashHover::None,
             show_settings: false, settings,
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()), extra,
+            selected_effect: None, eff_edit_field: 0,
         })
     }
 
@@ -258,8 +263,102 @@ impl App {
         }
     }
 }
-
 impl State {
+    /// Sorted (effect-index, start-beat) pairs — same ordering as the Eff
+    /// panel list, so a list row maps back to `ExtraRoot::effects`.
+    fn eff_sorted(&self) -> Vec<(usize, f64)> {
+        let mut idx: Vec<(usize, f64)> = self.extra.as_ref().map_or(Vec::new(), |extra| {
+            extra.effects.iter().enumerate().map(|(i, e)| (i, e.start.beats())).collect()
+        });
+        idx.sort_by(|a, b| a.1.total_cmp(&b.1));
+        idx
+    }
+
+    /// Persist the current ExtraRoot to `extra.json` and mark the UI dirty.
+    fn eff_save(&mut self) {
+        if let Some(extra) = &self.extra {
+            if let Err(e) = extra.save(&self.chart_dir.join("extra.json")) {
+                eprintln!("extra.json save: {e}");
+            }
+        }
+        self.ui_dirty = true;
+    }
+
+    /// Add a built-in effect spanning ±2 beats around the playhead.
+    fn eff_add(&mut self) {
+        let beat = self.chart.time_to_beat(self.chart_time_last);
+        let (name, defaults) = crate::render::shaders::EFFECTS.first()
+            .map(|d| (d.name.to_string(), d.defaults.to_vec()))
+            .unwrap_or_else(|| ("grayscale".to_string(), Vec::new()));
+        let vars: std::collections::HashMap<String, serde_json::Value> = defaults
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+            .collect();
+        let extra = self.extra.get_or_insert_with(|| core::extra::ExtraRoot { bpm: vec![], effects: vec![] });
+        extra.effects.push(core::extra::ExtraEffect {
+            start: core::bpm::Triple::from_beats(beat - 2.0),
+            end: core::bpm::Triple::from_beats(beat + 2.0),
+            shader: name,
+            global: true,
+            priority: 0,
+            vars,
+        });
+        self.selected_effect = None;
+        self.eff_save();
+    }
+
+    /// Remove the effect at the selected list row.
+    fn eff_remove_selected(&mut self) {
+        let Some(sel) = self.selected_effect else { return };
+        let idx = self.eff_sorted();
+        let Some((orig, _)) = idx.get(sel).copied() else { return };
+        if let Some(extra) = &mut self.extra {
+            extra.effects.remove(orig);
+        }
+        self.selected_effect = None;
+        self.eff_save();
+    }
+
+    /// Wheel editing on the selected effect's active field.
+    fn eff_wheel(&mut self, delta: f32) {
+        if delta == 0.0 { return; }
+        let Some(sel) = self.selected_effect else { return };
+        let idx = self.eff_sorted();
+        let Some((orig, _)) = idx.get(sel).copied() else { return };
+        let Some(extra) = &mut self.extra else { return };
+        let e = &mut extra.effects[orig];
+        match self.eff_edit_field {
+            0 => {
+                // Cycle through the built-in shaders; a custom shader jumps
+                // to the first built-in.
+                let names: Vec<&str> = crate::render::shaders::EFFECTS.iter().map(|d| d.name).collect();
+                let next = match names.iter().position(|n| **n == e.shader) {
+                    Some(p) => (p as isize + delta.signum() as isize).rem_euclid(names.len() as isize) as usize,
+                    None => 0,
+                };
+                if let Some(n) = names.get(next) {
+                    e.shader = n.to_string();
+                }
+            }
+            1 | 2 => {
+                let step = self.snap.max(0.01) as f64 * delta as f64;
+                if self.eff_edit_field == 1 {
+                    let start = (e.start.beats() + step).max(0.0);
+                    e.start = core::bpm::Triple::from_beats(start);
+                    if e.end.beats() <= start {
+                        e.end = core::bpm::Triple::from_beats(start + 0.01);
+                    }
+                } else {
+                    let end = (e.end.beats() + step).max(e.start.beats() + 0.01);
+                    e.end = core::bpm::Triple::from_beats(end);
+                }
+            }
+            3 => e.global = !e.global,
+            _ => {}
+        }
+        self.eff_save();
+    }
+
     fn rebuild_chart(&mut self) {
         let cur_time = self.chart_time_last;
         if let Ok(c) = core::chart::Chart::from_rpe_chart(self.doc.chart(), self.info.use_rpe_170_speed == Some(true)) {
@@ -464,6 +563,25 @@ impl State {
         let effect_names: Vec<String> = self.extra.as_ref().map_or(vec![], |extra| {
             core::extra::evaluate_effects(extra, chart_beat).iter().map(|e| e.shader_name.clone()).collect()
         });
+        // Eff panel list: ALL effects sorted by start beat (index maps back to
+        // ExtraRoot::effects for edits).
+        let effects: Arc<Vec<ui::EffectRow>> = {
+            let mut rows: Vec<ui::EffectRow> = self.extra.as_ref().map_or(Vec::new(), |extra| {
+                extra.effects.iter().enumerate().map(|(i, e)| {
+                    let (sb, eb) = (e.start.beats(), e.end.beats());
+                    ui::EffectRow {
+                        index: i,
+                        shader: e.shader.clone(),
+                        start_beats: sb,
+                        end_beats: eb,
+                        global: e.global,
+                        active: chart_beat >= sb && chart_beat <= eb,
+                    }
+                }).collect()
+            });
+            rows.sort_by(|a, b| a.start_beats.total_cmp(&b.start_beats));
+            Arc::new(rows)
+        };
         let info = ui::GameInfo {
             chart_time, audio_time, fps: self.fps, combo: self.combo,
             hits: self.hits, note_count: self.note_count, score,
@@ -499,6 +617,9 @@ impl State {
             event_edit_target: self.event_edit_target,
             ev_kind, ev_start_beats, ev_end_beats, ev_start_val, ev_end_val, ev_easing,
             effect_names: effect_names,
+            effects,
+            selected_effect: self.selected_effect,
+            eff_edit_field: self.eff_edit_field,
         };
         if self.show_overlay {
             if let Some(ev_idx) = self.overlay.take_timeline_click(&info, self.overlay.props_progress()) {
@@ -803,9 +924,22 @@ impl ApplicationHandler for App {
                     let t = state.audio.as_ref().map(|a| a.time()).unwrap_or(0.0) + dx as f64 * 2.0;
                     state.scroll_target = Some(t.clamp(0.0, state.chart.duration()));
                 }
-                // Vertical scroll: timeline zoom/scroll over timeline panel, else seek
+                // Vertical scroll: Eff panel edit (tool 3), timeline
+                // zoom/scroll over timeline panel, else seek.
                 if dy != 0.0 {
-                    if (state.show_events || state.show_notes) && state.overlay.is_over_timeline(state.overlay.props_progress()) {
+                    if !state.splash_mode
+                        && state.show_properties
+                        && state.overlay.selected_tool == 3
+                        && state.overlay.mouse_pos.is_some_and(|(mx, _)| {
+                            let s = state.overlay.gui_scale;
+                            let pp = state.overlay.props_progress();
+                            let pan_w = ui::PANEL_W * s;
+                            let props_x = state.window.inner_size().width as f32 - pp * pan_w;
+                            mx >= props_x && mx <= props_x + pan_w
+                        })
+                    {
+                        state.eff_wheel(dy);
+                    } else if (state.show_events || state.show_notes) && state.overlay.is_over_timeline(state.overlay.props_progress()) {
                         if state.ctrl {
                             state.overlay.timeline_zoom_in(dy);
                         } else if state.overlay.mouse_pos.map_or(false, |(_, my)| my >= 28.0) {
@@ -919,6 +1053,9 @@ impl ApplicationHandler for App {
                             state.ui_dirty = true;
                         }
                         KeyCode::Space => { if let Some(a) = &state.audio { a.set_paused(!a.is_paused()); } }
+                        KeyCode::Delete if state.show_properties && state.overlay.selected_tool == 3 => {
+                            state.eff_remove_selected();
+                        }
                         KeyCode::ArrowLeft | KeyCode::ArrowRight => {
                             let d = if code == KeyCode::ArrowLeft { -5.0 } else { 5.0 };
                             let t = state.audio.as_ref().map(|a| a.time()).unwrap_or(0.0) + d;
@@ -1066,6 +1203,28 @@ impl ApplicationHandler for App {
                         if !state.show_overlay && state.renderer.hit_test_pause(m.0, m.1) {
                             if let Some(a) = &state.audio { a.set_paused(!a.is_paused()); }
                             return;
+                        }
+                    }
+                }
+                // Eff panel (tool 3) click handling — releases only, so the
+                // press (which the overlay may consume) and the release land
+                // in the same spot.
+                if btn_state == ElementState::Released
+                    && state.show_properties
+                    && state.overlay.selected_tool == 3
+                {
+                    if let Some((mx, my)) = state.overlay.mouse_pos {
+                        let gs = state.overlay.gui_scale;
+                        let vw = state.window.inner_size().width as f32;
+                        let vh = state.window.inner_size().height as f32;
+                        let pp = state.overlay.props_progress();
+                        let n_rows = state.extra.as_ref().map_or(0, |e| e.effects.len());
+                        match ui::effects_hit_test(mx, my, vw, vh, gs, pp, n_rows) {
+                            ui::EffHit::List(ri) => { state.selected_effect = Some(ri); state.ui_dirty = true; }
+                            ui::EffHit::Add => state.eff_add(),
+                            ui::EffHit::Del => state.eff_remove_selected(),
+                            ui::EffHit::Field(f) => { state.eff_edit_field = f; state.ui_dirty = true; }
+                            ui::EffHit::None => {}
                         }
                     }
                 }
@@ -1562,3 +1721,4 @@ mod zip_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
