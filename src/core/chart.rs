@@ -1244,9 +1244,13 @@ impl Chart {
                     (head_y, Some(tail_y))
                 } else {
                     // Editor preview: notes vanish instantly at hit time
-                    // (no prpr 0.16s fade-out).
+                    // (no prpr 0.16s fade-out). Applies to every note — prpr
+                    // skips judged non-hold notes outright (note.rs render),
+                    // regardless of show_below. The old `!show_below ||`
+                    // guard kept notes alive past their hit time on cover
+                    // lines (is_cover=0 → show_below=true).
                     // Fake notes always vanish past their hit time to prevent trails.
-                    if (!show_below || note.fake) && time >= note.time {
+                    if time >= note.time {
                         continue;
                     }
                     if !show_below && note.time > time && base <= -0.001 {
