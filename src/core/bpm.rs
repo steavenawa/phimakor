@@ -80,6 +80,11 @@ impl BpmList {
 
     /// Get the time in seconds for a given beats
     pub fn time_beats(&mut self, beats: f64) -> f64 {
+        // Empty BPMList used to OOB-panic via `elements[0]`; fall back to a
+        // 120 BPM assumption so malformed charts degrade instead of crashing.
+        if self.elements.is_empty() {
+            return beats * 0.5;
+        }
         debug_assert!(!self.elements.is_empty(), "empty BPMList (prpr panics here via elements[0] OOB)");
         while let Some(kf) = self.elements.get(self.cursor + 1) {
             if kf.0 > beats {
@@ -101,6 +106,10 @@ impl BpmList {
 
     /// Get the beat coordinate for a given time in seconds
     pub fn beat(&mut self, time: f64) -> f64 {
+        // Empty BPMList: 120 BPM fallback (see [`BpmList::time_beats`]).
+        if self.elements.is_empty() {
+            return time * 2.0;
+        }
         debug_assert!(!self.elements.is_empty(), "empty BPMList (prpr panics here via elements[0] OOB)");
         while let Some(kf) = self.elements.get(self.cursor + 1) {
             if kf.1 > time {
@@ -113,5 +122,18 @@ impl BpmList {
         }
         let (beats, start_time, bpm) = &self.elements[self.cursor];
         beats + (time - start_time) / (60. / bpm)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_bpm_list_does_not_panic() {
+        let mut b = BpmList::new(vec![]);
+        // Used to OOB-panic via elements[0]; falls back to 120 BPM.
+        assert_eq!(b.time_beats(4.0), 2.0);
+        assert_eq!(b.beat(2.0), 4.0);
     }
 }

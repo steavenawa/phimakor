@@ -8,7 +8,7 @@ use std::{collections::HashMap, rc::Rc};
 
 use super::{
     anim::{Anim, AnimFloat, Keyframe},
-    bpm::BpmList,
+    bpm::{BpmList, Triple},
     easing::{
         speed_linear_tween, speed_segment_tween, BezierTween, ClampedTween, RPE_TWEEN_MAP, SpeedEasingMode, StaticTween, TweenFunction, Tweenable,
     },
@@ -222,7 +222,16 @@ impl<T> RPEEvent<T> {
         let left = self.easing_left.clamp(0., 1.);
         let right = self.easing_right.clamp(0., 1.);
         if self.bezier != 0 {
-            Rc::clone(&bezier_map[&self.bezier_key()])
+            let key = self.bezier_key();
+            match bezier_map.get(&key) {
+                Some(f) => Rc::clone(f),
+                // The map can miss events (e.g. speed events in older parser
+                // paths); build the curve on the fly instead of panicking.
+                None => Rc::new(BezierTween::new(
+                    (self.bezier_points[0], self.bezier_points[1]),
+                    (self.bezier_points[2], self.bezier_points[3]),
+                )),
+            }
         } else if tween <= 2 || (left.abs() < EPS as f32 && (right - 1.0).abs() < EPS as f32) || left >= right {
             StaticTween::get_rc(tween)
         } else {
@@ -487,7 +496,7 @@ fn parse_notes(r: &mut BpmList, rpe: Vec<RPENote>, height: &mut AnimFloat) -> Re
     Ok(notes)
 }
 
-fn parse_ctrl_events(events: &[super::model::RPECtrlEvent], key: &str) -> AnimFloat {
+fn parse_ctrl_events(r: &mut BpmList, events: &[super::model::RPECtrlEvent], key: &str) -> AnimFloat {
     use super::easing::{RPE_TWEEN_MAP, StaticTween, TweenFunction};
     use std::rc::Rc;
     let vals: Vec<f32> = events.iter().map(|it| it.value[key]).collect();
@@ -505,9 +514,12 @@ fn parse_ctrl_events(events: &[super::model::RPECtrlEvent], key: &str) -> AnimFl
         })
         .chain(std::iter::once(StaticTween::get_rc(0)))
         .collect();
+    // CtrlObject `x` is in BEATS (phira convention); `state_at` queries in
+    // seconds, so convert here — mixing units made ctrl events evaluate on
+    // the wrong timeline entirely.
     AnimFloat::new(
         events.iter().zip(vals).zip(tweens).map(|((it, val), tween)| Keyframe {
-            time: it.x,
+            time: r.time(&Triple::from_beats(it.x)),
             value: val,
             tween,
         }).collect(),
@@ -616,12 +628,10 @@ fn parse_judge_line(
     // (posControl etc.) and rotateWithFather are parsed but not lowered.
     let parent = {
         let parent = rpe.parent.unwrap_or(-1);
-        if parent == -1 {
-            None
-        } else {
-            // other negative values wrap to a huge index and panic later on
-            // access, same as prpr
-            Some(parent as usize)
+        match parent {
+            -1 => None,
+            p if p < 0 => anyhow::bail!("invalid father index {p} (must be -1 or >= 0)"),
+            p => Some(p as usize),
         }
     };
 
@@ -652,12 +662,12 @@ fn parse_judge_line(
         // alphaControl uses key "alpha" (0-1 range, factor 1.0).
         // yControl uses key "y" (factor 1.0).
         // phira: CtrlObject uses raw values (no factor), x is in beats.
-        ctrl_pos_x: parse_ctrl_events(&pos_control, "pos"),
-        ctrl_pos_y: parse_ctrl_events(&pos_control, "pos"),
-        ctrl_size_x: parse_ctrl_events(&size_control, "size"),
-        ctrl_size_y: parse_ctrl_events(&size_control, "size"),
-        ctrl_alpha: parse_ctrl_events(&alpha_control, "alpha"),
-        ctrl_y: parse_ctrl_events(&y_control, "y"),
+        ctrl_pos_x: parse_ctrl_events(r, &pos_control, "pos"),
+        ctrl_pos_y: parse_ctrl_events(r, &pos_control, "pos"),
+        ctrl_size_x: parse_ctrl_events(r, &size_control, "size"),
+        ctrl_size_y: parse_ctrl_events(r, &size_control, "size"),
+        ctrl_alpha: parse_ctrl_events(r, &alpha_control, "alpha"),
+        ctrl_y: parse_ctrl_events(r, &y_control, "y"),
         incline,
     })
 }
@@ -686,6 +696,7 @@ fn get_bezier_map(rpe: &RPEChart) -> BezierMap {
             add_bezier_events(&mut map, &event_layer.move_x_events);
             add_bezier_events(&mut map, &event_layer.move_y_events);
             add_bezier_events(&mut map, &event_layer.rotate_events);
+            add_bezier_events(&mut map, &event_layer.speed_events);
         }
         if let Some(ext_layer) = &line.extended {
             add_bezier_events(&mut map, &ext_layer.paint_events);
@@ -808,12 +819,24 @@ impl Chart {
                 .extended
                 .as_ref()
                 .map(|e| {
-                    vec(&e.scale_x_events)
+                    let mut m: f64 = 0.0;
+                    // Same-type event chains (f32), incl. incline/paint/gif
+                    // which used to be missed (shortened chart duration).
+                    for it in vec(&e.scale_x_events)
                         .chain(vec(&e.scale_y_events))
-                        .map(|it| r.time(&it.end_time))
-                        .reduce(f64::max)
-                        .unwrap_or(0.)
-                        .max(vec(&e.text_events).map(|it| r.time(&it.end_time)).reduce(f64::max).unwrap_or(0.))
+                        .chain(vec(&e.incline_events))
+                        .chain(vec(&e.paint_events))
+                        .chain(vec(&e.gif_events))
+                    {
+                        m = m.max(r.time(&it.end_time));
+                    }
+                    for it in vec(&e.text_events) {
+                        m = m.max(r.time(&it.end_time));
+                    }
+                    for it in vec(&e.color_events) {
+                        m = m.max(r.time(&it.end_time));
+                    }
+                    m
                 })
                 .unwrap_or(0.);
             max_time = max_time.max(notes_max).max(events_max).max(ext_max);
@@ -830,6 +853,12 @@ impl Chart {
         }
         fn has_cycle(lines: &[LineData], index: usize, visited: &mut Vec<usize>) -> Option<usize> {
             if let Some(parent_index) = lines[index].parent {
+                // Father indices out of range used to OOB-panic here; report
+                // them as an error instead (parse_judge_line already rejects
+                // negative values, this guards hand-built/edited data).
+                if parent_index >= lines.len() {
+                    return Some(parent_index);
+                }
                 if visited.contains(&parent_index) {
                     return Some(parent_index);
                 }
@@ -842,7 +871,7 @@ impl Chart {
             let mut vec = Vec::new();
             vec.push(i);
             if let Some(line) = has_cycle(&lines, i, &mut vec) {
-                anyhow::bail!("found infinite recursive parent relations: line {line}");
+                anyhow::bail!("invalid parent relation (cycle or out-of-range father): line {line}");
             }
         }
         // Multiple-hint, port of prpr `process_lines`: every note whose hit
@@ -1389,6 +1418,102 @@ mod tests {
         assert_eq!(chart.meta.rpe_version, 170);
         let chart: RPEChart = serde_json::from_str(r#"{"META":{"offset":0},"BPMList":[],"judgeLineList":[]}"#).unwrap();
         assert_eq!(chart.meta.rpe_version, 160);
+    }
+
+    #[test]
+    fn negative_father_rejected() {
+        // father < -1 used to wrap to a huge usize and panic in has_cycle.
+        let chart = r#"{
+            "META": { "offset": 0 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                { "Name": "a", "Texture": "line.png", "father": -2, "eventLayers": [], "notes": [], "isCover": 1 }
+            ]
+        }"#;
+        assert!(Chart::from_rpe(chart, false).is_err());
+    }
+
+    #[test]
+    fn out_of_range_father_rejected() {
+        // father index beyond judgeLineList must error, not OOB-panic.
+        let chart = r#"{
+            "META": { "offset": 0 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                { "Name": "a", "Texture": "line.png", "father": 5, "eventLayers": [], "notes": [], "isCover": 1 }
+            ]
+        }"#;
+        assert!(Chart::from_rpe(chart, false).is_err());
+    }
+
+    #[test]
+    fn speed_bezier_events_load() {
+        // A bezier speed event used to panic (bezier_map[&key] miss — speed
+        // events were not collected by get_bezier_map).
+        let chart = r#"{
+            "META": { "offset": 0, "RPEVersion": 170 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "a", "Texture": "line.png", "father": -1,
+                    "eventLayers": [
+                        {
+                            "speedEvents": [
+                                { "start": 1.0, "end": 2.0, "startTime": [0, 0, 1], "endTime": [4, 0, 1], "easingType": 0, "bezier": 1, "bezierPoints": [0.0, 0.0, 1.0, 1.0] }
+                            ]
+                        }
+                    ],
+                    "notes": [], "isCover": 1
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(chart, false).expect("speed bezier chart must load");
+        let frame = chart.state_at(0.0);
+        assert_eq!(frame.lines.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_events_use_seconds_timeline() {
+        // CtrlObject `x` is in beats; state_at queries in seconds. A pos
+        // control keyframe at x=2 beats (1.0s @ 120 BPM) must resolve at t=1s.
+        let chart = r#"{
+            "META": { "offset": 0 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "a", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "notes": [], "isCover": 1,
+                    "posControl": [ { "easing": 1, "x": 2, "pos": 0.5 } ]
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(chart, false).unwrap();
+        let frame = chart.state_at(1.0);
+        assert!((frame.lines[0].ctrl_pos_x - 0.5).abs() < 1e-3, "ctrl_pos_x at t=1s: {}", frame.lines[0].ctrl_pos_x);
+    }
+
+    #[test]
+    fn max_time_covers_extended_events() {
+        // incline events used to be missed by max_time → duration too short.
+        // incline endTime 4 beats @120bpm = 2.0s, +1s = 3.0s.
+        let chart = r#"{
+            "META": { "offset": 0 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "a", "Texture": "line.png", "father": -1,
+                    "eventLayers": [],
+                    "extended": {
+                        "inclineEvents": [
+                            { "start": 0.0, "end": 10.0, "startTime": [0, 0, 1], "endTime": [4, 0, 1], "easingType": 1 }
+                        ]
+                    },
+                    "notes": [], "isCover": 1
+                }
+            ]
+        }"#;
+        let chart = Chart::from_rpe(chart, false).unwrap();
+        assert!((chart.duration() - 3.0).abs() < 1e-9, "duration: {}", chart.duration());
     }
 
     #[test]
