@@ -12,7 +12,7 @@ fn main() {
     let window_aspect = 16.0 / 9.0;
     for (name, aspect) in [("3:2", 1.5f32), ("16:9", 16.0 / 9.0), ("4:3", 4.0 / 3.0), ("1:1", 1.0)] {
         let (kx, ky) = if window_aspect >= aspect { (aspect / window_aspect, 1.0) } else { (1.0, window_aspect / aspect) };
-        let fit = (1.5 / aspect).min(1.0);
+        let _fit = (1.5 / aspect).min(1.0);
         // Event positions depend ONLY on the playfield aspect (never the
         // window): the canvas edges (675/450) land on the box edges (±kx, ±ky)
         // at any window. Sprites keep the uniform letterbox scale (sx/sy).

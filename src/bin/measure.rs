@@ -193,7 +193,7 @@ use std::sync::Arc;
         // Simulate playback: chart_beat advances each frame (scrolling).
         let mut tl_times = Vec::with_capacity(frames);
         for fi in 0..frames {
-            let mut info2 = GameInfo {
+            let info2 = GameInfo {
                 chart_beat: 20.0 + fi as f64 * 0.1,
                 chart_time: (20.0 + fi as f64 * 0.1) * 0.5,
                 chart_name: info.chart_name.clone(),

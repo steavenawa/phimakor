@@ -15,7 +15,7 @@
 //!   4. HTTP Range request that chunk's byte range
 //!   5. Parse chunk → full frame state for T
 
-use anyhow::{bail, Context, Result};
+use anyhow::Result;
 use crate::core::bpm::Triple;
 use crate::core::model::*;
 use std::collections::HashMap;
