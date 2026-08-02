@@ -587,7 +587,15 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let events_x = props_x - ep * TL_W * s;
         let notes_x = events_x - np * NT_W * s;
         if self.tl_visible {
-            if self.tl_follow { self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0); }
+            if self.tl_follow {
+                self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
+            } else {
+                // 手动滚动后播放头跑出可视窗口 → 重新跟随播放头。
+                let b = info.chart_beat as f32;
+                if b < self.tl_scroll || b > self.tl_scroll + self.tl_zoom {
+                    self.tl_follow = true;
+                }
+            }
             let (scroll, zoom) = (self.tl_scroll as f64, self.tl_zoom as f64);
             let (min_b, _max_b) = (scroll, scroll + zoom);
             let head_h = HEADER_H * s;
@@ -685,7 +693,15 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let events_x = props_x - ep * TL_W * s;
         let notes_x = events_x - np * NT_W * s;
         if self.tl_visible {
-            if self.tl_follow { self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0); }
+            if self.tl_follow {
+                self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
+            } else {
+                // 手动滚动后播放头跑出可视窗口 → 重新跟随播放头。
+                let b = info.chart_beat as f32;
+                if b < self.tl_scroll || b > self.tl_scroll + self.tl_zoom {
+                    self.tl_follow = true;
+                }
+            }
             let (scroll, zoom) = (self.tl_scroll as f64, self.tl_zoom as f64);
             let (min_b, _max_b) = (scroll, scroll + zoom);
             let head_h = HEADER_H * s;
@@ -766,7 +782,15 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let notes_x = events_x - np * nt_w;  // Notes left of Events
 
         if self.tl_visible {
-            if self.tl_follow { self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0); }
+            if self.tl_follow {
+                self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
+            } else {
+                // 手动滚动后播放头跑出可视窗口 → 重新跟随播放头。
+                let b = info.chart_beat as f32;
+                if b < self.tl_scroll || b > self.tl_scroll + self.tl_zoom {
+                    self.tl_follow = true;
+                }
+            }
             let _s2 = trace_span!("tl_notes_draw");
             if info.show_notes {
                 draw_notes_timeline(&mut self.pixmap.as_mut(), self.tl_scroll, self.tl_zoom, info, notes_x, vh, s);
