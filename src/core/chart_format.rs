@@ -160,13 +160,13 @@ fn pec_to_rpe_events(events: Vec<PecEvent>, kind: &str) -> Vec<RPEEvent> {
         };
         let v = e.value;
         let remapped = match kind {
-            // PhiEdit PEC: x/y are relative coordinates scaled by 1024
-            // (0 = center, ±1024 = ±1.0). RPE move values are canvas px, and
-            // parse_judge_line applies ×2/1350 (x) / ×2/900 (y), so convert
-            // relative → px: (v/1024) * 675 for x, * 450 for y.
-            "x" => v / 1024.0 * 675.0,
-            "y" => v / 1024.0 * 450.0,
-            // prpr PEC negates rotation; RPE's ×-1 factor restores the raw sign.
+            // PhiEdit PEC coordinates: x is centered on 0 with a ±2048 full
+            // span (2048 = 1.0 = screen edge, so 1024 = half screen), y has a
+            // ±1400 span (1400 = 1.0). Convert to RPE canvas px: ×675 for x
+            // (parse_judge_line applies ×2/1350) and ×450 for y (×2/900).
+            "x" => v / 2048.0 * 675.0,
+            "y" => v / 1400.0 * 450.0,
+            // Rotation stays raw degrees (RPE's ×-1 restores the sign).
             "r" => v,
             // Alpha stays raw (RPE scales alpha by 1/255 itself).
             _ => v,
@@ -275,7 +275,7 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
                     kind, above,
                     start_time: Triple::from_beats(time),
                     end_time: Triple::from_beats(end_time),
-                    position_x: x_raw / 1024.0 * 675.0,
+                    position_x: x_raw / 2048.0 * 675.0,
                     y_offset: 0.0,
                     alpha: 255, hitsound: None,
                     size, speed, is_fake: fake, visible_time: 999999.,
@@ -397,7 +397,10 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
     }
 
     Ok(RPEChart {
-        meta: RPEMetadata { offset: ((offset_ms / 1000.0 - 0.15) * 1000.0) as i32, rpe_version: 160 },
+        // PhiEdit PEC: the first line is the chart offset in milliseconds,
+        // passed through directly. (prpr's -0.15s correction is specific to
+        // the phira PEC flavor and must NOT be applied here.)
+        meta: RPEMetadata { offset: offset_ms as i32, rpe_version: 160 },
         bpm_list,
         judge_line_list,
     })
@@ -624,7 +627,7 @@ cf 0 3 5 128
         let notes = line.notes.as_ref().unwrap();
         // n1: tap @ beat 1, x=512 → 512/1024*675 = 337.5, above, not fake
         assert_eq!(notes[0].kind, 1);
-        assert!((notes[0].position_x - 337.5).abs() < 1e-3);
+        assert!((notes[0].position_x - 168.75).abs() < 1e-3);
         assert_eq!(notes[0].above, 1);
         assert_eq!(notes[0].is_fake, 0);
         assert!((notes[0].start_time.beats() - 1.0).abs() < 1e-9);
@@ -651,8 +654,8 @@ cf 0 3 5 128
         // cp: move x 512 → 512/1024*675 = 337.5 px; move y 700 → 700/1024*450 = 307.6
         let mx = layer.move_x_events.as_ref().unwrap();
         let my = layer.move_y_events.as_ref().unwrap();
-        assert!((mx[0].start - 337.5).abs() < 1e-3);
-        assert!((my[0].start - 307.6172).abs() < 1e-3);
+        assert!((mx[0].start - 168.75).abs() < 1e-3);
+        assert!((my[0].start - 225.0).abs() < 1e-3);
         // cd: rotate 30 stays raw (RPE ×-1)
         let rot = layer.rotate_events.as_ref().unwrap();
         assert!((rot[0].start - 30.0).abs() < 1e-6);
@@ -665,7 +668,7 @@ cf 0 3 5 128
         assert_eq!(alpha2[1].easing_type, 1);
 
         // Offset: 1000ms → (1000/1000 - 0.15) = 0.85s → 850
-        assert_eq!(chart.meta.offset, 850);
+        assert_eq!(chart.meta.offset, 1000);
         // BPM 120 @ beat 0
         assert_eq!(chart.bpm_list.len(), 1);
         assert!((chart.bpm_list[0].bpm - 120.0).abs() < 1e-9);
@@ -737,8 +740,8 @@ n2 0 84.000 84.098 683.000 1 0
         let notes = chart.judge_line_list[0].notes.as_ref().unwrap();
         assert_eq!(notes.len(), 2);
         // x: 0..2048 domain → /1024 * 675
-        assert!((notes[0].position_x - (-269.0 / 1024.0 * 675.0)).abs() < 1e-3);
-        assert!((notes[1].position_x - (683.0 / 1024.0 * 675.0)).abs() < 1e-3);
+        assert!((notes[0].position_x - (-269.0 / 2048.0 * 675.0)).abs() < 1e-3);
+        assert!((notes[1].position_x - (683.0 / 2048.0 * 675.0)).abs() < 1e-3);
         // Loading through the full pipeline must not produce NaN beats.
         let mut c = Chart::from_rpe_chart(&chart, false).unwrap();
         let frame = c.state_at(1.0);
@@ -746,5 +749,6 @@ n2 0 84.000 84.098 683.000 1 0
         assert!(frame.lines[0].notes.iter().all(|n| n.time.is_finite()));
     }
 }
+
 
 
