@@ -899,6 +899,7 @@ impl IcedOverlay {
 /// Draw splash screen (chart picker) when no chart is loaded.
 /// Editor settings surfaced on the splash screen. Persisted to `config.json`.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SettingsData {
     pub vsync: bool,
     pub gui_scale: f32,
@@ -906,11 +907,15 @@ pub struct SettingsData {
     /// GPU backend: `None` = auto (all), or "dx12" / "vulkan" / "gl".
     /// On shared-memory GPUs (iGPU) DX12 is the heaviest by far.
     pub backend: Option<String>,
+    /// Custom chart library directory. `None` = the system Documents
+    /// folder (`<Documents>/PhiMakor/charts`). Persisted back to
+    /// `config.json` so the choice survives restarts.
+    pub charts_dir: Option<String>,
 }
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None }
     }
 }
 
@@ -970,6 +975,7 @@ pub enum SplashHover {
     ScaleRow,
     ScaleMinus,
     ScalePlus,
+    Library,
     Back,
 }
 
@@ -1041,6 +1047,8 @@ pub fn splash_hit_test(mx: f32, my: f32, vw: f32, vh: f32, s: f32, filtered_len:
         y += row_h + 6.0 * s;
         if hit(my, y) { return SplashHover::ScaleRow; }
         y += row_h + 6.0 * s;
+        if hit(my, y) { return SplashHover::Library; }
+        y += row_h + 6.0 * s;
         let bw = 60.0 * s;
         if mx >= lx && mx <= lx + bw && hit(my, y) { return SplashHover::ScaleMinus; }
         if mx >= lx + bw + 8.0 * s && mx <= lx + bw * 2.0 + 8.0 * s && hit(my, y) { return SplashHover::ScalePlus; }
@@ -1102,7 +1110,7 @@ pub fn draw_splash(pm: &mut tiny_skia::PixmapMut, data: &SplashData, vw: f32, vh
         if let Some(font) = font {
             draw_text_on_pixmap(pm, "Settings", SPLASH_M * s, 50.0 * s, 14.0 * s, font);
         }
-        draw_splash_settings(pm, cfg, data.hover, vw, vh, s);
+        draw_splash_settings(pm, cfg, data.lib_path, data.hover, vw, vh, s);
         return;
     }
     let detail_x = splash_detail_x(vw, s);
@@ -1440,7 +1448,7 @@ fn fit_text(text: &str, max_w: f32, size: f32) -> String {
 /// Settings page: toggles for vsync / fullscreen and a gui-scale slider.
 /// Hover targets: Vsync / Fullscreen / ScaleRow / ScaleMinus / ScalePlus /
 /// Back (hit-testing in [`splash_hit_test`]).
-fn draw_splash_settings(pm: &mut tiny_skia::PixmapMut, cfg: &SettingsData, hover: SplashHover, vw: f32, vh: f32, s: f32) {
+fn draw_splash_settings(pm: &mut tiny_skia::PixmapMut, cfg: &SettingsData, lib_path: &str, hover: SplashHover, vw: f32, vh: f32, s: f32) {
     let font = get_font();
     let bar_h = SPLASH_BAR_H * s;
     let mut y = 90.0 * s;
@@ -1453,11 +1461,20 @@ fn draw_splash_settings(pm: &mut tiny_skia::PixmapMut, cfg: &SettingsData, hover
         p
     };
 
-    let rows: [(&str, String, SplashHover); 4] = [
+    // Library path: truncate long paths for the row, full path in the tooltip line below.
+    let lib_short = if lib_path.chars().count() > 46 {
+        let head: String = lib_path.chars().take(20).collect();
+        let tail: String = lib_path.chars().skip(lib_path.chars().count() - 18).collect();
+        format!("{head}…{tail}")
+    } else {
+        lib_path.to_string()
+    };
+    let rows: [(&str, String, SplashHover); 5] = [
         ("Vsync", format!("{}", if cfg.vsync { "ON" } else { "OFF" }), SplashHover::Vsync),
         ("Fullscreen", format!("{}", if cfg.fullscreen { "ON" } else { "OFF" }), SplashHover::Fullscreen),
         ("GPU Backend", backend_label(&cfg.backend), SplashHover::Backend),
         ("GUI Scale", format!("{:.1}", cfg.gui_scale), SplashHover::ScaleRow),
+        ("Chart Library", lib_short, SplashHover::Library),
     ];
     for (label, value, target) in rows {
         let hovered = hover == target;
@@ -1466,7 +1483,8 @@ fn draw_splash_settings(pm: &mut tiny_skia::PixmapMut, cfg: &SettingsData, hover
         }
         if let Some(font) = font {
             draw_text_on_pixmap(pm, label, lx + 12.0 * s, y + row_h * 0.5, 14.0 * s, font);
-            draw_text_on_pixmap(pm, &value, rx - (value.len() as f32) * 8.0 * s - 12.0 * s, y + row_h * 0.5, 14.0 * s, font);
+            let tw = text_width(&value, 14.0 * s);
+            draw_text_on_pixmap(pm, &value, rx - tw - 12.0 * s, y + row_h * 0.5, 14.0 * s, font);
         }
         y += row_h + 6.0 * s;
     }

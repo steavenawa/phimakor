@@ -731,6 +731,7 @@ impl ApplicationHandler for App {
                         }
                         ui::SplashHover::ScaleMinus => { st.settings.gui_scale = (st.settings.gui_scale - 0.1).max(0.5); st.gui_scale = st.settings.gui_scale; save_settings(&st.settings); }
                         ui::SplashHover::ScalePlus => { st.settings.gui_scale = (st.settings.gui_scale + 0.1).min(2.0); st.gui_scale = st.settings.gui_scale; save_settings(&st.settings); }
+                        ui::SplashHover::Library => { open_in_explorer(&charts_dir()); }
                         ui::SplashHover::Refresh => { st.splash_charts = scan_charts(); st.splash_sel = None; st.splash_scroll = 0.0; }
                         ui::SplashHover::Sort => { st.splash_sort = (st.splash_sort + 1) % 2; }
                         ui::SplashHover::OpenFolder => { open_in_explorer(&charts_dir()); }
@@ -1127,28 +1128,67 @@ impl ApplicationHandler for App {
     }
 }
 
-/// Settings file lives next to the chart library: `<Documents>/PhiMakor/config.json`.
-/// Falls back to the old executable-dir `config.json` if present (and migrates
-/// it on the next save).
-fn settings_path() -> PathBuf {
-    let mut dir = charts_dir();
-    dir.pop(); // .../PhiMakor/charts → .../PhiMakor
-    dir.join("config.json")
+/// Config file lives in the system config directory, decoupled from the
+/// chart library so the library dir itself can be customized:
+/// `%APPDATA%\PhiMakor\config.json` on Windows,
+/// `$XDG_CONFIG_HOME`/`~/.config/phimakor/config.json` elsewhere.
+fn config_dir() -> PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        return PathBuf::from(appdata).join("PhiMakor");
+    }
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_else(|_| PathBuf::from("."));
+    base.join("phimakor")
 }
 
-/// Load editor settings from `config.json` in the PhiMakor documents folder.
-/// Missing or invalid files fall back to defaults.
+/// Settings file: `<config_dir>/config.json`. Falls back to the legacy
+/// locations (executable-dir and `<Documents>/PhiMakor/config.json`) for
+/// reading, and migrates them on the next save.
+fn settings_path() -> PathBuf {
+    config_dir().join("config.json")
+}
+
+/// Old settings location `<Documents>/PhiMakor/config.json`, coupled to the
+/// default chart library. Migrated into the config dir on the next save.
+fn legacy_settings_path() -> PathBuf {
+    default_charts_dir()
+        .parent()
+        .map(|p| p.join("config.json"))
+        .unwrap_or_else(|| PathBuf::from("config.json"))
+}
+
+/// Load editor settings from `config.json` in the config directory.
+/// Missing or invalid files fall back to defaults; a config found in a
+/// legacy location is migrated to the new one.
 fn load_settings() -> ui::SettingsData {
     let path = settings_path();
-    std::fs::read(&path)
-        .or_else(|_| std::fs::read("config.json")) // legacy location
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    let legacy = legacy_settings_path();
+    let bytes = std::fs::read(&path)
+        .or_else(|_| std::fs::read("config.json")) // legacy executable-dir
+        .or_else(|_| std::fs::read(&legacy))        // legacy documents dir
+        .ok();
+    if let Some(b) = &bytes {
+        if let Ok(settings) = serde_json::from_slice::<ui::SettingsData>(b) {
+            // Migrate: a config read from a legacy location gets copied to
+            // the new path so the old one can be dropped.
+            if !path.exists() {
+                if let Ok(json) = serde_json::to_string_pretty(&settings) {
+                    if let Some(dir) = path.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    let _ = std::fs::write(&path, json);
+                }
+            }
+            return settings;
+        }
+    }
+    ui::SettingsData::default()
 }
 
-/// Persist editor settings to `config.json` in the PhiMakor documents folder.
-/// Also removes the legacy executable-dir file once the new one is written.
+/// Persist editor settings to `config.json` in the config directory.
+/// Also removes legacy-location files once the new one is written.
 fn save_settings(settings: &ui::SettingsData) {
     if let Ok(json) = serde_json::to_string_pretty(settings) {
         let path = settings_path();
@@ -1157,6 +1197,7 @@ fn save_settings(settings: &ui::SettingsData) {
         }
         if std::fs::write(&path, json).is_ok() {
             let _ = std::fs::remove_file("config.json");
+            let _ = std::fs::remove_file(legacy_settings_path());
         }
     }
 }
@@ -1273,15 +1314,59 @@ fn import_chart_zip(zip_path: &std::path::Path) -> anyhow::Result<std::path::Pat
     Ok(dest)
 }
 
-/// Default chart library: `<Documents>/PhiMakor/charts/`. On Windows the
-/// Documents folder is `%USERPROFILE%\Documents`; other platforms use the
-/// XDG-ish `~/Documents` fallback. The folder is created on first use.
+/// Resolve the chart library directory. Precedence:
+/// 1. `PHIMAKOR_CHARTS_DIR` env var (overrides everything, not persisted)
+/// 2. `charts_dir` from `config.json` (customized via `--charts-dir`, persisted)
+/// 3. default: `<Documents>/PhiMakor/charts` (created on first use)
 fn charts_dir() -> PathBuf {
-    let docs = std::env::var("USERPROFILE")
+    if let Ok(d) = std::env::var("PHIMAKOR_CHARTS_DIR") {
+        if !d.trim().is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    if let Some(custom) = load_settings().charts_dir.filter(|d| !d.trim().is_empty()) {
+        return PathBuf::from(custom);
+    }
+    default_charts_dir()
+}
+
+/// Default chart library: `<Documents>/PhiMakor/charts/`. Uses the *real*
+/// system Documents folder — on Windows that is the known folder
+/// (`SHGetKnownFolderPath`), so redirected/OneDrive locations are honored;
+/// other platforms fall back to `$HOME/Documents`.
+fn default_charts_dir() -> PathBuf {
+    documents_dir().join("PhiMakor").join("charts")
+}
+
+/// The system Documents directory (real known-folder location on Windows).
+fn documents_dir() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(d) = known_documents_dir() {
+        return d;
+    }
+    let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
-        .map(|h| PathBuf::from(h).join("Documents"))
-        .unwrap_or_else(|_| PathBuf::from("."));
-    docs.join("PhiMakor").join("charts")
+        .unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join("Documents")
+}
+
+/// Windows: resolve the Documents known folder (handles redirection such as
+/// OneDrive and custom library locations), instead of assuming
+/// `%USERPROFILE%\Documents`.
+#[cfg(windows)]
+fn known_documents_dir() -> Option<PathBuf> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Documents};
+
+    let mut ptr: windows_sys::core::PWSTR = std::ptr::null_mut();
+    let hr = unsafe { SHGetKnownFolderPath(&FOLDERID_Documents, 0, std::ptr::null_mut(), &mut ptr) };
+    if hr != 0 || ptr.is_null() {
+        return None;
+    }
+    let len = unsafe { (0..).take_while(|&i| *ptr.add(i) != 0).count() };
+    let path = unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len)) };
+    unsafe { CoTaskMemFree(ptr as *mut _) };
+    if path.is_empty() { None } else { Some(PathBuf::from(path)) }
 }
 
 fn scan_charts() -> Vec<ui::ChartEntry> {
@@ -1383,10 +1468,26 @@ fn main() -> anyhow::Result<()> {
         dhat::Profiler::new_heap()
     };
     init_tracing();
-    let dir = match std::env::args_os().nth(1) {
-        Some(d) => Some(PathBuf::from(d)),
-        None => None,
-    };
+    // Args: `phimakor [--charts-dir <path>] [<chart dir>]`.
+    // `--charts-dir` sets a custom chart library and persists it back to
+    // `config.json` (env `PHIMAKOR_CHARTS_DIR` overrides without persisting).
+    let mut dir: Option<PathBuf> = None;
+    let mut custom_dir: Option<PathBuf> = None;
+    {
+        let mut args = std::env::args_os().skip(1);
+        while let Some(a) = args.next() {
+            if a.to_string_lossy() == "--charts-dir" {
+                custom_dir = args.next().map(PathBuf::from);
+            } else if !a.to_string_lossy().starts_with("--") && dir.is_none() {
+                dir = Some(PathBuf::from(a));
+            }
+        }
+    }
+    if let Some(cd) = custom_dir {
+        let mut settings = load_settings();
+        settings.charts_dir = Some(cd.to_string_lossy().to_string());
+        save_settings(&settings);
+    }
     let el = EventLoop::new()?;
     el.set_control_flow(ControlFlow::Poll);
     el.run_app(&mut App { dir, state: None })?;
