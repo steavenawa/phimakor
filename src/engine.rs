@@ -9,10 +9,10 @@
 //! ```no_run
 //! # use phimakor::engine::ChartSession;
 //! let mut session = ChartSession::new(1280, 720)?;
-//! session.load("path/to/chart/dir")?;
+//! session.load(std::path::Path::new("path/to/chart/dir"))?;
 //!
 //! // Seek to 30s, get RGBA pixels
-//! let pixels = session.render_frame(30.0, 0.5)?;
+//! let pixels = session.render_frame(30.0, 0.5).ok_or_else(|| anyhow::anyhow!("no frame rendered"))?;
 //! // pixels is &[u8] length = 1280*720*4, row-major top-down RGBA
 //! # Ok::<_, anyhow::Error>(())
 //! ```
