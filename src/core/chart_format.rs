@@ -160,14 +160,15 @@ fn pec_to_rpe_events(events: Vec<PecEvent>, kind: &str) -> Vec<RPEEvent> {
         };
         let v = e.value;
         let remapped = match kind {
-            // RPE move values are in canvas px; PEC raw x is 0..2048 with
-            // 1024 = center. (raw/1024 - 1) * 675 → px so the ×2/1350 factor
-            // in parse_judge_line lands on prpr's (raw/2048*2 - 1).
-            "x" => (v / 1024.0 - 1.0) * 675.0,
-            "y" => (v / 1400.0 - 1.0) * 450.0,
+            // PhiEdit PEC: x/y are relative coordinates scaled by 1024
+            // (0 = center, ±1024 = ±1.0). RPE move values are canvas px, and
+            // parse_judge_line applies ×2/1350 (x) / ×2/900 (y), so convert
+            // relative → px: (v/1024) * 675 for x, * 450 for y.
+            "x" => v / 1024.0 * 675.0,
+            "y" => v / 1024.0 * 450.0,
             // prpr PEC negates rotation; RPE's ×-1 factor restores the raw sign.
             "r" => v,
-            // Alpha and speed stay raw (RPE scales alpha by 1/255 itself).
+            // Alpha stays raw (RPE scales alpha by 1/255 itself).
             _ => v,
         };
         out.push(rpe(remapped));
@@ -287,11 +288,10 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
                 let line = get_line(&mut lines, li);
                 match cmd {
                     "cv" => {
-                        // PEC speed unit: prpr divides by 5.85; RPE applies its
-                        // own SPEED_RATIO on top — compensate so the height
-                        // integral matches prpr's PEC evaluation.
+                        // PhiEdit PEC: speed is the raw RPE speed-event value
+                        // (no scaling — the evaluator applies SPEED_RATIO).
                         let v = f32t!();
-                        line.speed.push((time, v / 5.85 / crate::core::SPEED_RATIO as f32));
+                        line.speed.push((time, v));
                     }
                     "ca" => line.alpha.push(PecEvent::single(time, f32t!())),
                     "cp" => {
@@ -641,18 +641,18 @@ cf 0 3 5 128
         assert_eq!(notes[3].above, 0);
 
         let layer = line.event_layers[0].as_ref().unwrap();
-        // cv @ beat 0: 1.5 / 5.85 / SPEED_RATIO step segment
+        // cv @ beat 0: raw speed value (1.5) passes through unscaled
         let spd = layer.speed_events.as_ref().unwrap();
         assert!(!spd.is_empty());
-        assert!((spd[0].end - 1.5 / 5.85 / crate::core::SPEED_RATIO as f32).abs() < 1e-4);
+        assert!((spd[0].end - 1.5).abs() < 1e-4);
         // ca: alpha 255 (raw; RPE scales by 1/255)
         let alpha = layer.alpha_events.as_ref().unwrap();
         assert!((alpha[0].start - 255.0).abs() < 1e-6);
-        // cp: move x 512 → (512/1024-1)*675 = -337.5 px; move y 700 → (700/1400-1)*450 = -225
+        // cp: move x 512 → 512/1024*675 = 337.5 px; move y 700 → 700/1024*450 = 307.6
         let mx = layer.move_x_events.as_ref().unwrap();
         let my = layer.move_y_events.as_ref().unwrap();
-        assert!((mx[0].start + 337.5).abs() < 1e-3);
-        assert!((my[0].start + 225.0).abs() < 1e-3);
+        assert!((mx[0].start - 337.5).abs() < 1e-3);
+        assert!((my[0].start - 307.6172).abs() < 1e-3);
         // cd: rotate 30 stays raw (RPE ×-1)
         let rot = layer.rotate_events.as_ref().unwrap();
         assert!((rot[0].start - 30.0).abs() < 1e-6);
