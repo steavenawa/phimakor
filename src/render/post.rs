@@ -271,11 +271,18 @@ impl PostPipe {
     }
 
     /// Load and compile a custom WGSL shader from the chart directory.
+    /// Failures are reported (stderr) instead of silently dropping the effect.
     fn ensure_custom_effect(&mut self, device: &wgpu::Device, name: String) {
         if self.pipelines.contains_key(&name) { return; }
         let Some(ref chart_dir) = self.chart_dir else { return };
         let path = chart_dir.join(&name);
-        let Ok(wgsl) = std::fs::read_to_string(&path) else { return };
+        let wgsl = match std::fs::read_to_string(&path) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("warning: custom effect {name}: cannot read {}: {e}", path.display());
+                return;
+            }
+        };
 
         let combined = String::from(crate::render::shaders::VERT) + &wgsl;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {

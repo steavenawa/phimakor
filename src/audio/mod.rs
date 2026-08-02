@@ -164,7 +164,11 @@ impl AudioClock {
     /// without seeking on an empty queue), re-create and re-append it so
     /// seek + playback can restart. If the player was paused before the
     /// seek, pause it again after re-appending.
-    pub fn seek(&self, t: f64) {
+    ///
+    /// Returns `false` (leaving the clock untouched) when the music file
+    /// cannot be reopened — otherwise the position would desync from what
+    /// is actually audible.
+    pub fn seek(&self, t: f64) -> bool {
         let t = t.max(0.0);
         let was_playing = self.playing.get();
         // rodio: on an empty queue try_seek() is a silent no-op returning Ok,
@@ -172,18 +176,29 @@ impl AudioClock {
         let empty = self.player.empty();
         let seeked = self.player.try_seek(Duration::from_secs_f64(t)).is_ok() && !empty;
         if !seeked {
-            if let Ok(file) = std::fs::File::open(&self.music_path) {
-                if let Ok(source) = rodio::Decoder::try_from(file) {
+            let reopen = std::fs::File::open(&self.music_path)
+                .ok()
+                .and_then(|file| rodio::Decoder::try_from(file).ok());
+            match reopen {
+                Some(source) => {
                     self.player.append(source);
-                    let _ = self.player.try_seek(Duration::from_secs_f64(t));
+                    if self.player.try_seek(Duration::from_secs_f64(t)).is_err() {
+                        eprintln!("warning: audio seek to {t:.2}s failed after reopening {}", self.music_path.display());
+                        return false;
+                    }
                     if !was_playing {
                         self.player.pause();
                     }
+                }
+                None => {
+                    eprintln!("warning: audio seek to {t:.2}s failed: cannot reopen {}", self.music_path.display());
+                    return false;
                 }
             }
         }
         self.pos.set(t);
         self.anchor.set(Instant::now());
+        true
     }
 
     /// Fire a hitsound: kind 1|2 -> click (hold uses click), 3 -> flick,
@@ -299,7 +314,9 @@ pub fn spawn_audio_thread(res_dir: &Path, chart_dir: &Path) -> anyhow::Result<Au
                             clock.set_paused(p);
                             paused2.store(p, Ordering::Relaxed);
                         }
-                        AudioCmd::Seek(t) => clock.seek(t),
+                        AudioCmd::Seek(t) => {
+                            clock.seek(t);
+                        }
                         AudioCmd::Quit => return,
                     }
                 }

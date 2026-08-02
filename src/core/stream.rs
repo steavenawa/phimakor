@@ -184,12 +184,15 @@ pub fn from_stream_bytes(bytes: &[u8]) -> Result<(RPEChart, ChartInfo)> {
     let mut info = ChartInfo::default();
     let mut bpm_list: Vec<RPEBpmItem> = Vec::new();
     let mut judge_lines: HashMap<usize, RPEJudgeLine> = HashMap::new();
-    let mut meta_offset = 0i32;
+    // Events are written into every chunk they overlap (for streamed random
+    // access), so the same event can arrive multiple times — dedupe by value.
+    let mut seen_events: Vec<ChunkEvent> = Vec::new();
 
-    for line in source.lines() {
+    for (line_no, line) in source.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() { continue; }
-        let Ok(record) = serde_json::from_str::<StreamRecord>(line) else { continue; };
+        let record = serde_json::from_str::<StreamRecord>(line)
+            .map_err(|e| anyhow::anyhow!("malformed PSS record at line {}: {e}", line_no + 1))?;
         match record {
             StreamRecord::Meta(m) => {
                 info.name = m.name; info.composer = m.composer;
@@ -220,6 +223,10 @@ pub fn from_stream_bytes(bytes: &[u8]) -> Result<(RPEChart, ChartInfo)> {
             StreamRecord::Chunk(c) => {
                 // Merge chunk events and notes into judge lines
                 for ev in c.events {
+                    if seen_events.contains(&ev) {
+                        continue;
+                    }
+                    seen_events.push(ev.clone());
                     let kind = match ev.kind.as_str() {
                         "alpha" => Some(0), "moveX" => Some(1), "moveY" => Some(2),
                         "rotate" => Some(3), "speed" => Some(4), _ => None,
@@ -378,14 +385,14 @@ struct ChunkRecord {
     #[serde(default)] notes: Vec<ChunkNote>,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ChunkEvent {
     line: u32, layer: u32, kind: String,
     start_time: f64, end_time: f64,
     start: f32, end: f32,
     #[serde(default)] easing_type: i32,
     #[serde(default)] easing_left: f32,
-    #[serde(default = "f32_one")] easing_right: f32,
+    #[serde(default = "crate::core::model::f32_one")] easing_right: f32,
     #[serde(default)] bezier: u8,
     #[serde(default)] bezier_points: [f32; 4],
 }
@@ -412,4 +419,76 @@ struct ChunkEntry {
     offset: u64,
 }
 
-fn f32_one() -> f32 { 1.0 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::model::ChartInfo;
+
+    fn count_events(r: &RPEChart) -> usize {
+        r.judge_line_list
+            .iter()
+            .flat_map(|l| l.event_layers.iter().flatten())
+            .map(|layer| {
+                [&layer.alpha_events, &layer.move_x_events, &layer.move_y_events, &layer.rotate_events, &layer.speed_events]
+                    .iter()
+                    .filter_map(|o| o.as_ref())
+                    .map(|v| v.len())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
+
+    #[test]
+    fn pss_roundtrip_is_idempotent() {
+        // alpha event [0,8] beats crosses the 10-beat chunk span? No — span
+        // is 10.0, so use a wide event that overlaps several chunks.
+        const CHART: &str = r#"{
+            "META": { "offset": 0 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "a", "Texture": "line.png", "father": -1,
+                    "eventLayers": [
+                        {
+                            "alphaEvents": [
+                                { "start": 255.0, "end": 0.0, "startTime": [0, 0, 1], "endTime": [45, 0, 1], "easingType": 1 }
+                            ]
+                        }
+                    ],
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [1, 0, 1], "endTime": [1, 0, 1], "positionX": 675.0, "yOffset": 0.0, "alpha": 255, "hitsound": null, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ],
+                    "isCover": 1
+                }
+            ]
+        }"#;
+        let rpe: RPEChart = serde_json::from_str(CHART).unwrap();
+        let info = ChartInfo::default();
+        // First roundtrip: the 45-beat event lands in chunks 0..=4 → written 5
+        // times; reading must dedupe it back to one.
+        let bytes = to_stream_bytes(&rpe, &info).unwrap();
+        let (rpe2, _) = from_stream_bytes(&bytes).unwrap();
+        assert_eq!(count_events(&rpe2), 1, "overlapping event duplicated on read");
+        assert_eq!(rpe2.judge_line_list[0].notes.as_ref().unwrap().len(), 1);
+        // Second roundtrip must be stable (no growth).
+        let bytes2 = to_stream_bytes(&rpe2, &info).unwrap();
+        let (rpe3, _) = from_stream_bytes(&bytes2).unwrap();
+        assert_eq!(count_events(&rpe3), count_events(&rpe2));
+    }
+
+    #[test]
+    fn malformed_record_is_reported() {
+        let mut bytes = to_stream_bytes(
+            &RPEChart {
+                meta: crate::core::model::RPEMetadata { offset: 0, rpe_version: 160 },
+                bpm_list: vec![crate::core::model::RPEBpmItem { bpm: 120.0, start_time: Triple::default() }],
+                judge_line_list: vec![],
+            },
+            &ChartInfo::default(),
+        )
+        .unwrap();
+        bytes.extend_from_slice(b"{\"type\":\"broken\"\n");
+        let err = from_stream_bytes(&bytes).unwrap_err();
+        assert!(err.to_string().contains("malformed PSS record at line"));
+    }
+}

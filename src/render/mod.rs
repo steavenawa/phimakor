@@ -444,7 +444,6 @@ impl Renderer {
             .context("no suitable GPU adapter")?;
 
         let caps = surface.get_capabilities(&adapter);
-        eprintln!("present modes available: {:?}", caps.present_modes);
         // Prefer a non-sRGB format so authored sRGB values pass through
         // unchanged (prpr colors are display-ready sRGB).
         let format = caps

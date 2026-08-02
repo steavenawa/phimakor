@@ -8,11 +8,11 @@ use std::collections::HashMap;
 
 use crate::core::bpm::Triple;
 
-fn f32_zero() -> f32 {
+pub(crate) fn f32_zero() -> f32 {
     0.
 }
 
-fn f32_one() -> f32 {
+pub(crate) fn f32_one() -> f32 {
     1.
 }
 

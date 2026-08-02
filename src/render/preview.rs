@@ -73,11 +73,9 @@ impl PreviewEngine {
             targets.push(target);
             readbacks.push(readback);
         }
-        (
-            [targets.pop().unwrap(), targets.pop().unwrap(), targets.pop().unwrap()],
-            [readbacks.pop().unwrap(), readbacks.pop().unwrap(), readbacks.pop().unwrap()],
-            padded_bpr,
-        )
+        let targets: [wgpu::Texture; 3] = targets.into_iter().rev().collect::<Vec<_>>().try_into().expect("3 preview slots");
+        let readbacks: [wgpu::Buffer; 3] = readbacks.into_iter().rev().collect::<Vec<_>>().try_into().expect("3 preview slots");
+        (targets, readbacks, padded_bpr)
     }
 
     /// Resize the offscreen targets and readback staging buffers.
