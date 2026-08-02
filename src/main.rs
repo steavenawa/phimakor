@@ -247,6 +247,16 @@ impl App {
             self.state = Some(s);
         }
     }
+
+    /// Drop the current state and open a chart directory (shared by the
+    /// drag-and-drop, splash-click, and reload paths).
+    fn open_chart(&mut self, event_loop: &ActiveEventLoop, path: &std::path::Path) {
+        self.state = None;
+        match self.create_state(event_loop, &path.to_path_buf()) {
+            Ok(st) => self.state = Some(st),
+            Err(e) => { eprintln!("failed to load {path:?}: {e:#}"); }
+        }
+    }
 }
 
 impl State {
@@ -700,11 +710,7 @@ impl ApplicationHandler for App {
                     return;
                 };
                 // Open the (imported) chart.
-                self.state = None;
-                match self.create_state(event_loop, &open_path) {
-                    Ok(st) => self.state = Some(st),
-                    Err(e) => { eprintln!("failed to load {open_path:?}: {e:#}"); }
-                }
+                self.open_chart(event_loop, &open_path);
                 return;
             }
             if let WindowEvent::MouseInput { state: btn_state, button: winit::event::MouseButton::Left, .. } = &event {
@@ -742,11 +748,7 @@ impl ApplicationHandler for App {
                             let Some(ci) = ci else { return };
                             let path = st.splash_charts[ci].path.clone();
                             drop(st);
-                            self.state = None;
-                            match self.create_state(event_loop, &path) {
-                                Ok(new_st) => self.state = Some(new_st),
-                                Err(e) => { eprintln!("failed to load {path:?}: {e:#}"); }
-                            }
+                            self.open_chart(event_loop, &path);
                             return;
                         }
                         ui::SplashHover::Delete(fi) => {
@@ -902,11 +904,7 @@ impl ApplicationHandler for App {
                             }
                             if let Some(path) = open_path {
                                 drop(state);
-                                self.state = None;
-                                match self.create_state(event_loop, &path) {
-                                    Ok(st) => self.state = Some(st),
-                                    Err(e) => { eprintln!("failed to load {path:?}: {e:#}"); }
-                                }
+                                self.open_chart(event_loop, &path);
                             }
                             return;
                         }
@@ -1088,9 +1086,14 @@ impl ApplicationHandler for App {
                 for msg in messages {
                     match msg {
                         ui::OverlayMessage::ToggleEvents => { state.show_events = !state.show_events; state.ui_dirty = true; }
+                        ui::OverlayMessage::ToggleNotes => {
+                            state.show_notes = !state.show_notes;
+                            state.ui_dirty = true;
+                        }
                         ui::OverlayMessage::SelectLayer(ly) => {
-                            if ly == 666 { state.show_notes = !state.show_notes; state.ui_dirty = true; }
-                            else { state.selected_layer = ly; state.cache_valid = false; state.ui_dirty = true; }
+                            state.selected_layer = ly;
+                            state.cache_valid = false;
+                            state.ui_dirty = true;
                         }
                         ui::OverlayMessage::ToggleMenu => { state.show_menu = !state.show_menu; state.ui_dirty = true; }
                         ui::OverlayMessage::MenuSave => {

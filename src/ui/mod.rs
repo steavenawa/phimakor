@@ -54,6 +54,8 @@ static SKIP_CENTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 pub enum OverlayMessage {
     ToggleEvents,
     SelectLayer(usize),
+    /// Toggle the note-preview panel (quick toolbar button).
+    ToggleNotes,
     ToggleMenu,
     MenuSave,
     MenuQuit,
@@ -306,7 +308,7 @@ impl IcedOverlay {
                 let right = self.w as f32 - 10.0 * s;
                 let bx = |i: usize| right - (3 - i) as f32 * (btn_w + 6.0 * s);
                 if mx >= bx(0) && mx < bx(0) + btn_w { self.messages.push(OverlayMessage::ToggleEvents); return; }
-                if mx >= bx(1) && mx < bx(1) + btn_w { self.messages.push(OverlayMessage::SelectLayer(666)); return; }
+                if mx >= bx(1) && mx < bx(1) + btn_w { self.messages.push(OverlayMessage::ToggleNotes); return; }
                 if mx >= bx(2) && mx < bx(2) + btn_w { self.messages.push(OverlayMessage::ToggleMenu); return; }
                 return;
             }
