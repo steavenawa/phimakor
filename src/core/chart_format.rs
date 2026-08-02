@@ -180,6 +180,10 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
     let mut bpm_list: Vec<RPEBpmItem> = Vec::new();
     let mut offset_ms = 0.0f64;
     let mut offset_seen = false;
+    // Global defaults set by standalone `# speed` / `& size` lines (legacy
+    // PEC flavor); per-note overrides win.
+    let mut default_speed = 1.0f32;
+    let mut default_size = 1.0f32;
 
     fn get_line<'a>(lines: &'a mut Vec<PecLine>, id: usize) -> &'a mut PecLine {
         if lines.len() <= id {
@@ -242,10 +246,10 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
                 let x_raw = f32t!();
                 let above: u8 = if usizet!() == 1 { 1 } else { 0 };
                 let fake: u8 = if usizet!() == 1 { 1 } else { 0 };
-                // Per-note overrides: `# speed` then `& size` (either order
-                // not supported — prpr only reads them in that order).
-                let mut speed = 1.0f32;
-                let mut size = 1.0f32;
+                // Per-note overrides: `# speed` then `& size`; fall back to
+                // the global defaults (set by standalone `#`/`&` lines).
+                let mut speed = default_speed;
+                let mut size = default_size;
                 while let Some(t) = it.next() {
                     match t {
                         "#" => speed = f32t!(),
@@ -309,7 +313,15 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
                 }
             }
             "#" | "&" => {
-                return Err(anyhow::anyhow!("{}: `{cmd}` without a preceding note", ctx()));
+                let v = f32t!();
+                // Standalone `#`/`&`: prpr applies them to the last inserted
+                // note; legacy PEC files also use them as global defaults
+                // before any note exists — accept both.
+                if let Some(last) = lines.last_mut().and_then(|l| l.notes.last_mut()) {
+                    if cmd == "#" { last.speed = v; } else { last.size = v; }
+                } else {
+                    if cmd == "#" { default_speed = v; } else { default_size = v; }
+                }
             }
             other => {
                 return Err(anyhow::anyhow!("{}: unknown PEC command `{other}`", ctx()));
@@ -674,6 +686,23 @@ n1 0 4 768 1 0
         // detect: leading number only
         assert!(PecParser::detect(b"1000\nn1 0 1 512 1 0\n"));
         assert!(!PecParser::detect(b"{\"META\":{}}"));
+    }
+
+    #[test]
+    fn pec_global_speed_before_notes() {
+        // Legacy PEC flavor: `#` / `&` on their own lines BEFORE any note set
+        // global defaults (prpr would reject this; the old Phimakor parser
+        // accepted it and real-world charts rely on it).
+        const SRC: &str = r#"0
+# 0.8
+& 1.25
+n1 0 1 512 1 0
+"#;
+        let chart = parse_pec_text(SRC).unwrap();
+        let notes = chart.judge_line_list[0].notes.as_ref().unwrap();
+        assert_eq!(notes.len(), 1);
+        assert!((notes[0].speed - 0.8).abs() < 1e-6);
+        assert!((notes[0].size - 1.25).abs() < 1e-6);
     }
 }
 
