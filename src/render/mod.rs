@@ -163,6 +163,22 @@ struct Instance {
 
 /// Pack the affine part of a column-major Mat3 into Instance.model format:
 /// `[m00, m01, m10, m11, m20, m21, 0, 0]`.
+/// Letterbox + event-position transform for the playfield box.
+/// `window_aspect` vs `playfield_aspect` decides the letterbox axes;
+/// `ev_y = 1.5/aspect` maps the RPE canvas half-height (450) onto the box edge.
+/// Returns (letterbox matrix, kx, ky, ev_x, ev_y).
+pub(crate) fn letterbox_transform(window_aspect: f32, playfield_aspect: f32) -> (Mat3, f32, f32, f32, f32) {
+    let aspect = playfield_aspect;
+    let (kx, ky) = if window_aspect >= aspect {
+        (aspect / window_aspect, 1.0)
+    } else {
+        (1.0, window_aspect / aspect)
+    };
+    let letterbox = mat_scale(kx / CANVAS_W, ky * aspect / CANVAS_W);
+    let ev_x = 1.0;
+    let ev_y = 1.5 / aspect;
+    (letterbox, kx, ky, ev_x, ev_y)
+}
 fn instance_model(m: &Mat3) -> [f32; 8] {
     [m[0][0], m[0][1], m[1][0], m[1][1], m[2][0], m[2][1], 0., 0.]
 }
@@ -880,23 +896,18 @@ impl Renderer {
         // playfield's aspect ratio (no shear, uniform pixel scale per axis).
         // ──────────────────────────────────────────────────────────────────
         let aspect = self.playfield_aspect;
-        let (kx, ky) = if window_aspect >= aspect {
-            (aspect / window_aspect, 1.0)
-        } else {
-            (1.0, window_aspect / aspect)
-        };
+        let (letterbox, kx, ky, ev_x, ev_y) = letterbox_transform(window_aspect, aspect);
         // Coordinate mapping from the playfield's x:y ratio: the playfield box
         // is 1350 × (1350/aspect) px, and the RPE canvas (1350×900) is scaled
         // UNIFORMLY by fit = min(1, 1.5/aspect) to fit inside it. The canvas
         // never clips, never distorts, and 3:2 fills the box exactly.
         // kx/ky letterbox the playfield into the window.
-        let fit = (1.5 / aspect).min(1.0);
+        let _fit = (1.5 / aspect).min(1.0);
         // Uniform letterbox: canvas px → world /675 (x) and ×aspect/675 (y) —
         // the y×aspect exactly compensates the window aspect so SPRITES keep
         // a uniform screen scale at every playfield aspect. Positions get the
         // per-axis factors separately (ev_x/ev_y fill the box at every aspect,
         // and the y stretch overflows the box at wide aspects): see below.
-        let letterbox = mat_scale(kx / CANVAS_W, ky * aspect / CANVAS_W);
         // Event-position factors: depend ONLY on the playfield aspect P (the
         // Tab-switchable design ratio), NEVER on the window — the window only
         // letterboxes (kx/ky) the playfield box uniformly, so note/event
@@ -906,9 +917,6 @@ impl Renderer {
         //                 (450 × 1.5/P × ky·P/675 = ky)
         // 3:2 → (1.0, 1.0), 16:9 → (1.0, 0.844), 4:3 → (1.0, 1.125),
         // 1:1 → (1.0, 1.5). Sprites keep the uniform letterbox scale.
-        let ev_x = 1.0;
-        let ev_y = 1.5 / aspect;
-
         // Rough pre-estimate for the cmds vec capacity.
         let needed = 2 + frame
             .lines
@@ -1065,7 +1073,7 @@ impl Renderer {
                     } else {
                         (self.textures.get(base), 1.0, false)
                     };
-                    let mut alpha = note.alpha;
+                    let alpha = note.alpha;
                     // fake notes render at full opacity (character art etc.)
                     if alpha <= 0.0 {
                         continue;
@@ -1610,4 +1618,21 @@ mod tests {
         let (x, y) = apply(&l, 675., 450.);
         assert!((x - 1.).abs() < 1e-4 && (y - ky).abs() < 1e-4, "({x}, {y})");
     }
+
+    #[test]
+    fn letterbox_transform_ev_factors() {
+        // 3:2 playfield at a matching window: no letterbox, ev_y = 1.
+        let (_, kx, ky, ev_x, ev_y) = letterbox_transform(1.5, 1.5);
+        assert!((kx - 1.).abs() < 1e-6 && (ky - 1.).abs() < 1e-6);
+        assert!((ev_x - 1.).abs() < 1e-6 && (ev_y - 1.).abs() < 1e-6);
+        // 16:9 window on a 3:2 playfield: x letterboxed, y fills.
+        let (_, kx, ky, _, _) = letterbox_transform(16. / 9., 1.5);
+        assert!((kx - 0.84375).abs() < 1e-4 && (ky - 1.).abs() < 1e-6);
+        // 4:3 window: y letterboxed, x fills; ev_y = 1.5 / 1.5 = 1.
+        let (_, kx, ky, _, ev_y) = letterbox_transform(4. / 3., 1.5);
+        assert!((kx - 1.).abs() < 1e-6 && (ky - 0.8889).abs() < 1e-4);
+        assert!((ev_y - 1.).abs() < 1e-6);
+    }
 }
+
+

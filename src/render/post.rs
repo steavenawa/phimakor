@@ -26,8 +26,8 @@ pub struct PostPipe {
     pub(crate) targets: [Option<wgpu::Texture>; 2],
     /// Texture views for the ping-pong targets.
     pub(crate) target_views: [Option<wgpu::TextureView>; 2],
-    /// Index of the current write target (toggles 0/1 each pass).
-    idx: usize,
+    /// Index of the target holding the last effect output (set by apply()).
+    last_output: usize,
 
     /// Bind group layout for screen texture (shared by all effects, needed by Renderer too).
     pub screen_bgl: wgpu::BindGroupLayout,
@@ -150,7 +150,7 @@ impl PostPipe {
         let mut pipe = PostPipe {
             targets: [None, None],
             target_views: [None, None],
-            idx: 0,
+            last_output: 0,
             screen_bgl,
             sampler,
             blit_pipeline,
@@ -199,19 +199,20 @@ impl PostPipe {
         })
     }
 
-    /// Ensure the pipeline + resources exist for a given effect.
-    pub fn ensure_effect(&mut self, device: &wgpu::Device, def: &EffectDef) {
-        if self.pipelines.contains_key(def.name) { return; }
-        let shader_src = String::from(crate::render::shaders::VERT) + def.frag;
+    /// Shared pipeline construction for built-in and custom effects (the two
+    /// paths used to duplicate ~70 lines). `wgsl_body` is the fragment shader;
+    /// the shared vertex shader is prepended.
+    fn build_eff_pipe(&self, device: &wgpu::Device, name: &str, wgsl_body: &str) -> EffPipe {
+        let shader_src = String::from(crate::render::shaders::VERT) + wgsl_body;
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(&format!("shader-{}", def.name)),
+            label: Some(&format!("shader-{name}")),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(shader_src)),
         });
 
         // Group 1: uniform buffer — generous 256 bytes covers any effect struct
         let uniform_size: u64 = 256;
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(&format!("bgl-{}", def.name)),
+            label: Some(&format!("bgl-{name}")),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
                 visibility: wgpu::ShaderStages::FRAGMENT,
@@ -225,13 +226,13 @@ impl PostPipe {
         });
 
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(&format!("pl-{}", def.name)),
+            label: Some(&format!("pl-{name}")),
             bind_group_layouts: &[Some(&self.screen_bgl), Some(&bgl)],
             ..Default::default()
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(&format!("pipe-{}", def.name)),
+            label: Some(&format!("pipe-{name}")),
             layout: Some(&pl),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -261,13 +262,20 @@ impl PostPipe {
         });
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("ubuf-{}", def.name)),
+            label: Some(&format!("ubuf-{name}")),
             size: uniform_size,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        self.pipelines.insert(def.name.to_string(), EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size, uniform_bg: None, screen_bgs: HashMap::new() });
+        EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size, uniform_bg: None, screen_bgs: HashMap::new() }
+    }
+
+    /// Ensure the pipeline + resources exist for a given effect.
+    pub fn ensure_effect(&mut self, device: &wgpu::Device, def: &EffectDef) {
+        if self.pipelines.contains_key(def.name) { return; }
+        let pipe = self.build_eff_pipe(device, &def.name, def.frag);
+        self.pipelines.insert(def.name.to_string(), pipe);
     }
 
     /// Load and compile a custom WGSL shader from the chart directory.
@@ -283,72 +291,8 @@ impl PostPipe {
                 return;
             }
         };
-
-        let combined = String::from(crate::render::shaders::VERT) + &wgsl;
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(&format!("custom-shader-{name}")),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(combined)),
-        });
-
-        // Create uniform bind group layout (256 bytes)
-        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some(&format!("custom-bgl-{name}")),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: Some(wgpu::BufferSize::new(256).unwrap()),
-                },
-                count: None,
-            }],
-        });
-
-        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some(&format!("custom-pl-{name}")),
-            bind_group_layouts: &[Some(&self.screen_bgl), Some(&bgl)],
-            ..Default::default()
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some(&format!("custom-pipe-{name}")),
-            layout: Some(&pl),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: self.tex_format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: None,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
-
-        let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some(&format!("custom-ubuf-{name}")),
-            size: 256,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        self.pipelines.insert(name, EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size: 256, uniform_bg: None, screen_bgs: HashMap::new() });
+        let pipe = self.build_eff_pipe(device, &name, &wgsl);
+        self.pipelines.insert(name, pipe);
     }
 
     /// Run all active effects. Reads from `src`, applies each in order.
@@ -362,8 +306,6 @@ impl PostPipe {
     ) {
         let _s = crate::trace_span!("post_apply");
         if self.active.is_empty() { return; }
-
-        self.idx = 0;
 
         // Phase 1: ensure all pipelines exist
         // Copy active descriptors: (pipeline_key, uniform_values, uniform_count)
@@ -383,13 +325,14 @@ impl PostPipe {
             }
         }
 
-        // Phase 2: execute effects
+        // Phase 2: execute effects. `write_idx` toggles 0/1 between effects
+        // (local only — no persistent state to get out of sync).
         let mut read_view: &wgpu::TextureView = src;
-        let mut idx = self.idx;
+        let mut write_idx = 0usize;
         for (key, uv, _) in &descriptors {
             let Some(ep) = self.pipelines.get_mut(key.as_str()) else { continue };
-            let write_view = self.target_views[idx].as_ref().unwrap();
-            idx = 1 - idx;
+            let write_view = self.target_views[write_idx].as_ref().unwrap();
+            write_idx = 1 - write_idx;
             // Write uniform buffer (256 bytes)
             let mut uniform_data = vec![0u8; 256];
             for (i, &val) in uv.iter().enumerate() {
@@ -458,11 +401,15 @@ impl PostPipe {
             pass.draw(0..3, 0..1);
             read_view = write_view;
         }
-        self.idx = idx;
+        // After the loop, `write_idx` points at the slot that was NOT written
+        // last (it toggled after the final write); the last output is the
+        // other one.
+        self.last_output = 1 - write_idx;
     }
 
     /// After `apply()`, returns the texture view containing the final result.
     pub fn last_view(&self) -> &wgpu::TextureView {
-        self.target_views[1 - self.idx].as_ref().unwrap()
+        self.target_views[self.last_output].as_ref().unwrap()
     }
 }
+
