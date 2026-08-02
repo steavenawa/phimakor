@@ -115,6 +115,8 @@ pub(crate) struct TextState {
     cjk_font: Option<Option<fontdue::Font>>,
     /// Field-split with `pending` for `push_text`; pub(crate) for mod.rs.
     pub(crate) cache: HashMap<(String, u8), CachedText>,
+    /// LRU recency order for the cache keys (front = least recently used).
+    access: Vec<(String, u8)>,
     /// Digit sprite sets by rasterization px (`(px*100) as u32`).
     digits: HashMap<u32, DigitGlyphs>,
     pub(crate) pending: Vec<PendingText>,
@@ -128,6 +130,7 @@ impl TextState {
             font: None,
             cjk_font: None,
             cache: HashMap::new(),
+            access: Vec::new(),
             digits: HashMap::new(),
             pending: Vec::new(),
             font_bytes: 0,
@@ -414,6 +417,65 @@ impl Renderer {
     }
 }
 
+/// Rasterize `text` for this frame (or fetch the cached line), touching the
+/// LRU order. Digit-only strings are composed per frame, never cached.
+/// Shared by the anchored and world-space draw paths.
+fn rasterized_entry(
+    text_state: &mut TextState,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex_bgl: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    px: f32,
+    text: &str,
+    anchor: TextAnchor,
+) -> Option<CachedText> {
+    if text_state.font.is_none() {
+        load_main_into(&mut text_state.font, &mut text_state.font_bytes);
+    }
+    let font = text_state.font.as_ref().and_then(|f| f.as_ref())?;
+    // CJK fallback loads only when the text actually needs it (Chinese song
+    // names) — ASCII-only HUDs never touch the ~19 MB msyh.
+    let cjk = if needs_cjk(font, text) {
+        if text_state.cjk_font.is_none() {
+            load_cjk_into(&mut text_state.cjk_font, &mut text_state.font_bytes);
+        }
+        text_state.cjk_font.as_ref().and_then(|f| f.as_ref())
+    } else {
+        None
+    };
+    if is_digits(text) {
+        // Dynamic numbers: compose from pre-rasterized digits, no cache.
+        return compose_digits(text_state, device, queue, tex_bgl, sampler, px, text)
+            .map(|(bind_group, size)| CachedText { bind_group, size });
+    }
+    let key = (text.to_string(), anchor as u8);
+    if let Some(entry) = text_state.cache.get(&key) {
+        // Touch LRU: move to the back (most recently used).
+        if let Some(pos) = text_state.access.iter().position(|k| k == &key) {
+            text_state.access.remove(pos);
+            text_state.access.push(key);
+        }
+        return Some(entry.clone());
+    }
+    let (bind_group, size) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px, cjk)?;
+    let entry = CachedText { bind_group, size };
+    // LRU eviction: drop the least recently used entry when over the cap,
+    // instead of wiping the whole cache (which destroyed every GPU texture).
+    if text_state.cache.len() >= TEXT_CACHE_CAP {
+        if let Some(oldest) = text_state.access.first() {
+            text_state.cache.remove(oldest);
+            text_state.access.remove(0);
+        }
+    }
+    text_state.cache.insert(key.clone(), entry.clone());
+    text_state.access.push(key);
+    Some(entry)
+}
+
+/// LRU cap for the static text line cache.
+const TEXT_CACHE_CAP: usize = 1024;
+
 /// Field-split version of [`Renderer::draw_text`]: queues an anchored text
 /// line. Callable while `cmds` holds borrows of other renderer fields.
 ///
@@ -434,43 +496,9 @@ pub(crate) fn draw_text_queued(
     scale: f32,
     color: [f32; 4],
 ) {
-    if text_state.font.is_none() {
-        load_main_into(&mut text_state.font, &mut text_state.font_bytes);
-    }
-    let Some(font) = text_state.font.as_ref().and_then(|f| f.as_ref()) else {
-        return;
-    };
-    // CJK fallback loads only when the text actually needs it (Chinese song
-    // names) — ASCII-only HUDs never touch the ~19 MB msyh.
-    let cjk = if needs_cjk(font, text) {
-        if text_state.cjk_font.is_none() {
-            load_cjk_into(&mut text_state.cjk_font, &mut text_state.font_bytes);
-        }
-        text_state.cjk_font.as_ref().and_then(|f| f.as_ref())
-    } else {
-        None
-    };
     let (px, _, _) = anchor.layout(aspect);
-    let entry = if is_digits(text) {
-        // Dynamic numbers: compose from pre-rasterized digits, no cache.
-        let Some((bind_group, size)) = compose_digits(text_state, device, queue, tex_bgl, sampler, px, text) else {
-            return;
-        };
-        CachedText { bind_group, size }
-    } else {
-        // Static text: rasterize once and cache (capped as a safety net).
-        let key = (text.to_string(), anchor as u8);
-        if !text_state.cache.contains_key(&key) {
-            let Some((bind_group, size)) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px, cjk) else {
-                return;
-            };
-            text_state.cache.insert(key.clone(), CachedText { bind_group, size });
-            if text_state.cache.len() > 1024 {
-                let keep = key.clone();
-                text_state.cache.retain(|k, _| k == &keep);
-            }
-        }
-        text_state.cache[&key].clone()
+    let Some(entry) = rasterized_entry(text_state, device, queue, tex_bgl, sampler, px, text, anchor) else {
+        return;
     };
     let (_, halign, top) = anchor.layout(aspect);
     let cx = match halign {
@@ -500,39 +528,8 @@ pub(crate) fn draw_text_world(
 ) {
     let anchor = TextAnchor::World;
     let (px, _, _) = anchor.layout(aspect);
-    let entry = if is_digits(text) {
-        let Some((bind_group, size)) = compose_digits(text_state, device, queue, tex_bgl, sampler, px, text) else {
-            return;
-        };
-        CachedText { bind_group, size }
-    } else {
-        if text_state.font.is_none() {
-            load_main_into(&mut text_state.font, &mut text_state.font_bytes);
-        }
-        let Some(font) = text_state.font.as_ref().and_then(|f| f.as_ref()) else {
-            return;
-        };
-        // CJK fallback loads only when the text actually needs it.
-        let cjk = if needs_cjk(font, text) {
-            if text_state.cjk_font.is_none() {
-                load_cjk_into(&mut text_state.cjk_font, &mut text_state.font_bytes);
-            }
-            text_state.cjk_font.as_ref().and_then(|f| f.as_ref())
-        } else {
-            None
-        };
-        let key = (text.to_string(), anchor as u8);
-        if !text_state.cache.contains_key(&key) {
-            let Some((bind_group, size)) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px, cjk) else {
-                return;
-            };
-            text_state.cache.insert(key.clone(), CachedText { bind_group, size });
-            if text_state.cache.len() > 1024 {
-                let keep = key.clone();
-                text_state.cache.retain(|k, _| k == &keep);
-            }
-        }
-        text_state.cache[&key].clone()
+    let Some(entry) = rasterized_entry(text_state, device, queue, tex_bgl, sampler, px, text, anchor) else {
+        return;
     };
     text_state.pending.push(PendingText { entry, pos, rotation, scale: 1.0, color, viewport_edge: false, anchor });
 }
