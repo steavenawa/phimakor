@@ -1253,14 +1253,21 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> std::io::
     Ok(())
 }
 
-/// Validate a chart directory: must contain `info.json` or `info.txt`.
+/// Whether `p` looks like a chart directory: it must carry `info.json`,
+/// RPE web-export `info.yml`, or a legacy `info.txt`.
 fn is_chart_dir(p: &std::path::Path) -> bool {
-    p.is_dir() && (p.join("info.json").exists() || p.join("info.txt").exists())
+    p.is_dir() && has_info_file(p)
 }
 
-/// Probe a `.zip` chart package: it must contain an `info.json` / `info.txt`
-/// entry. Returns `Ok(chart_root)` where `chart_root` is the archive-internal
-/// directory holding the info file (strip a single leading wrapper dir).
+/// True if the directory contains any supported info file.
+fn has_info_file(p: &std::path::Path) -> bool {
+    p.join("info.json").exists() || p.join("info.yml").exists() || p.join("info.txt").exists()
+}
+
+/// Probe a `.zip` chart package: it must contain an `info.json` / `info.yml` /
+/// `info.txt` entry. Returns `Ok(chart_root)` where `chart_root` is the
+/// archive-internal directory holding the info file (strip a single leading
+/// wrapper dir).
 fn probe_chart_zip(zip_path: &std::path::Path) -> anyhow::Result<std::path::PathBuf> {
     let file = std::fs::File::open(zip_path).map_err(|e| anyhow::anyhow!("open zip: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| anyhow::anyhow!("zip parse: {e}"))?;
@@ -1269,14 +1276,14 @@ fn probe_chart_zip(zip_path: &std::path::Path) -> anyhow::Result<std::path::Path
     for i in 0..archive.len() {
         let name = archive.by_index(i).map_err(|e| anyhow::anyhow!("zip entry: {e}"))?.name().to_string();
         let file_name = std::path::Path::new(&name).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-        if file_name == "info.json" || file_name == "info.txt" {
+        if file_name == "info.json" || file_name == "info.yml" || file_name == "info.txt" {
             let p = std::path::Path::new(&name);
             let root = p.parent().filter(|d| !d.as_os_str().is_empty()).map(|d| d.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::new());
             roots.push(root);
         }
     }
     if roots.is_empty() {
-        anyhow::bail!("not a chart zip: no info.json/info.txt inside");
+        anyhow::bail!("not a chart zip: no info.json/info.yml/info.txt inside");
     }
     // Prefer the shallowest root (root-level info beats a nested one).
     roots.sort_by_key(|r| r.components().count());
@@ -1316,7 +1323,7 @@ fn import_chart_zip(zip_path: &std::path::Path) -> anyhow::Result<std::path::Pat
     }
     if !is_chart_dir(&dest) {
         // Info file was nested deeper than the stripped root — rescan.
-        anyhow::bail!("extracted chart has no info.json/info.txt at root");
+        anyhow::bail!("extracted chart has no info.json/info.yml/info.txt at root");
     }
     Ok(dest)
 }
@@ -1385,7 +1392,7 @@ fn scan_charts() -> Vec<ui::ChartEntry> {
     if let Ok(readdir) = std::fs::read_dir(&dir) {
         for e in readdir.flatten() {
             let p = e.path();
-            if p.is_dir() && (p.join("info.json").exists() || p.join("info.txt").exists()) {
+            if is_chart_dir(&p) {
                 charts.push(read_chart_entry(&p));
             }
         }
@@ -1394,11 +1401,17 @@ fn scan_charts() -> Vec<ui::ChartEntry> {
     charts
 }
 
-/// Read a chart's `info.json` (falling back to RPE `info.txt`), or `None`.
+/// Read a chart's `info.json` (falling back to RPE web-export `info.yml`,
+/// then legacy `info.txt`), or `None`.
 fn read_chart_info(dir: &std::path::Path) -> Option<core::model::ChartInfo> {
     if let Ok(src) = std::fs::read_to_string(dir.join("info.json")) {
         if let Ok(info) = serde_json::from_str::<core::model::ChartInfo>(&src) {
             return Some(info);
+        }
+    }
+    if let Ok(src) = std::fs::read_to_string(dir.join("info.yml")) {
+        if let Ok(yaml) = serde_yaml::from_str::<core::model::InfoYaml>(&src) {
+            return Some(yaml.into_chart_info());
         }
     }
     if let Ok(src) = std::fs::read_to_string(dir.join("info.txt")) {

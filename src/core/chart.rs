@@ -1423,6 +1423,39 @@ mod tests {
     }
 
     #[test]
+    fn load_info_from_yml() {
+        let dir = std::env::temp_dir().join("phimakor-info-yml-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("info.yml"), r#"
+name: Test Song
+composer: Composer A
+charter: Charter B
+level: "IN 14"
+difficulty: 11.5
+chart: chart.json
+music: audio.mp3
+illustration: bg.png
+lineLength: 4.5
+previewStart: 12
+"#).unwrap();
+        let info = load_info(&dir).unwrap();
+        assert_eq!(info.name, "Test Song");
+        assert_eq!(info.composer, "Composer A");
+        assert_eq!(info.charter, "Charter B");
+        assert_eq!(info.level, "IN 14");
+        assert!((info.difficulty - 11.5).abs() < 1e-6);
+        assert_eq!(info.chart, "chart.json");
+        assert!((info.line_length - 4.5).abs() < 1e-6);
+        assert!((info.preview_start - 12.0).abs() < 1e-6);
+        // info.json wins over info.yml when both exist.
+        std::fs::write(dir.join("info.json"), r#"{"chart":"chart.json","name":"Json Name"}"#).unwrap();
+        let info = load_info(&dir).unwrap();
+        assert_eq!(info.name, "Json Name");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn negative_father_rejected() {
         // father < -1 used to wrap to a huge usize and panic in has_cycle.
         let chart = r#"{
