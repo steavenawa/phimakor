@@ -95,6 +95,9 @@ pub struct IcedOverlay {
     /// 时间轴是否跟随播放头滚动。手动滚轮滚动会置 false(视图停住),
     /// seek 时重新置 true。
     pub tl_follow: bool,
+    /// 时间轴视图参数(tl_scroll/tl_zoom)被手动改动后置位,强制下一帧
+    /// 全量重绘面板(否则 fast path 只画 playhead,网格/内容停留在旧视图)。
+    timeline_dirty: bool,
     pub gui_scale: f32,
     select_start: Option<(f32, f32)>,
     select_end: Option<(f32, f32)>,
@@ -134,6 +137,7 @@ impl IcedOverlay {
             tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 4],
             panel_defs: Vec::new(), messages: Vec::new(), timeline_click: None,
             layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, gui_scale: 1.0,
+            timeline_dirty: false,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
             drag_note: None, drag_updated: None, ctx_pos: None, ctx_progress: 0.0,
             mouse_beat: 0.0, notes_cache: Arc::new(Vec::new()), last_drawn_beat: 0.0, show_menu: false,
@@ -247,6 +251,7 @@ impl IcedOverlay {
     /// Zoom the timeline (Ctrl+scroll). `delta` is the notch value.
     pub fn timeline_zoom_in(&mut self, delta: f32) {
         self.tl_zoom = (self.tl_zoom * (1.0 - delta * 0.1)).clamp(2.0, 64.0);
+        self.timeline_dirty = true;
     }
 
     /// Scroll the timeline (mouse wheel). `delta` is the notch value.
@@ -255,6 +260,7 @@ impl IcedOverlay {
     pub fn timeline_scroll(&mut self, delta: f32) {
         self.tl_follow = false;
         self.tl_scroll = (self.tl_scroll - delta * self.tl_zoom * 0.15).max(0.0);
+        self.timeline_dirty = true;
     }
 
     /// Snap the timeline scroll position to the beat grid (`snap` in beats,
@@ -263,6 +269,7 @@ impl IcedOverlay {
     pub fn snap_timeline_scroll(&mut self, snap: f32) {
         let s = snap.max(0.0001);
         self.tl_scroll = (self.tl_scroll / s).round() * s;
+        self.timeline_dirty = true;
     }
 
     pub fn handle_click(&mut self, pressed: bool, ctrl: bool) {
@@ -494,8 +501,9 @@ impl IcedOverlay {
     }
 
     /// Rebuild the full Iced widget tree + draw everything (dirty-triggered, ~10fps).
-    pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
+pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let _s = trace_span!("render_iced");
+        self.timeline_dirty = false; // full redraw covers any pending view change
         self.panel_progress = self.approach(self.panel_progress, if info.show_properties { 1.0 } else { 0.0 });
         self.events_progress = self.approach(self.events_progress, if info.show_events { 1.0 } else { 0.0 });
         self.notes_progress = self.approach(self.notes_progress, if info.show_notes { 1.0 } else { 0.0 });
@@ -645,7 +653,8 @@ impl IcedOverlay {
             self.ctx_progress,
             self.tool_hover_progress,
         );
-        if playing || anim_moving {
+        if playing || anim_moving || self.timeline_dirty {
+            self.timeline_dirty = false;
             self.upload_timeline_to(queue, info);
             self.last_drawn_beat = info.chart_beat;
             return;

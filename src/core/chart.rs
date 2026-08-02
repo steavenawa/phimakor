@@ -12,7 +12,7 @@ use super::{
     easing::{
         speed_linear_tween, speed_segment_tween, BezierTween, ClampedTween, RPE_TWEEN_MAP, SpeedEasingMode, StaticTween, TweenFunction, Tweenable,
     },
-    model::{parse_info_txt, ChartFormat, ChartInfo, InfoYaml, RPEChart, RPEEvent, RPEEventLayer, RPEJudgeLine, RPENote},
+    model::{parse_info_txt, ChartInfo, InfoYaml, RPEChart, RPEEvent, RPEEventLayer, RPEJudgeLine, RPENote},
     Color, EPS, RPE_HEIGHT, RPE_WIDTH, SPEED_RATIO,
 };
 
@@ -1231,12 +1231,14 @@ impl Chart {
                     }
                     let head_y = yoff + bottom;
                     let tail_y = yoff + (note.end_height - line_height) * spd;
-                    // Viewport cull on the CLOSEST of head/tail: a long hold
-                    // whose head is far above can still have its body dipping
-                    // into view — culling on head_y alone would wrongly drop
-                    // the visible body.
+                    // Viewport cull on the head/tail INTERVAL, not the closest
+                    // endpoint: a long hold whose head is far above still has
+                    // its body dipping into view — culling on head_y alone
+                    // (or on min(head,tail)) would wrongly drop the whole
+                    // hold for part of its visible lifetime.
                     let near = head_y.min(tail_y);
-                    if near > 2.0 || near < -2.0 {
+                    let far = head_y.max(tail_y);
+                    if far < -2.0 || near > 2.0 {
                         continue;
                     }
                     (head_y, Some(tail_y))
@@ -1642,6 +1644,51 @@ mod tests {
         assert!(frame.lines[0].notes.is_empty()); // culled (past fadeout)
         assert_eq!(frame.fired.len(), 1);
         assert_eq!(frame.fired[0].kind, 1);
+    }
+
+    #[test]
+    fn hold_body_culling_keeps_interval_in_view() {
+        // A long hold whose HEAD is far above the viewport but whose BODY
+        // (tail end) is inside it must stay rendered. Culling used to check
+        // only min(head_y, tail_y): the far-above head dropped the whole hold.
+        //
+        // Speed profile (beats @120bpm, 0.5s/beat):
+        //   beat 0-2: 0 -> -160 (integrates height to ~-21, head far above)
+        //   beat 2-4: 0        (height frozen)
+        //   beat 4-6: +45      (body rises back into view)
+        // hold beat 4->6 with yOffset 10 → head_y ≈ -11 (culled before),
+        // tail_y ≈ +0.6 (inside the ±2 viewport).
+        const SRC: &str = r#"{
+            "META": { "offset": 0, "RPEVersion": 170 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "a", "Texture": "line.png", "father": -1,
+                    "eventLayers": [
+                        {
+                            "speedEvents": [
+                                { "start": 0.0, "end": -160.0, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 1 },
+                                { "start": 0.0, "end": 0.0, "startTime": [2, 0, 1], "endTime": [4, 0, 1], "easingType": 1 },
+                                { "start": 45.0, "end": 45.0, "startTime": [4, 0, 1], "endTime": [6, 0, 1], "easingType": 1 }
+                            ]
+                        }
+                    ],
+                    "notes": [
+                        { "type": 2, "above": 1, "startTime": [4, 0, 1], "endTime": [6, 0, 1], "positionX": 675.0, "yOffset": 10.0, "alpha": 255, "hitsound": null, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ],
+                    "isCover": 1
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(SRC, false).unwrap();
+        // 1.9s = beat 3.8: hold not hit yet (hit at beat 4 = 2.0s). Head is
+        // far above the viewport; the body dips in → must stay visible.
+        let frame = chart.state_at(1.9);
+        assert_eq!(frame.lines[0].notes.len(), 1, "hold body in viewport must not be culled");
+        assert_eq!(frame.lines[0].notes[0].kind, 2);
+        // Just before the head even approaches: both ends far above → culled.
+        let frame = chart.state_at(0.8);
+        assert!(frame.lines[0].notes.is_empty(), "fully offscreen hold must be culled");
     }
 
     #[test]
