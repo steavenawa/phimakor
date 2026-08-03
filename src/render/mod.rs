@@ -417,6 +417,57 @@ pub struct Renderer {
     text: text::TextState,
     /// Persistent single-instance buffer for UI overlay draws.
     ui_inst_buf: wgpu::Buffer,
+    /// 可选 GPU 计时(env PHIMAKOR_GPU_TIMING=1 启用,默认 None 零开销)。
+    gpu_timers: Option<GpuTimers>,
+}
+
+/// GPU 渲染耗时计时:每帧两个 timestamp(scene pass 起止),resolve 后读回。
+/// 测量的是 GPU 实际执行时间(不含 CPU 提交/上传)。
+struct GpuTimers {
+    query_set: wgpu::QuerySet,
+    resolve_buf: wgpu::Buffer,
+    readback_buf: wgpu::Buffer,
+    /// 上一帧 GPU 耗时(秒,由 poll_timing 更新)。
+    last_ms: f32,
+}
+
+impl GpuTimers {
+    fn new(device: &wgpu::Device) -> Self {
+        let query_set = device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("gpu-timers"),
+            ty: wgpu::QueryType::Timestamp,
+            count: 2,
+        });
+        let resolve_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-timers-resolve"),
+            size: 16,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("gpu-timers-readback"),
+            size: 16,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Self { query_set, resolve_buf, readback_buf, last_ms: 0.0 }
+    }
+
+    /// 读回上一帧 GPU 耗时(阻塞到可用;返回 ms)。
+    /// timestamp 单位为 GPU 时钟周期,需 × get_timestamp_period 换算。
+    fn poll(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> f32 {
+        let slice = self.readback_buf.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+        if let Ok(data) = slice.get_mapped_range() {
+            let t0 = u64::from_le_bytes(data[0..8].try_into().unwrap_or_default());
+            let t1 = u64::from_le_bytes(data[8..16].try_into().unwrap_or_default());
+            let period = queue.get_timestamp_period() as f64; // 周期 → 纳秒
+            self.last_ms = (t1.saturating_sub(t0)) as f32 * period as f32 * 1e-6; // ns → ms
+        }
+        self.readback_buf.unmap();
+        self.last_ms
+    }
 }
 
 impl Renderer {
@@ -515,7 +566,11 @@ impl Renderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
-                required_features: wgpu::Features::empty(),
+                required_features: if std::env::var("PHIMAKOR_GPU_TIMING").is_ok() {
+                    wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+                } else {
+                    wgpu::Features::empty()
+                },
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::default(),
                 memory_hints: wgpu::MemoryHints::default(),
@@ -595,6 +650,11 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let gpu_timers = if std::env::var("PHIMAKOR_GPU_TIMING").is_ok() {
+            Some(GpuTimers::new(&device))
+        } else {
+            None
+        };
         Ok(Self {
             instance,
             surface,
@@ -612,6 +672,7 @@ impl Renderer {
             disc,
             play_tri,
             textures: HashMap::new(),
+            gpu_timers,
             background: None,
             background_dim: 1.0,
             playfield_aspect: ASPECT,
@@ -1486,6 +1547,10 @@ impl Renderer {
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        // GPU 计时(可选):t0 = 场景 pass 开始前。
+        if let Some(t) = &self.gpu_timers {
+            encoder.write_timestamp(&t.query_set, 0);
+        }
         // Render 3D scene to intermediate (if effects active) or directly to surface
         let has_effects = { let p = &self.post; !p.active.is_empty() };
         let scene_view: &wgpu::TextureView = if has_effects {
@@ -1594,8 +1659,23 @@ impl Renderer {
                 pass.draw(0..4, 0..1);
             }
         }
+        // GPU 计时:所有渲染结束后写 t1 + resolve 到读回缓冲。
+        if let Some(t) = &self.gpu_timers {
+            encoder.write_timestamp(&t.query_set, 1);
+            encoder.resolve_query_set(&t.query_set, 0..2, &t.resolve_buf, 0);
+            encoder.copy_buffer_to_buffer(&t.resolve_buf, 0, &t.readback_buf, 0, 16);
+        }
         self.queue.submit([encoder.finish()]);
         self.frame_idx ^= 1;
+    }
+
+    /// 读回上一帧 GPU 渲染耗时(ms)。仅 PHIMAKOR_GPU_TIMING=1 时有效;
+    /// 默认返回 0(未启用)。阻塞到 GPU 完成。
+    pub fn gpu_last_frame_ms(&mut self) -> f32 {
+        match &mut self.gpu_timers {
+            Some(t) => t.poll(&self.device, &self.queue),
+            None => 0.0,
+        }
     }
 }
 

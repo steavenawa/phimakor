@@ -104,6 +104,12 @@ impl PreviewEngine {
         &self.renderer
     }
 
+    /// 读回上一帧 GPU 渲染耗时(ms)。需 PHIMAKOR_GPU_TIMING=1 启用;
+    /// 否则返回 0。阻塞到 GPU 完成。
+    pub fn gpu_frame_ms(&mut self) -> f32 {
+        self.renderer.gpu_last_frame_ms()
+    }
+
     /// Render one frame offscreen and read back RGBA8, row-major, top-down.
     /// Returns pixel bytes (len = w*h*4, row padding already removed).
     ///
