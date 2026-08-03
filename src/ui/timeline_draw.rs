@@ -52,6 +52,18 @@ pub struct TimelineDrawState {
     pub line_list_hover: Option<Area>,
     /// 右上角性能提示开关(设置里开启)。
     pub perf_hint: bool,
+    /// 鼠标位置(自定义 GPU 光标用)。
+    pub mouse_pos: Option<(f32, f32)>,
+    /// 光标样式:true = 自定义 GPU 光标(系统光标已隐藏)。
+    pub custom_cursor: bool,
+    /// 光标移动强度 0..1(移动时顶点外扩,静止回落)。
+    pub cursor_move: f32,
+    /// 光标点击强度 0..1(点击时菱形收缩变色)。
+    pub cursor_click: f32,
+    /// 光标位置历史(延迟轨迹,新→旧)。
+    pub cursor_trail: Vec<(f32, f32)>,
+    /// 光标动画时间(秒,顶点呼吸用)。
+    pub cursor_time: f32,
 }
 
 impl TimelineDrawState {
@@ -74,6 +86,12 @@ impl TimelineDrawState {
             chart_grid: o.chart_grid.clone(), chart_grid_hover: o.chart_grid_hover,
             line_list: o.line_list.clone(), line_list_hover: o.line_list_hover,
             perf_hint: o.perf_hint,
+            mouse_pos: o.mouse_pos,
+            custom_cursor: o.custom_cursor,
+            cursor_move: o.cursor_move,
+            cursor_click: o.cursor_click,
+            cursor_trail: o.cursor_trail.clone(),
+            cursor_time: o.cursor_time,
         }
     }
 }
@@ -242,8 +260,82 @@ impl TimelineDrawState {
             let mut cv = bpm_panel::SkiaCanvas { pm: &mut pm.as_mut() };
             cv.text(&txt, x, y, size, color);
         }
+        // 自定义 GPU 光标(最顶层,系统光标已隐藏时)。
+        if self.custom_cursor {
+            if let Some((mx, my)) = self.mouse_pos {
+                draw_custom_cursor(&mut pm.as_mut(), mx, my, s, self.cursor_move, self.cursor_click, &self.cursor_trail, self.cursor_time);
+            }
+        }
     }
 }
+
+/// 画自定义几何光标:中心菱形 + 4 顶点 + 延迟轨迹。
+/// `mv` 0..1 移动强度(顶点外扩),`clk` 0..1 点击强度(收缩变色)。
+/// pub:标题界面(render_splash)也用它同步绘制。
+pub fn draw_custom_cursor(
+    pm: &mut PixmapMut,
+    mx: f32,
+    my: f32,
+    s: f32,
+    mv: f32,
+    clk: f32,
+    trail: &[(f32, f32)],
+    time: f32,
+) {
+    // 基色青 #00d4aa;点击时偏红。
+    let (kr, kg, kb) = (
+        (0.0 + clk * 255.0).min(255.0) as u8,
+        (212.0 - clk * 200.0).max(0.0) as u8,
+        (170.0 - clk * 140.0).max(0.0) as u8,
+    );
+
+    // 1) 延迟轨迹:历史位置画淡色小菱形(渐隐)。
+    for (i, &(tx, ty)) in trail.iter().enumerate() {
+        if i == 0 || i > 24 { continue; }
+        let fade = (1.0 - i as f32 / 25.0) * 0.10;
+        if fade <= 0.01 { continue; }
+        let sz = (3.0 + 3.0 * (1.0 - i as f32 / 25.0)) * s;
+        let pts = [(tx, ty - sz), (tx + sz, ty), (tx, ty + sz), (tx - sz, ty)];
+        let mut p = tiny_skia::PathBuilder::new();
+        p.move_to(pts[0].0, pts[0].1);
+        for pt in &pts[1..] { p.line_to(pt.0, pt.1); }
+        p.close();
+        if let Some(path) = p.finish() {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(kr, kg, kb, (fade * 255.0) as u8);
+            pm.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::default(), None);
+        }
+    }
+
+    // 2) 中心菱形:点击时收缩;轻微呼吸。
+    let breathe = 1.0 + 0.06 * (time * 2.0).sin();
+    let sz = (4.0 + mv * 1.0 - clk * 2.5) * s * breathe;
+    let diamond = [(mx, my - sz), (mx + sz, my), (mx, my + sz), (mx - sz, my)];
+    let mut dp = tiny_skia::PathBuilder::new();
+    dp.move_to(diamond[0].0, diamond[0].1);
+    for pt in &diamond[1..] { dp.line_to(pt.0, pt.1); }
+    dp.close();
+    if let Some(path) = dp.finish() {
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(kr, kg, kb, 220);
+        pm.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::default(), None);
+    }
+
+    // 3) 四顶点:移动时外扩 + 变亮。
+    let vertex_d = 8.0 * s + mv * 6.0 * s;
+    let vr = 1.6 * s;
+    let va = (80.0 + mv * 90.0) as u8;
+    for (dx, dy) in [(0.0, -1.0), (1.0, 0.0), (0.0, 1.0), (-1.0, 0.0)] {
+        let vx = mx + dx * vertex_d;
+        let vy = my + dy * vertex_d;
+        let mut paint = Paint::default();
+        paint.set_color_rgba8(kr, kg, kb, va);
+        if let Some(circle) = tiny_skia::PathBuilder::from_circle(vx, vy, vr) {
+            pm.fill_path(&circle, &paint, tiny_skia::FillRule::Winding, Transform::default(), None);
+        }
+    }
+}
+
 
 // ── 绘制 worker(PMCORE-55 第二阶段)──
 
@@ -336,6 +428,7 @@ impl TimelineWorker {
         }
     }
 }
+
 
 
 

@@ -276,6 +276,10 @@ impl App {
         let mut overlay = ui::IcedOverlay::new(renderer.device(), renderer.tex_bgl(), renderer.sampler(), 1200, 800);
         overlay.set_panels(layout.panels.clone());
         overlay.perf_hint = settings.perf_hint;
+        overlay.custom_cursor = settings.custom_cursor;
+        if settings.custom_cursor {
+            window.set_cursor_visible(false);
+        }
         Ok(State {
             window, chart_dir: dir.to_path_buf(), renderer, overlay, doc, chart, info, audio,
             started: Instant::now(), fps_since: Instant::now(), aspect_idx: 0,
@@ -963,7 +967,12 @@ impl State {
         // 应用即时生效的设置。
         self.renderer.set_vsync(self.settings.vsync);
         self.gui_scale = self.settings.gui_scale;
-        self.overlay.perf_hint = self.settings.perf_hint;        if self.settings.fullscreen {
+        self.overlay.perf_hint = self.settings.perf_hint;
+        // 自定义 GPU 光标:隐藏系统光标。
+        if self.settings.custom_cursor != self.overlay.custom_cursor {
+            self.overlay.custom_cursor = self.settings.custom_cursor;
+            self.window.set_cursor_visible(!self.settings.custom_cursor);
+        }        if self.settings.fullscreen {
             self.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         } else {
             self.window.set_fullscreen(None);
@@ -2164,6 +2173,10 @@ impl ApplicationHandler for App {
                 // Splash presses are handled by the splash block (releases);
                 // skip overlay state here so nothing leaks into the editor.
                 if state.splash_mode { return; }
+                // 光标点击反馈(自定义光标收缩变色)。
+                if btn_state == ElementState::Pressed {
+                    state.overlay.cursor_click = 1.0;
+                }
                 // HUD pause button (window px hit-test against last frame).
                 if btn_state == ElementState::Pressed {
                     if let Some(m) = state.overlay.mouse_pos {

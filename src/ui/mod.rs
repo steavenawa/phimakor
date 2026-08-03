@@ -109,6 +109,18 @@ pub struct IcedOverlay {
     pub tl_worker: Option<timeline_draw::TimelineWorker>,
     /// 右上角性能提示开关(设置里开启,播放帧延迟大时显示)。
     pub perf_hint: bool,
+    /// 自定义 GPU 光标(系统光标隐藏,worker 管线画动态光标)。
+    pub custom_cursor: bool,
+    /// 光标移动强度 0..1(移动时顶点外扩,静止回落)。
+    pub cursor_move: f32,
+    /// 光标点击强度 0..1(点击时菱形收缩变色)。
+    pub cursor_click: f32,
+    /// 光标位置历史(延迟轨迹,新→旧)。
+    cursor_trail: Vec<(f32, f32)>,
+    /// 光标动画时间。
+    cursor_time: f32,
+    /// 面板进度动画中已重绘 iced(避免重复重绘)。
+    last_anim_iced: bool,
     pub messages: Vec<OverlayMessage>,
     timeline_click: Option<f32>,
     layer_click: Option<f32>,
@@ -157,7 +169,7 @@ impl IcedOverlay {
             w: w.max(1), h: h.max(1), panel_progress: 0.0, events_progress: 0.0,
             notes_progress: 0.0, mouse_pos: None, show_overlay: true, tl_visible: false,
             tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 5],
-            panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, tl_worker: Some(timeline_draw::TimelineWorker::new(w.max(1), h.max(1))), perf_hint: false, messages: Vec::new(), timeline_click: None,
+            panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, tl_worker: Some(timeline_draw::TimelineWorker::new(w.max(1), h.max(1))), perf_hint: false, custom_cursor: false, cursor_move: 0.0, cursor_click: 0.0, cursor_trail: Vec::new(), cursor_time: 0.0, last_anim_iced: false, messages: Vec::new(), timeline_click: None,
             layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, gui_scale: 1.0,
             timeline_dirty: false,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
@@ -207,6 +219,13 @@ impl IcedOverlay {
     pub fn handle_cursor(&mut self, x: f64, y: f64) {
         let _s = trace_span!("handle_cursor");
         self.mouse_pos = Some((x as f32, y as f32));
+        // 光标移动:置 1(animate_all 衰减,实现"移动外扩→静止回落")。
+        self.cursor_move = 1.0;
+        // 光标轨迹(延迟跟随):推新位置,保留最近 30 个。
+        self.cursor_trail.insert(0, (x as f32, y as f32));
+        if self.cursor_trail.len() > 30 {
+            self.cursor_trail.pop();
+        }
         if self.selecting {
             self.select_end = Some((x as f32, y as f32));
         }
@@ -540,6 +559,16 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
             &[Rectangle::new(Point::ORIGIN, logical)], iced::Color::TRANSPARENT);
         // Upload Iced cache to GPU — capture data before mutable borrow
         let iced_data = self.iced_cache.data().to_vec();
+        if std::env::var("PHIMAKOR_ICED_CHECK").is_ok() {
+            // 诊断:统计非透明像素(排除面板区域,面板在右侧)。
+            let opaque = iced_data.chunks_exact(4)
+                .filter(|p| p[3] > 0).count();
+            let w = self.w as usize;
+            // 左侧区域(非面板)的透明情况
+            let left_opaque = iced_data.chunks_exact(4).enumerate()
+                .filter(|(i, p)| (i % w) < (w / 3) && p[3] > 0).count();
+            eprintln!("iced cache: opaque={opaque} (left-third opaque={left_opaque})");
+        }
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &self.iced_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             &iced_data,
@@ -565,6 +594,15 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let vw = self.w as f32;
         let vh = self.h as f32;
         draw_splash(&mut self.pixmap.as_mut(), data, vw, vh, gui_scale, settings);
+        // 标题界面也画自定义光标(设置开启时)。
+        if self.custom_cursor {
+            if let Some((mx, my)) = self.mouse_pos {
+                timeline_draw::draw_custom_cursor(
+                    &mut self.pixmap.as_mut(), mx, my, gui_scale,
+                    self.cursor_move, self.cursor_click, &self.cursor_trail, self.cursor_time,
+                );
+            }
+        }
         self.iced_cache.data_mut().copy_from_slice(self.pixmap.data());
         // Upload to both textures
         for (tex, data) in [(&self.iced_tex, self.iced_cache.data()), (&self.timeline_tex, self.pixmap.data())] {
@@ -709,10 +747,21 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         );
         if playing || anim_moving || self.timeline_dirty {
             self.timeline_dirty = false;
+            // 面板进度动画中:iced 布局随 progress 变化,需同步重绘,
+            // 否则面板关闭后内容定格残留(透明区留存面板名)。
+            if anim_moving && !self.last_anim_iced {
+                self.render_iced(queue, info);
+                self.last_anim_iced = true;
+                return;
+            }
+            if !anim_moving {
+                self.last_anim_iced = false;
+            }
             self.upload_timeline_to(queue, info);
             self.last_drawn_beat = info.chart_beat;
             return;
         }
+        self.last_anim_iced = false;
         // Restore base content (no playhead) — memcpy, much cheaper than redraw.
         // 若 worker 有新帧(播放→静态切换),同步到 base_pixmap 一次。
         if let Some(worker) = &mut self.tl_worker {
@@ -783,6 +832,12 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let d = ctx_target - self.ctx_progress;
         if d.abs() > 0.005 { self.ctx_progress += d * 0.12; }
         else { self.ctx_progress = ctx_target; }
+        // 光标移动/点击强度:handle_cursor 置 1,mouse 按下置 1,这里衰减。
+        self.cursor_move *= 0.94;
+        if self.cursor_move < 0.01 { self.cursor_move = 0.0; }
+        self.cursor_click *= 0.90;
+        if self.cursor_click < 0.01 { self.cursor_click = 0.0; }
+        self.cursor_time += 1.0 / 60.0;
     }
 
     fn animate_tool_hover(&mut self) {
