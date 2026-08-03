@@ -150,7 +150,7 @@ impl HList {
         (0..self.n).map(|i| Area { id: i as u32, rect: self.item_rect(i) }).collect()
     }
 
-    /// 命中:返回项索引,或 `None`。
+    /// 命中:返回项索引,或 `None`(右开区间,px = 右缘不命中)。
     pub fn hit(&self, p: (f32, f32)) -> Option<usize> {
         let (px, py) = p;
         if py < self.y || py > self.y + self.h || px < self.x || px > self.x + self.w {
@@ -158,7 +158,7 @@ impl HList {
         }
         (0..self.n).find(|&i| {
             let r = self.item_rect(i);
-            px >= r.left() && px <= r.right()
+            px >= r.left() && px < r.right()
         })
     }
 }
