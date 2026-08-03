@@ -6,6 +6,7 @@ use iced_tiny_skia::Renderer;
 use std::sync::Arc;
 
 pub mod panels;
+pub mod widgets;
 use phimakor::trace_span;
 
 // Global font fallback chain: the first font that has a glyph for a given
