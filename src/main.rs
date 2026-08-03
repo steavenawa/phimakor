@@ -96,14 +96,24 @@ struct State {
     num_edit: Option<NumEdit>,
     /// Last Eff-field click for double-click detection (time, row, field).
     last_eff_click: (std::time::Instant, Option<usize>, u8),
+    /// Keyframe editor: expanded var index (into sorted var names) + selected
+    /// keyframe row.
+    eff_kf_var: Option<usize>,
+    eff_kf_sel: Option<usize>,
+}
+
+/// Target of an in-progress numeric edit (double-clicked value field).
+#[derive(Clone, Copy)]
+enum NumTarget {
+    /// Eff panel fixed/vars field (same ids as `eff_edit_field`).
+    Eff(u8),
+    /// Keyframe row field: (keyframe index, sub-field: 0 = start, 1 = end).
+    Kf(usize, u8),
 }
 
 /// In-progress numeric edit started by double-clicking an Eff panel field.
 struct NumEdit {
-    /// The `eff_edit_field` this edit targets (4+ = sorted var index).
-    field: u8,
-    /// Variable name when `field >= 4` (sorted order), to write back.
-    var_key: Option<String>,
+    target: NumTarget,
     /// Text buffer being typed.
     buf: String,
 }
@@ -162,7 +172,7 @@ impl App {
             splash_lib_path: charts_dir().display().to_string(),
             splash_hover: ui::SplashHover::None, show_settings: false, settings,
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()),
-            extra: None, selected_effect: None, eff_edit_field: 0, num_edit: None, last_eff_click: (std::time::Instant::now(), None, 0),
+            extra: None, selected_effect: None, eff_edit_field: 0, num_edit: None, last_eff_click: (std::time::Instant::now(), None, 0), eff_kf_var: None, eff_kf_sel: None,
         })
     }
 
@@ -245,7 +255,7 @@ impl App {
             show_settings: false, settings,
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()), extra,
             selected_effect: None, eff_edit_field: 0, num_edit: None,
-            last_eff_click: (std::time::Instant::now(), None, 0),
+            last_eff_click: (std::time::Instant::now(), None, 0), eff_kf_var: None, eff_kf_sel: None,
         })
     }
 
@@ -299,9 +309,12 @@ impl State {
         self.ui_dirty = true;
     }
 
-    /// Add a built-in effect spanning ±2 beats around the playhead.
+    /// Add a built-in effect spanning ±2 beats around the playhead, snapped to
+    /// the beat grid (`snap`, e.g. 0.25) so start/end land on grid lines.
     fn eff_add(&mut self) {
         let beat = self.chart.time_to_beat(self.chart_time_last);
+        let snap = self.snap.max(0.01) as f64;
+        let beat = (beat / snap).round() * snap;
         let (name, defaults) = crate::render::shaders::EFFECTS.first()
             .map(|d| (d.name.to_string(), d.defaults.to_vec()))
             .unwrap_or_else(|| ("grayscale".to_string(), Vec::new()));
@@ -311,7 +324,7 @@ impl State {
             .collect();
         let extra = self.extra.get_or_insert_with(|| core::extra::ExtraRoot { bpm: vec![], effects: vec![] });
         extra.effects.push(core::extra::ExtraEffect {
-            start: core::bpm::Triple::from_beats(beat - 2.0),
+            start: core::bpm::Triple::from_beats((beat - 2.0).max(0.0)),
             end: core::bpm::Triple::from_beats(beat + 2.0),
             shader: name,
             global: true,
@@ -400,28 +413,48 @@ impl State {
         let Some((orig, _)) = sorted.get(sel).copied() else { return };
         let Some(extra) = &self.extra else { return };
         let Some(e) = extra.effects.get(orig) else { return };
-        let var_key = if field >= 4 {
-            let vi = (field - 4) as usize;
-            let mut keys: Vec<&String> = e.vars.keys().collect();
-            keys.sort();
-            match keys.get(vi) {
-                Some(k) if matches!(e.vars.get(*k), Some(serde_json::Value::Number(_))) => Some((*k).clone()),
-                _ => return, // keyframed / missing — not direct-editable
-            }
-        } else { None };
         let buf = match field {
             1 => format!("{:.3}", e.start.beats()),
             2 => format!("{:.3}", e.end.beats()),
             f if f >= 4 => {
-                let key = var_key.as_ref().unwrap();
-                match e.vars.get(key) {
+                let vi = (f - 4) as usize;
+                let mut keys: Vec<&String> = e.vars.keys().collect();
+                keys.sort();
+                let Some(key) = keys.get(vi) else { return };
+                match e.vars.get(*key) {
                     Some(serde_json::Value::Number(n)) => format!("{:.3}", n.as_f64().unwrap_or(0.0)),
-                    _ => return,
+                    _ => return, // keyframed / missing — not direct-editable
                 }
             }
             _ => return,
         };
-        self.num_edit = Some(NumEdit { field, var_key, buf });
+        self.num_edit = Some(NumEdit { target: NumTarget::Eff(field), buf });
+        self.ui_dirty = true;
+    }
+
+    /// Start numeric input for a keyframe row field (double-click).
+    fn start_kf_num_edit(&mut self, kf: usize, sub: u8) {
+        let Some(sel) = self.selected_effect else { return };
+        let sorted = self.eff_sorted();
+        let Some((orig, _)) = sorted.get(sel).copied() else { return };
+        let Some(extra) = &self.extra else { return };
+        let Some(e) = extra.effects.get(orig) else { return };
+        let Some(kv) = self.eff_kf_var else { return };
+        let mut keys: Vec<&String> = e.vars.keys().collect();
+        keys.sort();
+        let Some(key) = keys.get(kv) else { return };
+        let Some(serde_json::Value::Array(kfs)) = e.vars.get(*key) else { return };
+        let Some(kf_obj) = kfs.get(kf).and_then(|v| v.as_object()) else { return };
+        let buf = match sub {
+            0 => kf_obj.get("startTime")
+                .and_then(|t| triple_to_beats(t))
+                .map(|b| format!("{b:.3}")).unwrap_or_default(),
+            1 => kf_obj.get("endTime")
+                .and_then(|t| triple_to_beats(t))
+                .map(|b| format!("{b:.3}")).unwrap_or_default(),
+            _ => return,
+        };
+        self.num_edit = Some(NumEdit { target: NumTarget::Kf(kf, sub), buf });
         self.ui_dirty = true;
     }
 
@@ -434,26 +467,82 @@ impl State {
         let Some((orig, _)) = sorted.get(sel).copied() else { return };
         let Some(extra) = &mut self.extra else { return };
         let Some(e) = extra.effects.get_mut(orig) else { return };
-        match edit.field {
-            1 => {
-                let start = value.max(0.0);
-                e.start = core::bpm::Triple::from_beats(start);
-                if e.end.beats() <= start {
-                    e.end = core::bpm::Triple::from_beats(start + 0.01);
+        match edit.target {
+            NumTarget::Eff(field) => match field {
+                1 => {
+                    let start = value.max(0.0);
+                    e.start = core::bpm::Triple::from_beats(start);
+                    if e.end.beats() <= start {
+                        e.end = core::bpm::Triple::from_beats(start + 0.01);
+                    }
                 }
-            }
-            2 => {
-                let end = value.max(e.start.beats() + 0.01);
-                e.end = core::bpm::Triple::from_beats(end);
-            }
-            f if f >= 4 => {
-                if let Some(key) = &edit.var_key {
-                    e.vars.insert(key.clone(), serde_json::json!(value));
+                2 => {
+                    let end = value.max(e.start.beats() + 0.01);
+                    e.end = core::bpm::Triple::from_beats(end);
                 }
+                f if f >= 4 => {
+                    let vi = (f - 4) as usize;
+                    let mut keys: Vec<&String> = e.vars.keys().collect();
+                    keys.sort();
+                    if let Some(key) = keys.get(vi) {
+                        e.vars.insert((*key).clone(), serde_json::json!(value));
+                    }
+                }
+                _ => {}
+            },
+            NumTarget::Kf(kf, sub) => {
+                let Some(kv) = self.eff_kf_var else { return };
+                let mut keys: Vec<&String> = e.vars.keys().collect();
+                keys.sort();
+                let Some(key) = keys.get(kv).map(|k| (*k).clone()) else { return };
+                let Some(serde_json::Value::Array(kfs)) = e.vars.get_mut(&key) else { return };
+                let Some(kf_obj) = kfs.get_mut(kf).and_then(|v| v.as_object_mut()) else { return };
+                let field = match sub {
+                    0 => "startTime",
+                    1 => "endTime",
+                    _ => return,
+                };
+                kf_obj.insert(field.to_string(), serde_json::json!([value, 0, 1]));
             }
-            _ => {}
         }
         self.eff_save();
+    }
+
+    /// Wheel over the expanded keyframe list: cycle the selected keyframe's
+    /// easing (0..=29, RPE_TWEEN_MAP indices).
+    fn eff_kf_wheel(&mut self, delta: f32) {
+        if delta == 0.0 { return; }
+        let (Some(kv), Some(ks)) = (self.eff_kf_var, self.eff_kf_sel) else { return };
+        let Some(sel) = self.selected_effect else { return };
+        let sorted = self.eff_sorted();
+        let Some((orig, _)) = sorted.get(sel).copied() else { return };
+        let Some(extra) = &mut self.extra else { return };
+        let Some(e) = extra.effects.get_mut(orig) else { return };
+        let mut keys: Vec<&String> = e.vars.keys().collect();
+        keys.sort();
+        let Some(key) = keys.get(kv).map(|k| (*k).clone()) else { return };
+        let Some(serde_json::Value::Array(kfs)) = e.vars.get_mut(&key) else { return };
+        let Some(kf_obj) = kfs.get_mut(ks).and_then(|v| v.as_object_mut()) else { return };
+        let cur = kf_obj.get("easingType").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+        let next = (cur + delta.signum() as i32).rem_euclid(30);
+        kf_obj.insert("easingType".to_string(), serde_json::json!(next));
+        self.eff_save();
+    }
+
+    /// Number of keyframes in the currently expanded var (for hit-testing).
+    fn eff_kf_rows_cache(&self) -> usize {
+        if self.eff_kf_var.is_none() { return 0; }
+        let Some(sel) = self.selected_effect else { return 0 };
+        let sorted = self.eff_sorted();
+        let Some((orig, _)) = sorted.get(sel).copied() else { return 0 };
+        let Some(extra) = &self.extra else { return 0 };
+        let Some(e) = extra.effects.get(orig) else { return 0 };
+        let Some(kv) = self.eff_kf_var else { return 0 };
+        let mut keys: Vec<&String> = e.vars.keys().collect();
+        keys.sort();
+        keys.get(kv)
+            .and_then(|k| e.vars.get(*k))
+            .map_or(0, |v| if let serde_json::Value::Array(a) = v { a.len() } else { 0 })
     }
 
     fn rebuild_chart(&mut self) {
@@ -742,7 +831,46 @@ impl State {
             effects,
             selected_effect: self.selected_effect,
             eff_edit_field: self.eff_edit_field,
-            num_edit: self.num_edit.as_ref().map(|e| (e.field, e.buf.clone())),
+            num_edit: self.num_edit.as_ref().map(|e| (match e.target {
+                NumTarget::Eff(f) => f,
+                NumTarget::Kf(_, sub) => 100 + sub, // keyframe edits render in the kf rows
+            }, e.buf.clone())),
+            eff_kf_var: self.eff_kf_var,
+            eff_kf_sel: self.eff_kf_sel,
+            eff_kf_rows: {
+                // Parse the expanded var's keyframes for display. Inlined
+                // sort — `frame` borrows self, so no &self method calls.
+                let mut rows = Vec::new();
+                if let (Some(sel), Some(kv)) = (self.selected_effect, self.eff_kf_var) {
+                    if let Some(extra) = &self.extra {
+                        let mut sorted: Vec<(usize, f64)> = extra.effects.iter().enumerate()
+                            .map(|(i, e)| (i, e.start.beats())).collect();
+                        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
+                        if let Some((orig, _)) = sorted.get(sel) {
+                            if let Some(e) = extra.effects.get(*orig) {
+                                let mut keys: Vec<&String> = e.vars.keys().collect();
+                                keys.sort();
+                                if let Some(key) = keys.get(kv) {
+                                    if let Some(serde_json::Value::Array(kfs)) = e.vars.get(*key) {
+                                        for kf in kfs {
+                                            if let Some(obj) = kf.as_object() {
+                                                rows.push(ui::KfRow {
+                                                    start_beats: obj.get("startTime").and_then(triple_to_beats).unwrap_or(0.0),
+                                                    end_beats: obj.get("endTime").and_then(triple_to_beats).unwrap_or(0.0),
+                                                    v1: obj.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                                    v2: obj.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
+                                                    easing: obj.get("easingType").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                rows
+            },
         };
         if self.show_overlay {
             if let Some(ev_idx) = self.overlay.take_timeline_click(&info, self.overlay.props_progress()) {
@@ -849,6 +977,20 @@ impl State {
         let dt = self.fps_since.elapsed().as_secs_f64();
         self.fps_since = Instant::now();
         self.fps = self.fps * 0.95 + (1.0 / dt.max(1e-6)) * 0.05;
+    }
+}
+
+    /// Parse an RPE time triple `[i, n, d]` (or a plain number) to beats.
+fn triple_to_beats(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Array(a) if a.len() >= 2 => {
+            let i = a[0].as_i64()? as f64;
+            let n = a[1].as_i64()? as f64;
+            let d = a.get(2).and_then(|v| v.as_i64()).unwrap_or(1) as f64;
+            Some(i + n / d.max(1.0))
+        }
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
     }
 }
 
@@ -1084,7 +1226,13 @@ impl ApplicationHandler for App {
                             mx >= props_x && mx <= props_x + pan_w
                         })
                     {
-                        state.eff_wheel(dy);
+                        // Expanded keyframe list: wheel cycles the selected
+                        // keyframe's easing; otherwise normal field editing.
+                        if state.eff_kf_var.is_some() {
+                            state.eff_kf_wheel(dy);
+                        } else {
+                            state.eff_wheel(dy);
+                        }
                     } else if (state.show_events || state.show_notes) && state.overlay.is_over_timeline(state.overlay.props_progress()) {
                         if state.ctrl {
                             state.overlay.timeline_zoom_in(dy);
@@ -1408,15 +1556,47 @@ impl ApplicationHandler for App {
                         let pp = state.overlay.props_progress();
                         let n_rows = state.extra.as_ref().map_or(0, |e| e.effects.len());
                         // Var count of the selected effect (row → original index).
-                        let n_vars = state.eff_sorted().get(state.selected_effect.unwrap_or(usize::MAX))
-                            .and_then(|(orig, _)| state.extra.as_ref()?.effects.get(*orig))
+                        let sel_orig = state.eff_sorted().get(state.selected_effect.unwrap_or(usize::MAX)).map(|(o, _)| *o);
+                        let n_vars = sel_orig
+                            .and_then(|orig| state.extra.as_ref()?.effects.get(orig))
                             .map_or(0, |e| e.vars.len());
-                        match ui::effects_hit_test(mx, my, vw, vh, gs, pp, n_rows, n_vars) {
-                            ui::EffHit::List(ri) => { state.selected_effect = Some(ri); state.num_edit = None; state.ui_dirty = true; }
+                        let kf_open = state.eff_kf_var.is_some();
+                        let n_kf = state.eff_kf_rows_cache();
+                        match ui::effects_hit_test(mx, my, vw, vh, gs, pp, n_rows, n_vars, kf_open, n_kf) {
+                            ui::EffHit::List(ri) => {
+                                state.selected_effect = Some(ri);
+                                state.num_edit = None;
+                                state.eff_kf_var = None;
+                                state.eff_kf_sel = None;
+                                state.ui_dirty = true;
+                            }
                             ui::EffHit::Add => { state.eff_add(); state.num_edit = None; }
                             ui::EffHit::Del => { state.eff_remove_selected(); state.num_edit = None; }
                             ui::EffHit::Field(f) => {
-                                // Double-click a number field → type the value.
+                                // Clicking a keyframed var toggles its expansion;
+                                // double-click a number field → type the value.
+                                let is_kf_var = f >= 4 && {
+                                    let vi = (f - 4) as usize;
+                                    sel_orig
+                                        .and_then(|orig| state.extra.as_ref()?.effects.get(orig))
+                                        .is_some_and(|e| {
+                                            let mut keys: Vec<&String> = e.vars.keys().collect();
+                                            keys.sort();
+                                            keys.get(vi).is_some_and(|k| matches!(e.vars.get(*k), Some(serde_json::Value::Array(_))))
+                                        })
+                                };
+                                if is_kf_var {
+                                    // Toggle expansion; clear selection when closing.
+                                    if state.eff_kf_var == Some((f - 4) as usize) {
+                                        state.eff_kf_var = None;
+                                        state.eff_kf_sel = None;
+                                    } else {
+                                        state.eff_kf_var = Some((f - 4) as usize);
+                                        state.eff_kf_sel = Some(0);
+                                    }
+                                    state.ui_dirty = true;
+                                    return;
+                                }
                                 let (last_t, last_sel, last_f) = state.last_eff_click;
                                 if f == last_f && state.selected_effect == last_sel
                                     && last_t.elapsed() < std::time::Duration::from_millis(300)
@@ -1425,6 +1605,18 @@ impl ApplicationHandler for App {
                                 }
                                 state.last_eff_click = (std::time::Instant::now(), state.selected_effect, f);
                                 state.eff_edit_field = f;
+                                state.ui_dirty = true;
+                            }
+                            ui::EffHit::KfRow(ri) => {
+                                // Click selects; double-click edits start beats.
+                                let (last_t, last_sel, last_f) = state.last_eff_click;
+                                let is_double = state.eff_kf_sel == Some(ri)
+                                    && last_f == 200 && last_t.elapsed() < std::time::Duration::from_millis(300);
+                                state.eff_kf_sel = Some(ri);
+                                if is_double {
+                                    state.start_kf_num_edit(ri, 0);
+                                }
+                                state.last_eff_click = (std::time::Instant::now(), state.selected_effect, 200);
                                 state.ui_dirty = true;
                             }
                             ui::EffHit::None => {}
@@ -1927,6 +2119,7 @@ mod zip_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
 
 
 

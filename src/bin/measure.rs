@@ -178,7 +178,7 @@ use std::sync::Arc;
             selected_tool: 0, show_menu: false, selected_event_idx: None,
             event_edit_target: 0, ev_kind: String::new(),
             ev_start_beats: 0.0, ev_end_beats: 0.0, ev_start_val: 0.0,
-            ev_end_val: 0.0, ev_easing: 0, effect_names: vec![], effects: Arc::new(vec![]), selected_effect: None, eff_edit_field: 0, num_edit: None,
+            ev_end_val: 0.0, ev_easing: 0, effect_names: vec![], effects: Arc::new(vec![]), selected_effect: None, eff_edit_field: 0, num_edit: None, eff_kf_var: None, eff_kf_sel: None, eff_kf_rows: vec![],
         };
         overlay.render_iced(r.queue(), &info); // warmup (iced layout + glyph cache)
         let mut overlay_times = Vec::with_capacity(frames);
@@ -205,7 +205,7 @@ use std::sync::Arc;
                 notes: info.notes.clone(),
                 effect_names: info.effect_names.clone(),
                 effects: info.effects.clone(),
-                num_edit: info.num_edit.clone(),
+                num_edit: info.num_edit.clone(), eff_kf_var: info.eff_kf_var, eff_kf_sel: info.eff_kf_sel, eff_kf_rows: info.eff_kf_rows.clone(),
                 ..info
             };
             let s = Instant::now();
@@ -224,6 +224,7 @@ use std::sync::Arc;
         stats("redraw_timeline(paused)", &tl_paused);
     }
 }
+
 
 
 

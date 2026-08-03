@@ -123,7 +123,8 @@ pub(crate) enum EffHit {
     List(usize),
     Add,
     Del,
-    Field(u8), // 0=shader, 1=start, 2=end, 3=global
+    Field(u8),  // 0=shader, 1=start, 2=end, 3=global, 4+ = uniform vars
+    KfRow(usize), // expanded keyframe list row
 }
 
 /// Panel geometry constants (draw + hit-test share these).
@@ -139,9 +140,10 @@ const EFF_ROW_H: f32 = 22.0;
 
 /// Hit-test the Eff panel (editor mode, tool 3). `n_rows` = effect list length.
 /// The bottom edit block has 4 fixed fields (Shader/Start/End/Global) plus one
-/// row per uniform variable (field ids 4+).
+/// row per uniform variable (field ids 4+). When a keyframed var is expanded
+/// (`kf_open`), `n_kf` extra rows follow below the vars (hit as [`EffHit::KfRow`]).
 pub(crate) fn effects_hit_test(
-    mx: f32, my: f32, vw: f32, vh: f32, s: f32, pp: f32, n_rows: usize, n_vars: usize,
+    mx: f32, my: f32, vw: f32, vh: f32, s: f32, pp: f32, n_rows: usize, n_vars: usize, kf_open: bool, n_kf: usize,
 ) -> EffHit {
     let (px, pan_w, bg_h, _) = eff_layout(vw, vh, s, pp);
     if mx < px || mx > px + pan_w { return EffHit::None; }
@@ -159,12 +161,15 @@ pub(crate) fn effects_hit_test(
         if mx >= px + 72.0 * s && mx < px + 72.0 * s + 60.0 * s { return EffHit::Del; }
     }
     // Edit fields pinned to the bottom (only reachable when rows don't cover them)
-    let n_edit = 4 + n_vars;
+    let n_edit = 4 + n_vars + if kf_open { n_kf } else { 0 };
     let edit_h = n_edit as f32 * row_h + 8.0 * s;
     let ey = (bg_h - edit_h).max(y0);
     if my >= ey && my < ey + n_edit as f32 * row_h {
-        let fi = ((my - ey) / row_h) as u8;
-        if (fi as usize) < n_edit { return EffHit::Field(fi); }
+        let fi = ((my - ey) / row_h) as usize;
+        if fi < 4 + n_vars { return EffHit::Field(fi as u8); }
+        if kf_open && fi < n_edit {
+            return EffHit::KfRow(fi - 4 - n_vars);
+        }
     }
     EffHit::None
 }
@@ -240,11 +245,14 @@ pub(crate) fn draw_effects_panel(pixmap: &mut tiny_skia::PixmapMut, info: &GameI
     }
 
     // Edit fields pinned to the bottom: 4 fixed rows + one row per uniform
-    // variable (wheel-adjustable when the var is a plain number).
+    // variable (wheel-adjustable when the var is a plain number), and the
+    // expanded keyframe rows of a keyframed var when `eff_kf_var` is set.
     if let Some(sel) = info.selected_effect {
         if let Some(e) = info.effects.get(sel) {
             let n_vars = e.vars.len();
-            let n_edit = 4 + n_vars;
+            let kf_open = info.eff_kf_var.is_some();
+            let n_kf = if kf_open { info.eff_kf_rows.len() } else { 0 };
+            let n_edit = 4 + n_vars + n_kf;
             let edit_h = n_edit as f32 * cell_h + 8.0 * s;
             let ey = (bg_h - edit_h).max(list_top);
             let mut eb = tiny_skia::Paint::default();
@@ -259,7 +267,13 @@ pub(crate) fn draw_effects_panel(pixmap: &mut tiny_skia::PixmapMut, info: &GameI
                 ("Global".to_string(), if e.global { "ON" } else { "OFF" }.to_string(), 3),
             ];
             for (vi, (name, val)) in e.vars.iter().enumerate() {
-                rows.push((format!("{name}"), val.clone(), (4 + vi) as u8));
+                // Highlight the expanded keyframed var row.
+                let display = if info.eff_kf_var == Some(vi) {
+                    format!("▶ {val}")
+                } else {
+                    val.clone()
+                };
+                rows.push((format!("{name}"), display, (4 + vi) as u8));
             }
             if let Some(font) = font {
                 let mut ry = ey + 4.0 * s;
@@ -281,6 +295,33 @@ pub(crate) fn draw_effects_panel(pixmap: &mut tiny_skia::PixmapMut, info: &GameI
                     draw_text_on_pixmap(pixmap, label, px + 8.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
                     draw_text_on_pixmap(pixmap, &shown, px + pan_w * 0.5 + 4.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
                     ry += cell_h;
+                }
+                // Expanded keyframe rows: E{id} start~end v1→v2.
+                if kf_open {
+                    for (ki, k) in info.eff_kf_rows.iter().enumerate() {
+                        if info.eff_kf_sel == Some(ki) {
+                            let mut hp = tiny_skia::Paint::default();
+                            hp.set_color_rgba8(60, 90, 140, 90);
+                            if let Some(r) = tiny_skia::Rect::from_xywh(px + 4.0 * s, ry, pan_w - 8.0 * s, cell_h) {
+                                fill_rect_clipped(pixmap, r, &hp);
+                            }
+                        }
+                        // Show typed buffer for keyframe start/end edits.
+                        let is_kf_edit = info.num_edit.as_ref().is_some_and(|(f, _)| *f >= 100);
+                        let shown = if is_kf_edit {
+                            let (f, buf) = info.num_edit.as_ref().unwrap();
+                            if *f as usize == 100 + ki {
+                                format!("{buf}|")
+                            } else {
+                                format!("{:.3}", if *f as usize == 101 + ki { k.end_beats } else { k.start_beats })
+                            }
+                        } else {
+                            format!("E{} {:.2}~{:.2} {:.2}→{:.2}", k.easing, k.start_beats, k.end_beats, k.v1, k.v2)
+                        };
+                        draw_text_on_pixmap(pixmap, &format!("kf{ki}"), px + 8.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
+                        draw_text_on_pixmap(pixmap, &shown, px + pan_w * 0.5 + 4.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
+                        ry += cell_h;
+                    }
                 }
             }
         }

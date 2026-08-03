@@ -28,7 +28,7 @@ pub mod text;
 pub mod timeline;
 
 pub use font::font_mem_bytes;
-pub use model::{gameinfo_values, EffectRow, EventEntry, GameInfo, NoteEntry};
+pub use model::{gameinfo_values, EffectRow, EventEntry, GameInfo, KfRow, NoteEntry};
 pub use panel_ui::draw_panel_def;
 pub use primitives::fill_rect_clipped;
 pub use settings::{backend_cycle, backend_label, SettingsData};

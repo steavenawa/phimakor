@@ -73,6 +73,16 @@ pub struct EffectRow {
     pub vars: Vec<(String, String)>,
 }
 
+/// One keyframe row of an expanded Eff-panel uniform variable.
+#[derive(Clone)]
+pub struct KfRow {
+    pub start_beats: f64,
+    pub end_beats: f64,
+    pub v1: f32,
+    pub v2: f32,
+    pub easing: i32,
+}
+
 pub struct GameInfo {
     pub chart_time: f64, pub chart_beat: f64, pub audio_time: f64, pub fps: f64,
     pub combo: u32, pub hits: u32, pub note_count: usize, pub score: u32,
@@ -108,6 +118,11 @@ pub struct GameInfo {
     pub eff_edit_field: u8,
     /// Eff panel double-click numeric input: (field id, typed buffer) or None.
     pub num_edit: Option<(u8, String)>,
+    /// Eff keyframe editor: expanded var index (into sorted var names),
+    /// selected keyframe row, and the parsed rows for display.
+    pub eff_kf_var: Option<usize>,
+    pub eff_kf_sel: Option<usize>,
+    pub eff_kf_rows: Vec<KfRow>,
 }
 
 pub(crate) fn build_ui<'a>(info: &'a GameInfo, panel: f32) -> Element<'a, (), Theme, Renderer> {
