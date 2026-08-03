@@ -122,22 +122,9 @@ pub(crate) fn build_ui<'a>(info: &'a GameInfo, panel: f32) -> Element<'a, (), Th
         .width(ev_w).height(Length::Fill)
         .into();
 
-    // Old Iced properties panel (bottom of properties column)
-    let header_fmt2 = header_fmt.clone();
     let props_w = PANEL_W * s * panel;
-    let old_props: Element<'_, (), Theme, Renderer> = if props_w > 1.0 {
-        container(iced::widget::Column::new()
-            .push(text("Properties").size(iced::Pixels(14.0 * s)))
-            .push(text("---"))
-            .push(text(header_fmt2))
-            .spacing(2.0 * s)
-        ).padding(8.0 * s)
-            .style(|_: &Theme| container::Style::default().background(iced::Color::from_rgba(0.12, 0.12, 0.14, 0.92)))
-            .width(props_w).into()
-    } else { container(iced::widget::Column::new()).width(0.0).into() };
     let props: Element<'_, (), Theme, Renderer> = container(iced::widget::Column::new()
         .push(container(iced::widget::Column::new()).height(Length::Fill))
-        .push(old_props)
     ).width(props_w).height(Length::Fill).into();
 
     fn btn(label: &str, s: f32) -> Element<'static, (), Theme, Renderer> {
