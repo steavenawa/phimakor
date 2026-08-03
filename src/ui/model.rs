@@ -86,6 +86,10 @@ pub struct KfRow {
 #[derive(Clone)]
 pub struct GameInfo {
     pub chart_time: f64, pub chart_beat: f64, pub audio_time: f64, pub fps: f64,
+    /// 主线程帧延迟(ms,性能提示用)。
+    pub frame_latency_ms: f32,
+    /// 是否正在播放(性能提示只在播放时显示)。
+    pub playing: bool,
     pub combo: u32, pub hits: u32, pub note_count: usize, pub score: u32,
     pub lines: usize, pub visible_notes: usize, pub paused: bool, pub dim: f32,
     pub chart_name: String, pub composer: String, pub level: String, pub difficulty: f32,

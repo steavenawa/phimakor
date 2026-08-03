@@ -275,6 +275,7 @@ impl App {
             .unwrap_or(LayoutDef { panels: vec![] });
         let mut overlay = ui::IcedOverlay::new(renderer.device(), renderer.tex_bgl(), renderer.sampler(), 1200, 800);
         overlay.set_panels(layout.panels.clone());
+        overlay.perf_hint = settings.perf_hint;
         Ok(State {
             window, chart_dir: dir.to_path_buf(), renderer, overlay, doc, chart, info, audio,
             started: Instant::now(), fps_since: Instant::now(), aspect_idx: 0,
@@ -962,7 +963,7 @@ impl State {
         // 应用即时生效的设置。
         self.renderer.set_vsync(self.settings.vsync);
         self.gui_scale = self.settings.gui_scale;
-        if self.settings.fullscreen {
+        self.overlay.perf_hint = self.settings.perf_hint;        if self.settings.fullscreen {
             self.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         } else {
             self.window.set_fullscreen(None);
@@ -1269,7 +1270,10 @@ impl State {
             Arc::new(rows)
         };
         let info = ui::GameInfo {
-            chart_time, audio_time, fps: self.fps, combo: self.combo,
+            chart_time, audio_time, fps: self.fps,
+            frame_latency_ms: self.frame_latency as f32 * 1000.0,
+            playing: self.audio.as_ref().is_some_and(|a| !a.is_paused()),
+            combo: self.combo,
             hits: self.hits, note_count: self.note_count, score,
             lines: frame.lines.len(), visible_notes,
             paused: self.audio.as_ref().is_some_and(|a| a.is_paused()),

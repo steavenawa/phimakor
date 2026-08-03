@@ -15,11 +15,13 @@ pub struct SettingsData {
     /// folder (`<Documents>/PhiMakor/charts`). Persisted back to
     /// `config.json` so the choice survives restarts.
     pub charts_dir: Option<String>,
+    /// 右上角极小性能提示(播放中帧延迟过大时显示)。默认关,设置里开。
+    pub perf_hint: bool,
 }
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false }
     }
 }
 
@@ -65,6 +67,7 @@ pub fn build_settings_form(x: f32, y: f32, w: f32, s: f32, settings: &SettingsDa
         ("vsync".into(), RTControl::Toggle { on: settings.vsync, anim: if settings.vsync { 1.0 } else { 0.0 }, dir: if settings.vsync { 1.0 } else { -1.0 } }),
         ("fullscreen".into(), RTControl::Toggle { on: settings.fullscreen, anim: if settings.fullscreen { 1.0 } else { 0.0 }, dir: if settings.fullscreen { 1.0 } else { -1.0 } }),
         ("backend".into(), RTControl::Combo { items: vec!["Auto".into(), "DX12".into(), "Vulkan".into(), "GL".into()], selected: backend_idx, open: false }),
+        ("perf hint".into(), RTControl::Toggle { on: settings.perf_hint, anim: if settings.perf_hint { 1.0 } else { 0.0 }, dir: if settings.perf_hint { 1.0 } else { -1.0 } }),
     ]);
     form.row_h = 24.0 * s;
     form.gap = 4.0 * s;
@@ -105,6 +108,12 @@ pub fn apply_settings_form(form: &RealtimeForm, settings: &mut SettingsData) -> 
                 };
                 if v != settings.backend {
                     settings.backend = v;
+                    changed = true;
+                }
+            }
+            ("perf hint", RTControl::Toggle { on, .. }) => {
+                if *on != settings.perf_hint {
+                    settings.perf_hint = *on;
                     changed = true;
                 }
             }

@@ -165,6 +165,7 @@ use std::sync::Arc;
         let mut overlay = IcedOverlay::new(r.device(), r.tex_bgl(), r.sampler(), w, h);
         let info = GameInfo {
             chart_time: 10.0, chart_beat: 20.0, audio_time: 10.0, fps: 60.0,
+            frame_latency_ms: 16.0, playing: true,
             combo: 100, hits: 100, note_count: 656, score: 500_000,
             lines: 90, visible_notes: 300, paused: false, dim: 1.0,
             chart_name: "Test".into(), composer: "T".into(), level: "IN 15".into(), difficulty: 15.0,

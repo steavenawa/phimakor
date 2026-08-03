@@ -50,6 +50,8 @@ pub struct TimelineDrawState {
     pub chart_grid_hover: Option<Area>,
     pub line_list: Option<ScrollList>,
     pub line_list_hover: Option<Area>,
+    /// 右上角性能提示开关(设置里开启)。
+    pub perf_hint: bool,
 }
 
 impl TimelineDrawState {
@@ -71,6 +73,7 @@ impl TimelineDrawState {
             settings_form: o.settings_form.clone(), settings_hover: o.settings_hover,
             chart_grid: o.chart_grid.clone(), chart_grid_hover: o.chart_grid_hover,
             line_list: o.line_list.clone(), line_list_hover: o.line_list_hover,
+            perf_hint: o.perf_hint,
         }
     }
 }
@@ -217,6 +220,28 @@ impl TimelineDrawState {
         if info.show_menu {
             draw_menu(&mut pm.as_mut(), vw, vh, s);
         }
+        // 右上角性能提示(PMCORE-68):设置开启 + 播放中 + 帧延迟过大才显示。
+        // 极小英文文字,画在时间轴/面板之上(worker 管线内,非阻塞)。
+        if self.perf_hint && info.playing && info.frame_latency_ms > 25.0 {
+            let txt = format!("frame {:.0}ms / {:.0}fps", info.frame_latency_ms, info.fps);
+            let size = 9.0 * s;
+            let tw = {
+                let mut cv = bpm_panel::SkiaCanvas { pm: &mut pm.as_mut() };
+                cv.text_width(&txt, size)
+            };
+            let x = (vw - tw - 6.0 * s).max(4.0);
+            let y = 14.0 * s;
+            // 半透明黑底,保证可读
+            let mut bgp = Paint::default();
+            bgp.set_color_rgba8(0, 0, 0, 140);
+            if let Some(r) = Rect::from_xywh(x - 2.0 * s, y - size, tw + 4.0 * s, size + 4.0 * s) {
+                fill_rect_clipped(&mut pm.as_mut(), r, &bgp);
+            }
+            // 帧延迟大 → 红色,轻微 → 黄
+            let color = if info.frame_latency_ms > 50.0 { [255, 90, 90] } else { [255, 210, 90] };
+            let mut cv = bpm_panel::SkiaCanvas { pm: &mut pm.as_mut() };
+            cv.text(&txt, x, y, size, color);
+        }
     }
 }
 
@@ -311,6 +336,7 @@ impl TimelineWorker {
         }
     }
 }
+
 
 
 
