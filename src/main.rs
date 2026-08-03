@@ -352,11 +352,13 @@ impl App {
     }
 }
 /// 后台线程加载的谱面数据(纯 IO + 解析,不碰 GPU)。
+/// 注意:core::chart::Chart 含 `Rc<dyn TweenFunction>`(easing 缓存),不是
+/// Send,不能跨线程传回——主线程在 apply 时构建 Chart。
 struct LoadedChart {
     doc: ChartDocument,
     /// 谱面目录名(加载屏显示)。
     name: String,
-    /// chart 纹理: (名字, 字节)。
+    /// chart 纹理: (名字, 字节)。从 RPEChart 的 line texture 提取。
     textures: Vec<(String, Vec<u8>)>,
     /// 自定义 note 纹理: (key, 字节)。
     custom_textures: Vec<(String, Vec<u8>)>,
@@ -372,14 +374,15 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
     let info = doc.info().clone();
     let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
 
+    // 纹理清单:各线的 texture 字段(与 Chart::textures() 同源)。
     let mut textures = Vec::new();
-    // 后台也建一次 Chart(CPU 解析,顺便拿纹理清单;主线程还会重建,
-    // 但 from_rpe_chart 缓存友好,双份成本可接受——避免 RPEChart 无 textures()。
-    if let Ok(chart) = core::chart::Chart::from_rpe_chart(doc.chart(), info.use_rpe_170_speed == Some(true)) {
-        for t in chart.textures() {
-            if let Ok(bytes) = std::fs::read(dir.join(&t)) {
-                textures.push((t.to_string(), bytes));
-            }
+    let mut seen = std::collections::HashSet::new();
+    for line in &doc.chart().judge_line_list {
+        if line.texture.is_empty() || !seen.insert(line.texture.clone()) {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(dir.join(&line.texture)) {
+            textures.push((line.texture.clone(), bytes));
         }
     }
     let mut custom_textures = Vec::new();
@@ -702,10 +705,19 @@ impl State {
         for (k, bytes) in &custom_textures {
             if let Err(e) = self.renderer.load_texture(k, bytes) { eprintln!("warning: custom {k}: {e:#}"); }
         }
+        // res 内置 note 纹理(音符/命中特效)。splash 首次进谱面也走此路径,
+        // 必须在这里加载,否则音符贴图缺失。
+        let res_dir = PathBuf::from("res");
+        for kind in ["click", "drag", "flick", "hold", "click_mh", "drag_mh", "flick_mh", "hold_mh", "hit_fx"] {
+            let path = res_dir.join(format!("{kind}.png"));
+            let key = if kind == "hit_fx" { "note:hitfx".to_string() } else { format!("note:{kind}") };
+            if let Ok(bytes) = std::fs::read(&path) {
+                if let Err(e) = self.renderer.load_texture(&key, &bytes) { eprintln!("warning: {kind}: {e:#}"); }
+            }
+        }
         if let Some(bytes) = &bg {
             if let Err(e) = self.renderer.set_background(bytes, info.background_dim) { eprintln!("warning: bg: {e:#}"); }
         }
-        let res_dir = PathBuf::from("res");
         self.audio = audio::spawn_audio_thread(res_dir.as_path(), &self.chart_dir).ok();
 
         self.doc = doc;
