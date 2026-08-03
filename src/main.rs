@@ -516,6 +516,11 @@ impl State {
         let chart_beat = self.chart.time_to_beat(chart_time);
         let line_count = self.chart.line_count();
         let line_name = if self.selected_line < line_count { self.chart.line_name(self.selected_line).to_string() } else { "?".to_string() };
+        // PHIMAKOR_PERF=1: per-frame stage timings (60-frame moving average),
+        // to see where the CPU budget goes while playing.
+        static PERF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let perf = *PERF.get_or_init(|| std::env::var("PHIMAKOR_PERF").is_ok());
+        let t_eval = std::time::Instant::now();
         let frame = self.chart.state_at(chart_time);
 
         let pf_aspect = self.renderer.playfield_aspect();
@@ -641,6 +646,7 @@ impl State {
                 self.overlay.redraw_timeline(self.renderer.queue(), &info);
             }
         }
+        let t_panel = std::time::Instant::now();
         // Evaluate post-processing effects at current beat
         self.renderer.post.active.clear();
         if let Some(extra) = &self.extra {
@@ -685,6 +691,7 @@ impl State {
 
         let ui_bg = if self.show_overlay { Some(self.overlay.bind_group()) } else { None };
         let ui_iced = if self.show_overlay { Some(self.overlay.iced_bind_group()) } else { None };
+        let t_post = std::time::Instant::now();
 
         // Phigros-style HUD: hidden while editor panels cover the screen.
         self.renderer.set_hud(render::HudData {
@@ -704,6 +711,27 @@ impl State {
                 self.frame_latency = self.frame_latency * 0.9 + Instant::now().elapsed().as_secs_f64() * 0.1;
             }
             _ => {}
+        }
+        let t_draw = std::time::Instant::now();
+        if perf {
+            // 60-frame moving totals, printed every 60 frames.
+            static PERF_ACC: std::sync::Mutex<([f64; 4], u32)> = std::sync::Mutex::new(([0.0; 4], 0));
+            let ms = [
+                t_eval.elapsed().as_secs_f64() * 1000.0,
+                t_panel.elapsed().as_secs_f64() * 1000.0,
+                t_post.elapsed().as_secs_f64() * 1000.0,
+                t_draw.elapsed().as_secs_f64() * 1000.0,
+            ];
+            let mut acc = PERF_ACC.lock().unwrap();
+            for i in 0..4 { acc.0[i] += ms[i]; }
+            acc.1 += 1;
+            if acc.1 >= 60 {
+                let avg = |i: usize| acc.0[i] / acc.1 as f64;
+                eprintln!("perf: eval {:.2}ms | panel {:.2}ms | post {:.2}ms | draw {:.2}ms | fps {:.0}",
+                    avg(0), avg(1), avg(2), avg(3), self.fps);
+                acc.0 = [0.0; 4];
+                acc.1 = 0;
+            }
         }
 
         let dt = self.fps_since.elapsed().as_secs_f64();
