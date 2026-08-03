@@ -1052,7 +1052,21 @@ impl ApplicationHandler for App {
                             state.selected_event_idx = None;
                             state.ui_dirty = true;
                         }
-                        KeyCode::Space => { if let Some(a) = &state.audio { a.set_paused(!a.is_paused()); } }
+                        KeyCode::Space => {
+                            // Resuming after the track ended: the audio thread
+                            // re-appends the source and replays from the start,
+                            // but combo/hits/score only reset in `seek` — so a
+                            // restart from the end kept the previous run's
+                            // stats. Detect the end-of-chart resume and seek 0.
+                            let at_end = state.chart_time_last >= state.chart.duration() - 0.1;
+                            let paused = state.audio.as_ref().is_some_and(|a| a.is_paused());
+                            if paused && at_end {
+                                state.seek(0.0);
+                            }
+                            if let Some(a) = &state.audio {
+                                a.set_paused(!paused);
+                            }
+                        }
                         KeyCode::Delete if state.show_properties && state.overlay.selected_tool == 3 => {
                             state.eff_remove_selected();
                         }
