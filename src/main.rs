@@ -3,6 +3,11 @@ mod core;
 mod render;
 mod ui;
 
+// mimalloc 全局分配器(PMCORE-67):tiny_skia/iced/JSON 每帧大量小分配,
+// Windows 系统分配器是隐藏瓶颈,mimalloc 减少分配抖动。
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
