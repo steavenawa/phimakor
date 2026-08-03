@@ -8,6 +8,7 @@ use std::sync::Arc;
 pub mod panels;
 pub mod widgets;
 use widgets::Widget as _;
+use widgets::Canvas as _;
 use phimakor::trace_span;
 
 // Global font fallback chain: the first font that has a glyph for a given
@@ -571,6 +572,41 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
 
     pub fn set_panels(&mut self, panels: Vec<panels::PanelDef>) {
         self.panel_defs = panels;
+    }
+
+    /// 加载界面:黑底 + 谱名 + 组件库 ProgressBar 动画。切谱面后台加载
+    /// 期间渲染(PMCORE 加载屏)。
+    pub fn render_loading(&mut self, queue: &wgpu::Queue, name: &str, progress: f32, gui_scale: f32) {
+        let _s = trace_span!("render_loading");
+        self.pixmap.fill(tiny_skia::Color::BLACK);
+        self.iced_cache.fill(tiny_skia::Color::TRANSPARENT);
+        let vw = self.w as f32;
+        let vh = self.h as f32;
+        let s = gui_scale;
+        let theme = widgets::Theme::default().scaled(s);
+        let mut cv = bpm_panel::SkiaCanvas { pm: &mut self.pixmap.as_mut() };
+        // 谱名(居中)
+        let name = if name.is_empty() { "Loading…" } else { name };
+        let name_w = cv.text_width(name, 22.0 * s);
+        cv.text(name, (vw - name_w) * 0.5, vh * 0.5 - 30.0 * s, 22.0 * s, [230, 230, 235]);
+        // 进度条(组件库)
+        let bw = 360.0 * s;
+        let bx = (vw - bw) * 0.5;
+        let by = vh * 0.5 - 10.0 * s;
+        let bar = widgets::ProgressBar::new(bx, by, bw, 20.0 * s, "loading", progress);
+        bar.draw(&mut cv, &theme, None);
+        bar.draw_overlay(&mut cv, &theme, None);
+        // 百分比文本
+        cv.text(&format!("{:.0}%", progress * 100.0), (vw - 30.0 * s) * 0.5 + bw * 0.5, by + 24.0 * s, 12.0 * s, [130, 130, 140]);
+        self.iced_cache.data_mut().copy_from_slice(self.pixmap.data());
+        for (tex, data) in [(&self.iced_tex, self.iced_cache.data()), (&self.timeline_tex, self.pixmap.data())] {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
+                wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+            );
+        }
     }
 
     /// Lightweight playhead-only redraw: draw current-time lines on the

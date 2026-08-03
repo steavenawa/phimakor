@@ -119,7 +119,16 @@ struct State {
     // ── Line panel (widgets 组件库,tool 1)──
     /// 线列表滚动条是否正在拖拽。
     line_dragging: bool,
+
+    // ── Loading screen (切谱面后台加载)──
+    /// 正在加载的谱面名(显示在加载屏)。
+    loading_name: Option<String>,
+    /// 后台加载线程(读+解析 chart,不碰 renderer)。
+    loading_thread: Option<std::thread::JoinHandle<anyhow::Result<LoadedChart>>>,
+    /// 加载开始时间(进度动画)。
+    loading_start: Instant,
 }
+
 
 /// Target of an in-progress numeric edit (double-clicked value field).
 #[derive(Clone, Copy)]
@@ -195,6 +204,7 @@ impl App {
             bpm_form: None, bpm_focus: None, bpm_dragging: false,
             settings_form: None, settings_dragging: false,
             line_dragging: false,
+            loading_name: None, loading_thread: None, loading_start: Instant::now(),
         })
     }
 
@@ -281,6 +291,7 @@ impl App {
             bpm_form: None, bpm_focus: None, bpm_dragging: false,
             settings_form: None, settings_dragging: false,
             line_dragging: false,
+            loading_name: None, loading_thread: None, loading_start: Instant::now(),
         })
     }
 
@@ -340,6 +351,58 @@ impl App {
         }
     }
 }
+/// 后台线程加载的谱面数据(纯 IO + 解析,不碰 GPU)。
+struct LoadedChart {
+    doc: ChartDocument,
+    /// 谱面目录名(加载屏显示)。
+    name: String,
+    /// chart 纹理: (名字, 字节)。
+    textures: Vec<(String, Vec<u8>)>,
+    /// 自定义 note 纹理: (key, 字节)。
+    custom_textures: Vec<(String, Vec<u8>)>,
+    /// 背景图字节。
+    bg: Option<Vec<u8>>,
+    /// extra.json 解析结果。
+    extra: Option<core::extra::ExtraRoot>,
+}
+
+/// 后台加载:读 + 解析谱面(ChartDocument::open 是最重的部分)。
+fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
+    let doc = ChartDocument::open(&dir)?;
+    let info = doc.info().clone();
+    let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+
+    let mut textures = Vec::new();
+    // 后台也建一次 Chart(CPU 解析,顺便拿纹理清单;主线程还会重建,
+    // 但 from_rpe_chart 缓存友好,双份成本可接受——避免 RPEChart 无 textures()。
+    if let Ok(chart) = core::chart::Chart::from_rpe_chart(doc.chart(), info.use_rpe_170_speed == Some(true)) {
+        for t in chart.textures() {
+            if let Ok(bytes) = std::fs::read(dir.join(&t)) {
+                textures.push((t.to_string(), bytes));
+            }
+        }
+    }
+    let mut custom_textures = Vec::new();
+    let tex_dir = dir.join("Texture2D");
+    if tex_dir.is_dir() {
+        let custom_map: [(&str, &str); 4] = [("Tap", "click"), ("Drag", "drag"), ("Flick", "flick"), ("Hold", "hold")];
+        for (file, key_suffix) in &custom_map {
+            for ext in &[".png", ".jpg"] {
+                let path = tex_dir.join(format!("{file}{ext}"));
+                if let Ok(bytes) = std::fs::read(&path) {
+                    custom_textures.push((format!("note:{key_suffix}"), bytes));
+                    break;
+                }
+            }
+        }
+    }
+    let bg = std::fs::read(dir.join(&info.illustration)).ok();
+    let extra = std::fs::read(dir.join("extra.json")).ok()
+        .and_then(|b| core::extra::parse_extra(&b).ok());
+
+    Ok(LoadedChart { doc, name, textures, custom_textures, bg, extra })
+}
+
 impl State {
     /// Sorted (effect-index, start-beat) pairs — same ordering as the Eff
     /// panel list, so a list row maps back to `ExtraRoot::effects`.
@@ -610,50 +673,41 @@ impl State {
         self.selected_event_idx = None;
     }
 
-    /// 切谱面:复用 window/renderer/overlay,只重载 chart 数据。
-    /// 避免 create_window 重建窗口(PMCORE-63)。
+    /// 切谱面:启动后台加载线程 + 显示加载屏。
+    /// 完成后由 render_frame 每帧轮询调用 [`State::apply_loaded_chart`]。
     fn reload_chart(&mut self, dir: &std::path::Path) -> anyhow::Result<()> {
         if let Some(a) = &self.audio { a.quit(); }
         self.audio = None;
-        let res_dir = PathBuf::from("res");
-        // 清掉旧谱纹理(note: 内置保留)。
         self.renderer.clear_chart_textures();
+        self.chart_dir = dir.to_path_buf();
+        let dir = dir.to_path_buf();
+        let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        self.loading_name = Some(name);
+        self.loading_start = Instant::now();
+        self.loading_thread = Some(std::thread::spawn(move || load_chart_async(dir)));
+        self.ui_dirty = true;
+        Ok(())
+    }
 
-        let doc = ChartDocument::open(dir)?;
+    /// 主线程应用后台加载结果(renderer 相关的上传/创建)。
+    fn apply_loaded_chart(&mut self, loaded: LoadedChart) -> anyhow::Result<()> {
+        let LoadedChart { doc, name: _name, textures, custom_textures, bg, extra } = loaded;
         let info = doc.info().clone();
         self.renderer.set_line_length(info.line_length);
         let chart = core::chart::Chart::from_rpe_chart(doc.chart(), info.use_rpe_170_speed == Some(true))?;
-        self.renderer.post.chart_dir = Some(dir.to_path_buf());
-
-        for name in chart.textures() {
-            if let Ok(bytes) = std::fs::read(dir.join(&name)) {
-                if let Err(e) = self.renderer.load_texture(&name, &bytes) { eprintln!("warning: texture {name}: {e:#}"); }
-            }
+        self.renderer.post.chart_dir = Some(self.chart_dir.clone());
+        for (k, bytes) in &textures {
+            if let Err(e) = self.renderer.load_texture(k, bytes) { eprintln!("warning: texture {k}: {e:#}"); }
         }
-        let tex_dir = dir.join("Texture2D");
-        if tex_dir.is_dir() {
-            let custom_map: [(&str, &str); 4] = [("Tap", "click"), ("Drag", "drag"), ("Flick", "flick"), ("Hold", "hold")];
-            for (file, key_suffix) in &custom_map {
-                for ext in &[".png", ".jpg"] {
-                    let path = tex_dir.join(format!("{file}{ext}"));
-                    if let Ok(bytes) = std::fs::read(&path) {
-                        let key = format!("note:{key_suffix}");
-                        if let Err(e) = self.renderer.load_texture(&key, &bytes) { eprintln!("warning: custom {file}: {e}"); }
-                        break;
-                    }
-                }
-            }
+        for (k, bytes) in &custom_textures {
+            if let Err(e) = self.renderer.load_texture(k, bytes) { eprintln!("warning: custom {k}: {e:#}"); }
         }
-        if let Ok(bytes) = std::fs::read(dir.join(&info.illustration)) {
-            if let Err(e) = self.renderer.set_background(&bytes, info.background_dim) { eprintln!("warning: bg: {e:#}"); }
+        if let Some(bytes) = &bg {
+            if let Err(e) = self.renderer.set_background(bytes, info.background_dim) { eprintln!("warning: bg: {e:#}"); }
         }
+        let res_dir = PathBuf::from("res");
+        self.audio = audio::spawn_audio_thread(res_dir.as_path(), &self.chart_dir).ok();
 
-        let extra = std::fs::read(dir.join("extra.json")).ok()
-            .and_then(|b| core::extra::parse_extra(&b).ok());
-        self.audio = audio::spawn_audio_thread(res_dir.as_path(), dir).ok();
-
-        // 替换数据,保留 window/renderer/overlay。
-        self.chart_dir = dir.to_path_buf();
         self.doc = doc;
         self.info = info;
         self.chart = chart;
@@ -685,8 +739,42 @@ impl State {
         self.overlay.line_list = None;
         self.overlay.chart_grid = None;
         self.chart.state_at(0.0);
+        self.loading_name = None;
+        self.loading_thread = None;
         self.ui_dirty = true;
         Ok(())
+    }
+
+    /// 每帧轮询:后台加载完成则应用结果。返回是否仍在加载。
+    fn poll_loading(&mut self) -> bool {
+        let Some(handle) = self.loading_thread.take() else {
+            return self.loading_name.is_some();
+        };
+        if !handle.is_finished() {
+            self.loading_thread = Some(handle);
+            return self.loading_name.is_some();
+        }
+        match handle.join() {
+            Ok(Ok(loaded)) => {
+                if let Err(e) = self.apply_loaded_chart(loaded) {
+                    eprintln!("apply loaded chart: {e:#}");
+                    self.loading_name = None;
+                }
+            }
+            Ok(Err(e)) => {
+                eprintln!("load chart: {e:#}");
+                self.loading_name = None;
+                // 加载失败:清掉空状态,回 splash(由 App 层检测 loading 结束
+                // 后 splash_mode 仍为 false 时触发)。
+                self.splash_mode = true;
+            }
+            Err(_) => {
+                eprintln!("load thread panicked");
+                self.loading_name = None;
+                self.splash_mode = true;
+            }
+        }
+        self.loading_name.is_some()
     }
 
     /// 每帧重建 BPM 面板表单(从 ChartDocument),保留焦点/拖拽状态。
@@ -895,6 +983,29 @@ impl State {
                 let _ = self.doc.add_note(self.selected_line, nn);
                 self.rebuild_chart();
                 self.ui_dirty = true;
+            }
+        }
+        // Loading screen: 后台加载期间只画加载屏,不渲染谱面。
+        if self.loading_name.is_some() || self.loading_thread.is_some() {
+            // 轮询后台线程(完成则应用)。
+            let still_loading = self.poll_loading();
+            if still_loading {
+                let elapsed = self.loading_start.elapsed().as_secs_f32();
+                // 假进度(加载中动画):缓慢逼近 0.95。
+                let progress = (elapsed * 0.25).min(0.95);
+                let name = self.loading_name.clone().unwrap_or_default();
+                self.overlay.render_loading(self.renderer.queue(), &name, progress, self.gui_scale);
+                let ui_bg = Some(self.overlay.bind_group());
+                match self.renderer.surface_acquire() {
+                    Ok(st) => {
+                        let aspect = st.texture.width() as f32 / st.texture.height().max(1) as f32;
+                        let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        self.renderer.draw_to_view(&view, &core::chart::FrameState { time: 0., lines: vec![], fired: vec![] }, aspect, 1.0, ui_bg, None);
+                        self.renderer.queue().present(st);
+                    }
+                    _ => {}
+                }
+                return;
             }
         }
         // Splash mode
@@ -2678,6 +2789,7 @@ mod zip_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
 
 
 
