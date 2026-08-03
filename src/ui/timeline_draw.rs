@@ -86,6 +86,14 @@ pub fn draw_timeline_pixmap(state: &TimelineDrawState, info: &GameInfo) -> Pixma
     pm
 }
 
+/// 画进已有 Pixmap(worker 复用缓冲用,不新建)。
+pub fn draw_timeline_pixmap_into(state: &TimelineDrawState, info: &GameInfo, pm: &mut Pixmap) {
+    let _s = trace_span!("draw_timeline_pixmap");
+    pm.fill(tiny_skia::Color::TRANSPARENT);
+    let mut st = state.clone();
+    st.draw_into(pm, info);
+}
+
 impl TimelineDrawState {
     /// 把当前快照绘制进 pixmap(与旧 upload_timeline_to 逐行等价,
     /// 只是所有 self 读取都换成快照字段)。
@@ -241,12 +249,19 @@ impl TimelineWorker {
         let handle = std::thread::Builder::new()
             .name("timeline-draw".into())
             .spawn(move || {
+                // 复用 Pixmap(避免每帧 new/drop 的对齐分配尖峰),
+                // 发送时 to_vec(唯一分配,普通分配器)。
+                let mut pms = [
+                    Pixmap::new(w, h).unwrap(),
+                    Pixmap::new(w, h).unwrap(),
+                ];
+                let mut idx = 0usize;
                 while let Ok(job) = job_rx.recv() {
-                    let pm = draw_timeline_pixmap(&job.state, &job.info);
-                    // Pixmap::take 拿到 owned buffer,不复制。
-                    if out_tx.send(pm.take()).is_err() {
+                    draw_timeline_pixmap_into(&job.state, &job.info, &mut pms[idx]);
+                    if out_tx.send(pms[idx].data().to_vec()).is_err() {
                         break;
                     }
+                    idx = 1 - idx;
                 }
             })
             .ok();
@@ -296,6 +311,7 @@ impl TimelineWorker {
         }
     }
 }
+
 
 
 
