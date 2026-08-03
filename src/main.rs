@@ -958,6 +958,24 @@ impl State {
         self.seek_dim_until = Instant::now() + Duration::from_millis(400);
     }
 
+    /// 硬 seek:立即跳到 `t`,不走平滑动画(空格重播等场景)。
+    /// 平滑 seek 会在滚动动画里逐帧给音频发 seek,导致重播时音频/显示
+    /// 卡在中间时间。
+    fn hard_seek(&mut self, t: f64) {
+        let _s = trace_span!("hard_seek");
+        let t = t.clamp(0.0, self.chart.duration());
+        if let Some(a) = &self.audio { a.seek(t); }
+        self.overlay.tl_follow = true;
+        self.pending_seek = None;
+        self.scroll_target = None;
+        self.chart_time_last = t;
+        let off = (self.chart.offset() + self.info.offset) as f64;
+        let ct = (t - off).max(0.0);
+        self.hits = self.chart.hits_before(ct) as u32;
+        self.combo = self.hits;
+        self.seek_dim_until = Instant::now() + Duration::from_millis(400);
+    }
+
     fn edit_selected_event(&mut self, f: impl Fn(&mut core::model::RPEEvent<f32>)) {
         let _s = trace_span!("edit_selected_event");
         let Some(ev_idx) = self.selected_event_idx else { return };
@@ -1877,16 +1895,12 @@ impl ApplicationHandler for App {
                             // 播放到末尾后音频队列排空(playing 仍是 true,
                             // is_paused() 检测不到),空格 resume 会重播但
                             // combo/hits/score 不清。用时间回绕检测:
-                            // 末尾 or 时间越过末尾 → 一律 seek(0) 清统计。
+                            // 末尾 or 时间越过末尾 → 一律 hard_seek(0) 清统计
+                            // (硬跳,不走平滑动画,避免音频被中间 seek 卡住)。
                             let at_end = state.chart_time_last >= state.chart.duration() - 0.1;
                             let paused = state.audio.as_ref().is_some_and(|a| a.is_paused());
-                            if paused && at_end {
-                                // 暂停在末尾:seek 清零后恢复播放。
-                                state.seek(0.0);
-                            } else if !paused && at_end {
-                                // 队列排空的"假播放"状态:seek(0) 清统计,
-                                // 音频线程 set_paused(false) 会 re-append 重播。
-                                state.seek(0.0);
+                            if at_end {
+                                state.hard_seek(0.0);
                             }
                             if let Some(a) = &state.audio {
                                 a.set_paused(!paused);
