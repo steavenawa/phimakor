@@ -374,7 +374,11 @@ impl State {
 
     /// Print a memory breakdown to the console (F7, or PHIMAKOR_MEMLOG=1
     /// every 5 s). Tracks the allocations the app itself controls.
-    fn debug_memory(&self) {
+    /// `include_gpu`: the wgpu registry report walks internal registries under
+    /// locks; it is fine on an explicit F7 but was stuttering playback when
+    /// the automatic 5 s MEMLOG report ran on the render thread — skip it
+    /// there.
+    fn debug_memory(&self, include_gpu: bool) {
         let (text_entries, digit_bytes, font_bytes) = self.renderer.text_mem();
         let mb = |b: usize| b as f64 / 1048576.0;
         eprintln!("──── memory report ────");
@@ -391,8 +395,10 @@ impl State {
         eprintln!("splash thumbnails      : {} (≤200 px each)", thumbs);
         let notes = self.doc.chart().judge_line_list.iter().map(|l| l.notes.as_ref().map_or(0, |n| n.len())).sum::<usize>();
         eprintln!("chart notes            : {} (parsed JSON kept in RAM)", notes);
-        if let Some(gpu) = self.renderer.gpu_mem() {
-            eprintln!("wgpu live resources    : {gpu}");
+        if include_gpu {
+            if let Some(gpu) = self.renderer.gpu_mem() {
+                eprintln!("wgpu live resources    : {gpu}");
+            }
         }
     }
 
@@ -1085,7 +1091,7 @@ impl ApplicationHandler for App {
                         KeyCode::F4 => { state.show_events = !state.show_events; state.ui_dirty = true; }
                         KeyCode::F5 => { if state.ctrl { state.full_notes = !state.full_notes; state.cache_valid = false; } else { state.show_notes = !state.show_notes; } state.ui_dirty = true; }
                         KeyCode::F6 => { state.renderer.set_vsync(!state.renderer.vsync); state.ui_dirty = true; }
-                        KeyCode::F7 => { state.debug_memory(); }
+                        KeyCode::F7 => { state.debug_memory(true); }
                         KeyCode::BracketLeft => { state.gui_scale = (state.gui_scale - 0.1).max(0.5); state.ui_dirty = true; }
                         KeyCode::BracketRight => { state.gui_scale = (state.gui_scale + 0.1).min(2.0); state.ui_dirty = true; }
                         KeyCode::Digit1 => { state.snap = 1.0; state.ui_dirty = true; }
@@ -1291,13 +1297,16 @@ impl ApplicationHandler for App {
         #[cfg(feature = "profiling")]
         tracy_client::frame_mark();
         // PHIMAKOR_MEMLOG=1 → print the memory report every 5 s (watch for
-        // leaks while playing / scrubbing).
-        if std::env::var("PHIMAKOR_MEMLOG").is_ok() {
+        // leaks while playing / scrubbing). The env var is read once (a syscall
+        // per frame was measurable); the report skips the wgpu registry walk
+        // so playback is not stuttered every 5 s.
+        static MEMLOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *MEMLOG.get_or_init(|| std::env::var("PHIMAKOR_MEMLOG").is_ok()) {
             static MEMLOG_LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
             let now = std::time::Instant::now();
             let mut last = MEMLOG_LAST.lock().unwrap();
             if last.map_or(true, |t| now.duration_since(t) >= std::time::Duration::from_secs(5)) {
-                if let Some(s) = &self.state { s.debug_memory(); }
+                if let Some(s) = &self.state { s.debug_memory(false); }
                 *last = Some(now);
             }
         }
