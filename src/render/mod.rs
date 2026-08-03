@@ -105,7 +105,9 @@ fn mat_mul(a: &Mat3, b: &Mat3) -> Mat3 {
 struct DrawUniform {
     /// Column-major 2D affine transform (Mat3 padded to 3×vec4).
     model: Mat3,
-    /// RGBA tint, pre-multiplied alpha in scene pass.
+    /// RGBA tint, multiplied with the sampled texture in the fragment shader.
+    /// Straight (non-premultiplied) alpha: the scene pass blends with
+    /// `ALPHA_BLENDING` (src-over), so the texture's alpha edge stays correct.
     color: [f32; 4],
     /// UV rectangle: [u0, v0, du, dv]; final UV = xy + quad_uv * zw.
     uv_rect: [f32; 4],
@@ -154,7 +156,7 @@ struct Instance {
     /// Affine matrix: [a, b, c, d, tx, ty, 0, 0].
     /// a,b,c,d = linear; tx,ty = translation; last 2 always 0.
     model: [f32; 8],
-    /// RGBA tint (pre-multiplied alpha in scene pass).
+    /// RGBA tint (straight, non-premultiplied — see `DrawUniform::color`).
     color: [f32; 4],
     /// UV rect: [u0, v0, du, dv]. Final UV = (u0, v0) + corner * (du, dv).
     /// V⵨ is standard GPU bottom-up; overlay textures pass (du=1, dv=-1) to flip.
