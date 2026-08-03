@@ -58,5 +58,7 @@ codegen-units = 256
 incremental = true
 
 [profile.release]
-lto = "thin"
-codegen-units = 16
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3

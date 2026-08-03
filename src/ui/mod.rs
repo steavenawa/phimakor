@@ -712,6 +712,14 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
             return;
         }
         // Restore base content (no playhead) — memcpy, much cheaper than redraw.
+        // 若 worker 有新帧(播放→静态切换),同步到 base_pixmap 一次。
+        if let Some(worker) = &mut self.tl_worker {
+            worker.poll();
+            if worker.has_frame() {
+                let data = worker.pixels();
+                self.base_pixmap.data_mut().copy_from_slice(data);
+            }
+        }
         self.pixmap.data_mut().copy_from_slice(self.base_pixmap.data());
         self.draw_playhead(info);
         self.last_drawn_beat = info.chart_beat;
@@ -819,9 +827,9 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         worker.submit(st, info.clone());
         worker.poll();
         if worker.has_frame() {
+            // 播放中 base_pixmap 不需要同步(静态 fast path 才用,
+            // 由 redraw_timeline 在切静态时同步一次)。
             let data = worker.pixels();
-            // 同步 playhead-free base(仅静态路径用,拷贝一次可接受)。
-            self.base_pixmap.data_mut().copy_from_slice(data);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 data,
@@ -832,7 +840,6 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
             // 首帧 worker 未完成:上传空白(避免显示旧谱残留)。
             self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
             let data = self.pixmap.data();
-            self.base_pixmap.data_mut().copy_from_slice(data);
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
                 data,
