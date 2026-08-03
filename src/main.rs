@@ -427,6 +427,7 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
         }
     }
     // 背景:解码 + σ=8 高斯模糊(重活,放后台)。
+    // 注意:背景不翻转(原 set_background 无 flip,与 upload_image 不同)。
     let (bg, bg_dim) = match std::fs::read(dir.join(&info.illustration)) {
         Ok(bytes) => {
             let blurred = image::load_from_memory(&bytes)
@@ -434,8 +435,6 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
                 .map(|im| im.to_rgba8())
                 .map(|img| image::imageops::blur(&img, 8.0));
             let bg = blurred.map(|img| {
-                let mut img = img;
-                image::imageops::flip_vertical_in_place(&mut img);
                 let (w, h) = (img.width().max(1), img.height().max(1));
                 DecodedImage { rgba: img.into_raw(), w, h }
             });
