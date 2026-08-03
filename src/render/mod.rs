@@ -413,6 +413,8 @@ pub struct Renderer {
 
     /// Live hit-effect bursts (see `fx.rs`).
     hit_fx: Vec<fx::HitFx>,
+    /// hit-fx 碎片随机种子(LCG,每次命中推进)。
+    fx_seed: u64,
     /// Text overlay state (see `text.rs`).
     text: text::TextState,
     /// Persistent single-instance buffer for UI overlay draws.
@@ -684,6 +686,7 @@ impl Renderer {
             scene_tex,
             scene_view,
             hit_fx: Vec::new(),
+            fx_seed: 0x9E3779B97F4A7C15,
             text: text::TextState::new(),
             vsync: true,
             ui_inst_buf,
@@ -1211,10 +1214,18 @@ impl Renderer {
                                 let y1 = end_y as f32 * CANVAS_H * ev_y * ctrl_y;
                                 let (head_y, tail_y) = (y, y1);
                                 let h = (tail_y - head_y).abs();
-                                if h > 1e-5 {
+                                // [FIX] 头尾偏移:body 从 head 边缘延伸到 tail 边缘,
+                                // 否则 body 与头尾中心重叠(中段和头尾重叠 bug)。
+                                let (h0, h1) = if tail_y >= head_y {
+                                    (head_y + head_h * 0.5, tail_y - tail_h * 0.5)
+                                } else {
+                                    (head_y - head_h * 0.5, tail_y + tail_h * 0.5)
+                                };
+                                let bh = (h1 - h0).abs();
+                                if bh > 1e-5 {
                                     cmds.push(DrawCmd {
                                         uniform: DrawUniform {
-                                            model: mat_mul(&hd((head_y + tail_y) * 0.5), &mat_scale(1.0, h / w)),
+                                            model: mat_mul(&hd((h0 + h1) * 0.5), &mat_scale(1.0, bh / w)),
                                             color: tint,
                                             uv_rect: v_at(head_uv, 1. - head_uv - tail_uv),
                                         },
@@ -1495,7 +1506,7 @@ impl Renderer {
         }
 
         // Field-split call: `cmds` already borrows `self.textures`/`self.white`.
-        Self::push_hit_fx(&mut self.hit_fx, &self.textures, &mut cmds, &letterbox, ev_x, ev_y);
+        Self::push_hit_fx(&mut self.hit_fx, &self.textures, &self.white, &mut cmds, &letterbox, ev_x, ev_y);
 
         // Text overlay (Phaser UI), on top of everything; queue is per-frame.
         text::push_text(
