@@ -89,9 +89,23 @@ struct State {
     // ── Post-processing effects ──
     extra: Option<core::extra::ExtraRoot>,
     /// Selected row in the Eff panel list + edit field under the wheel
-    /// (0 = shader, 1 = start, 2 = end, 3 = global).
+    /// (0 = shader, 1 = start, 2 = end, 3 = global, 4+ = uniform vars).
     selected_effect: Option<usize>,
     eff_edit_field: u8,
+    /// Double-click numeric input on the Eff panel (field + buffer).
+    num_edit: Option<NumEdit>,
+    /// Last Eff-field click for double-click detection (time, row, field).
+    last_eff_click: (std::time::Instant, Option<usize>, u8),
+}
+
+/// In-progress numeric edit started by double-clicking an Eff panel field.
+struct NumEdit {
+    /// The `eff_edit_field` this edit targets (4+ = sorted var index).
+    field: u8,
+    /// Variable name when `field >= 4` (sorted order), to write back.
+    var_key: Option<String>,
+    /// Text buffer being typed.
+    buf: String,
 }
 
 impl State {
@@ -148,7 +162,7 @@ impl App {
             splash_lib_path: charts_dir().display().to_string(),
             splash_hover: ui::SplashHover::None, show_settings: false, settings,
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()),
-            extra: None, selected_effect: None, eff_edit_field: 0,
+            extra: None, selected_effect: None, eff_edit_field: 0, num_edit: None, last_eff_click: (std::time::Instant::now(), None, 0),
         })
     }
 
@@ -230,7 +244,8 @@ impl App {
             splash_lib_path: String::new(), splash_hover: ui::SplashHover::None,
             show_settings: false, settings,
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()), extra,
-            selected_effect: None, eff_edit_field: 0,
+            selected_effect: None, eff_edit_field: 0, num_edit: None,
+            last_eff_click: (std::time::Instant::now(), None, 0),
         })
     }
 
@@ -370,6 +385,71 @@ impl State {
                 };
                 let step = (delta as f64 * 0.1 * 1000.0).round() / 1000.0;
                 e.vars.insert(key, serde_json::json!(((cur + step) * 1000.0).round() / 1000.0));
+            }
+            _ => {}
+        }
+        self.eff_save();
+    }
+
+    /// Start numeric input for the Eff panel field (double-click). Only
+    /// number-backed fields accept it (start/end/vars); shader/global are
+    /// cycle/toggle-only. Pre-fills the current value.
+    fn start_num_edit(&mut self, field: u8) {
+        let Some(sel) = self.selected_effect else { return };
+        let sorted = self.eff_sorted();
+        let Some((orig, _)) = sorted.get(sel).copied() else { return };
+        let Some(extra) = &self.extra else { return };
+        let Some(e) = extra.effects.get(orig) else { return };
+        let var_key = if field >= 4 {
+            let vi = (field - 4) as usize;
+            let mut keys: Vec<&String> = e.vars.keys().collect();
+            keys.sort();
+            match keys.get(vi) {
+                Some(k) if matches!(e.vars.get(*k), Some(serde_json::Value::Number(_))) => Some((*k).clone()),
+                _ => return, // keyframed / missing — not direct-editable
+            }
+        } else { None };
+        let buf = match field {
+            1 => format!("{:.3}", e.start.beats()),
+            2 => format!("{:.3}", e.end.beats()),
+            f if f >= 4 => {
+                let key = var_key.as_ref().unwrap();
+                match e.vars.get(key) {
+                    Some(serde_json::Value::Number(n)) => format!("{:.3}", n.as_f64().unwrap_or(0.0)),
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        self.num_edit = Some(NumEdit { field, var_key, buf });
+        self.ui_dirty = true;
+    }
+
+    /// Commit the numeric edit (Enter): parse and write back to the effect.
+    fn commit_num_edit(&mut self) {
+        let Some(edit) = self.num_edit.take() else { return };
+        let Ok(value) = edit.buf.parse::<f64>() else { return };
+        let Some(sel) = self.selected_effect else { return };
+        let sorted = self.eff_sorted();
+        let Some((orig, _)) = sorted.get(sel).copied() else { return };
+        let Some(extra) = &mut self.extra else { return };
+        let Some(e) = extra.effects.get_mut(orig) else { return };
+        match edit.field {
+            1 => {
+                let start = value.max(0.0);
+                e.start = core::bpm::Triple::from_beats(start);
+                if e.end.beats() <= start {
+                    e.end = core::bpm::Triple::from_beats(start + 0.01);
+                }
+            }
+            2 => {
+                let end = value.max(e.start.beats() + 0.01);
+                e.end = core::bpm::Triple::from_beats(end);
+            }
+            f if f >= 4 => {
+                if let Some(key) = &edit.var_key {
+                    e.vars.insert(key.clone(), serde_json::json!(value));
+                }
             }
             _ => {}
         }
@@ -662,6 +742,7 @@ impl State {
             effects,
             selected_effect: self.selected_effect,
             eff_edit_field: self.eff_edit_field,
+            num_edit: self.num_edit.as_ref().map(|e| (e.field, e.buf.clone())),
         };
         if self.show_overlay {
             if let Some(ev_idx) = self.overlay.take_timeline_click(&info, self.overlay.props_progress()) {
@@ -1107,6 +1188,34 @@ impl ApplicationHandler for App {
                             }
                             return;
                         }
+                        // Numeric input on the Eff panel (double-clicked field):
+                        // consume digits / . / - / Enter / Escape / Backspace.
+                        if state.num_edit.is_some() && !state.ctrl {
+                            if event.state == ElementState::Pressed {
+                                let mut done = false;
+                                if let Some(edit) = &mut state.num_edit {
+                                    match code {
+                                        KeyCode::Enter | KeyCode::NumpadEnter => { done = true; }
+                                        KeyCode::Escape => { state.num_edit = None; state.ui_dirty = true; }
+                                        KeyCode::Backspace => { edit.buf.pop(); state.ui_dirty = true; }
+                                        _ => {
+                                            let ch = match &event.logical_key {
+                                                winit::keyboard::Key::Character(s) => s.chars().next(),
+                                                _ => None,
+                                            };
+                                            if let Some(c) = ch {
+                                                if c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' {
+                                                    edit.buf.push(c);
+                                                    state.ui_dirty = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if done { state.commit_num_edit(); }
+                            }
+                            return;
+                        }
                         // pre-copy fields to avoid borrow conflicts
                         let has_event = state.selected_event_idx.is_some();
                         let edit_target = state.event_edit_target;
@@ -1303,10 +1412,21 @@ impl ApplicationHandler for App {
                             .and_then(|(orig, _)| state.extra.as_ref()?.effects.get(*orig))
                             .map_or(0, |e| e.vars.len());
                         match ui::effects_hit_test(mx, my, vw, vh, gs, pp, n_rows, n_vars) {
-                            ui::EffHit::List(ri) => { state.selected_effect = Some(ri); state.ui_dirty = true; }
-                            ui::EffHit::Add => state.eff_add(),
-                            ui::EffHit::Del => state.eff_remove_selected(),
-                            ui::EffHit::Field(f) => { state.eff_edit_field = f; state.ui_dirty = true; }
+                            ui::EffHit::List(ri) => { state.selected_effect = Some(ri); state.num_edit = None; state.ui_dirty = true; }
+                            ui::EffHit::Add => { state.eff_add(); state.num_edit = None; }
+                            ui::EffHit::Del => { state.eff_remove_selected(); state.num_edit = None; }
+                            ui::EffHit::Field(f) => {
+                                // Double-click a number field → type the value.
+                                let (last_t, last_sel, last_f) = state.last_eff_click;
+                                if f == last_f && state.selected_effect == last_sel
+                                    && last_t.elapsed() < std::time::Duration::from_millis(300)
+                                {
+                                    state.start_num_edit(f);
+                                }
+                                state.last_eff_click = (std::time::Instant::now(), state.selected_effect, f);
+                                state.eff_edit_field = f;
+                                state.ui_dirty = true;
+                            }
                             ui::EffHit::None => {}
                         }
                     }
@@ -1807,4 +1927,6 @@ mod zip_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+
 

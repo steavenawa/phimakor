@@ -106,6 +106,8 @@ pub struct GameInfo {
     /// wheel: 0 = shader, 1 = start, 2 = end, 3 = global.
     pub selected_effect: Option<usize>,
     pub eff_edit_field: u8,
+    /// Eff panel double-click numeric input: (field id, typed buffer) or None.
+    pub num_edit: Option<(u8, String)>,
 }
 
 pub(crate) fn build_ui<'a>(info: &'a GameInfo, panel: f32) -> Element<'a, (), Theme, Renderer> {

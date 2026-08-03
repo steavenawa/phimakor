@@ -271,8 +271,15 @@ pub(crate) fn draw_effects_panel(pixmap: &mut tiny_skia::PixmapMut, info: &GameI
                             fill_rect_clipped(pixmap, r, &hp);
                         }
                     }
+                    // Double-click numeric edit: show the typed buffer.
+                    let shown = if info.num_edit.as_ref().is_some_and(|(f, _)| *f == *tgt) {
+                        let buf = &info.num_edit.as_ref().unwrap().1;
+                        format!("{buf}|")
+                    } else {
+                        val.clone()
+                    };
                     draw_text_on_pixmap(pixmap, label, px + 8.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
-                    draw_text_on_pixmap(pixmap, val, px + pan_w * 0.5 + 4.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
+                    draw_text_on_pixmap(pixmap, &shown, px + pan_w * 0.5 + 4.0 * s, ry + cell_h * 0.5, 10.0 * s, font);
                     ry += cell_h;
                 }
             }
