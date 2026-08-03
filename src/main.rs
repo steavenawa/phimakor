@@ -303,7 +303,9 @@ impl State {
             priority: 0,
             vars,
         });
-        self.selected_effect = None;
+        // Select the freshly added effect (its row after the start-beat sort).
+        let new_idx = extra.effects.len() - 1;
+        self.selected_effect = self.eff_sorted().iter().position(|(i, _)| *i == new_idx);
         self.eff_save();
     }
 
@@ -354,6 +356,21 @@ impl State {
                 }
             }
             3 => e.global = !e.global,
+            _ if self.eff_edit_field >= 4 => {
+                // Uniform variable editing: field 4+ indexes into the sorted
+                // var names. Plain numbers step by 0.1 per notch; keyframed
+                // arrays are read-only (skipped).
+                let vi = (self.eff_edit_field - 4) as usize;
+                let mut keys: Vec<String> = e.vars.keys().cloned().collect();
+                keys.sort();
+                let Some(key) = keys.get(vi).cloned() else { return };
+                let cur = match e.vars.get(&key) {
+                    Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
+                    _ => return,
+                };
+                let step = (delta as f64 * 0.1 * 1000.0).round() / 1000.0;
+                e.vars.insert(key, serde_json::json!(((cur + step) * 1000.0).round() / 1000.0));
+            }
             _ => {}
         }
         self.eff_save();
@@ -580,6 +597,19 @@ impl State {
             let mut rows: Vec<ui::EffectRow> = self.extra.as_ref().map_or(Vec::new(), |extra| {
                 extra.effects.iter().enumerate().map(|(i, e)| {
                     let (sb, eb) = (e.start.beats(), e.end.beats());
+                    // Vars: name → display value. Plain numbers are editable;
+                    // keyframe arrays are summarized as "N kf".
+                    let mut vars: Vec<(String, String)> = e.vars.iter()
+                        .map(|(k, v)| {
+                            let disp = match v {
+                                serde_json::Value::Number(n) => format!("{:.3}", n.as_f64().unwrap_or(0.0)),
+                                serde_json::Value::Array(a) if !a.is_empty() => format!("{} kf", a.len()),
+                                _ => "…".to_string(),
+                            };
+                            (k.clone(), disp)
+                        })
+                        .collect();
+                    vars.sort_by(|a, b| a.0.cmp(&b.0));
                     ui::EffectRow {
                         index: i,
                         shader: e.shader.clone(),
@@ -587,6 +617,7 @@ impl State {
                         end_beats: eb,
                         global: e.global,
                         active: chart_beat >= sb && chart_beat <= eb,
+                        vars,
                     }
                 }).collect()
             });
@@ -1267,7 +1298,11 @@ impl ApplicationHandler for App {
                         let vh = state.window.inner_size().height as f32;
                         let pp = state.overlay.props_progress();
                         let n_rows = state.extra.as_ref().map_or(0, |e| e.effects.len());
-                        match ui::effects_hit_test(mx, my, vw, vh, gs, pp, n_rows) {
+                        // Var count of the selected effect (row → original index).
+                        let n_vars = state.eff_sorted().get(state.selected_effect.unwrap_or(usize::MAX))
+                            .and_then(|(orig, _)| state.extra.as_ref()?.effects.get(*orig))
+                            .map_or(0, |e| e.vars.len());
+                        match ui::effects_hit_test(mx, my, vw, vh, gs, pp, n_rows, n_vars) {
                             ui::EffHit::List(ri) => { state.selected_effect = Some(ri); state.ui_dirty = true; }
                             ui::EffHit::Add => state.eff_add(),
                             ui::EffHit::Del => state.eff_remove_selected(),

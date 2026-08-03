@@ -138,8 +138,10 @@ fn eff_layout(vw: f32, vh: f32, s: f32, pp: f32) -> (f32, f32, f32, f32) {
 const EFF_ROW_H: f32 = 22.0;
 
 /// Hit-test the Eff panel (editor mode, tool 3). `n_rows` = effect list length.
+/// The bottom edit block has 4 fixed fields (Shader/Start/End/Global) plus one
+/// row per uniform variable (field ids 4+).
 pub(crate) fn effects_hit_test(
-    mx: f32, my: f32, vw: f32, vh: f32, s: f32, pp: f32, n_rows: usize,
+    mx: f32, my: f32, vw: f32, vh: f32, s: f32, pp: f32, n_rows: usize, n_vars: usize,
 ) -> EffHit {
     let (px, pan_w, bg_h, _) = eff_layout(vw, vh, s, pp);
     if mx < px || mx > px + pan_w { return EffHit::None; }
@@ -157,11 +159,12 @@ pub(crate) fn effects_hit_test(
         if mx >= px + 72.0 * s && mx < px + 72.0 * s + 60.0 * s { return EffHit::Del; }
     }
     // Edit fields pinned to the bottom (only reachable when rows don't cover them)
-    let edit_h = 4.0 * row_h + 8.0 * s;
+    let n_edit = 4 + n_vars;
+    let edit_h = n_edit as f32 * row_h + 8.0 * s;
     let ey = (bg_h - edit_h).max(y0);
-    if my >= ey && my < ey + 4.0 * row_h {
+    if my >= ey && my < ey + n_edit as f32 * row_h {
         let fi = ((my - ey) / row_h) as u8;
-        if fi < 4 { return EffHit::Field(fi); }
+        if (fi as usize) < n_edit { return EffHit::Field(fi); }
     }
     EffHit::None
 }
@@ -236,22 +239,28 @@ pub(crate) fn draw_effects_panel(pixmap: &mut tiny_skia::PixmapMut, info: &GameI
         }
     }
 
-    // Edit fields pinned to the bottom
+    // Edit fields pinned to the bottom: 4 fixed rows + one row per uniform
+    // variable (wheel-adjustable when the var is a plain number).
     if let Some(sel) = info.selected_effect {
         if let Some(e) = info.effects.get(sel) {
-            let edit_h = 4.0 * cell_h + 8.0 * s;
+            let n_vars = e.vars.len();
+            let n_edit = 4 + n_vars;
+            let edit_h = n_edit as f32 * cell_h + 8.0 * s;
             let ey = (bg_h - edit_h).max(list_top);
             let mut eb = tiny_skia::Paint::default();
             eb.set_color_rgba8(30, 32, 40, 230);
             if let Some(r) = tiny_skia::Rect::from_xywh(px, ey, pan_w, edit_h) {
                 fill_rect_clipped(pixmap, r, &eb);
             }
-            let rows: [(&str, String, u8); 4] = [
-                ("Shader", e.shader.clone(), 0),
-                ("Start", format!("{:.3}b", e.start_beats), 1),
-                ("End", format!("{:.3}b", e.end_beats), 2),
-                ("Global", if e.global { "ON" } else { "OFF" }.to_string(), 3),
+            let mut rows: Vec<(String, String, u8)> = vec![
+                ("Shader".to_string(), e.shader.clone(), 0),
+                ("Start".to_string(), format!("{:.3}b", e.start_beats), 1),
+                ("End".to_string(), format!("{:.3}b", e.end_beats), 2),
+                ("Global".to_string(), if e.global { "ON" } else { "OFF" }.to_string(), 3),
             ];
+            for (vi, (name, val)) in e.vars.iter().enumerate() {
+                rows.push((format!("{name}"), val.clone(), (4 + vi) as u8));
+            }
             if let Some(font) = font {
                 let mut ry = ey + 4.0 * s;
                 for (label, val, tgt) in &rows {

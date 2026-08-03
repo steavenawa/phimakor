@@ -68,6 +68,9 @@ pub struct EffectRow {
     pub global: bool,
     /// Whether the effect is active at the current playhead beat.
     pub active: bool,
+    /// Uniform variables: (name, display value). A plain number is editable
+    /// with the wheel; keyframed values show "N kf" (read-only).
+    pub vars: Vec<(String, String)>,
 }
 
 pub struct GameInfo {
