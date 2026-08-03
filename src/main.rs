@@ -1162,9 +1162,22 @@ impl State {
             } else { (String::new(), 0.0, 0.0, 0.0, 0.0, 0) };
             (self.selected_event_idx, k, sb, eb, sv, ev, ea)
         };
-        let effect_names: Vec<String> = self.extra.as_ref().map_or(vec![], |extra| {
-            core::extra::evaluate_effects(extra, chart_beat).iter().map(|e| e.shader_name.clone()).collect()
+        // FX 链(PMCORE-64):提前构建一次,post.active 与 effect_names 共用,
+        // 避免 evaluate_effects 双份计算。
+        let fx_chain = self.extra.as_ref().map(|extra| {
+            let size = self.renderer.size();
+            render::effects_chain::build_effect_chain(
+                extra, chart_beat, chart_time, (size[0] as f32, size[1] as f32),
+            )
         });
+        let effect_names: Vec<String> = fx_chain.as_ref()
+            .map(|chain| chain.iter().map(|e| {
+                e.custom_name.clone().unwrap_or_else(|| {
+                    render::shaders::EFFECTS.get(e.shader_idx)
+                        .map(|d| d.name.to_string()).unwrap_or_default()
+                })
+            }).collect())
+            .unwrap_or_default();
         // Eff panel list: ALL effects sorted by start beat (index maps back to
         // ExtraRoot::effects for edits).
         let effects: Arc<Vec<ui::EffectRow>> = {
@@ -1355,46 +1368,10 @@ impl State {
             }
         }
         let t_panel = std::time::Instant::now();
-        // Evaluate post-processing effects at current beat
+        // 应用 FX 链(已在上方构建,PMCORE-64)。
         self.renderer.post.active.clear();
-        if let Some(extra) = &self.extra {
-            let evals = core::extra::evaluate_effects(extra, chart_beat);
-            let size = self.renderer.size();
-            let (sw, sh) = (size[0] as f32, size[1] as f32);
-            for e in &evals {
-                let si = crate::render::shaders::EFFECTS.iter().position(|d| d.name == e.shader_name).unwrap_or(usize::MAX);
-                let (uv, count) = if si == usize::MAX {
-                    // Custom shader: use raw uniforms from extra.json vars
-                    (e.uniforms.clone(), e.uniforms.len())
-                } else {
-                    let def = &crate::render::shaders::EFFECTS[si];
-                    let mut uv: Vec<f32> = def.defaults.iter().map(|(_, v)| *v).collect();
-                    let norm = |s: &str| s.to_lowercase().replace("_", "").replace("-", "");
-                    for (i, (dname, _)) in def.defaults.iter().enumerate() {
-                        let base = dname.trim_end_matches("_r").trim_end_matches("_g")
-                            .trim_end_matches("_b").trim_end_matches("_a")
-                            .trim_end_matches("_x").trim_end_matches("_y");
-                        let nbase = norm(base);
-                        if let Some(pos) = e.uniforms_names.iter().position(|n| norm(n) == nbase) {
-                            uv[i] = e.uniforms[pos];
-                        }
-                        if dname.contains("screen_size") {
-                            uv[i] = if dname.ends_with('x') { sw } else { sh };
-                        }
-                        if *dname == "time" {
-                            uv[i] = chart_time as f32;
-                        }
-                    }
-                    let l = uv.len(); (uv, l)
-                };
-                self.renderer.post.active.push(render::post::ActiveEffect {
-                    shader_idx: si,
-                    custom_name: if si == usize::MAX { Some(e.shader_name.clone()) } else { None },
-                    priority: e.priority,
-                    uniform_values: uv,
-                    uniform_count: count,
-                });
-            }
+        if let Some(chain) = &fx_chain {
+            self.renderer.post.active.extend(chain.iter().cloned());
         }
 
         let ui_bg = if self.show_overlay { Some(self.overlay.bind_group()) } else { None };

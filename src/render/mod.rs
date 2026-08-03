@@ -23,6 +23,7 @@ use winit::window::Window;
 use crate::core::FrameState;
 
 mod fx;
+pub mod effects_chain;
 pub mod post;
 pub mod preview;
 pub mod shaders;

@@ -6,6 +6,7 @@ use crate::render::shaders::{EffectDef, EFFECTS};
 use std::collections::HashMap;
 
 /// A single active effect instance (from extra.json).
+#[derive(Clone)]
 pub struct ActiveEffect {
     /// Index into the built-in [`EFFECTS`] array.
     /// `usize::MAX` signals a custom shader loaded from the chart directory.
