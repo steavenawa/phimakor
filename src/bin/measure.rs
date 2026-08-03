@@ -55,10 +55,13 @@ fn main() {
     {
         use tracing_subscriber::layer::SubscriberExt;
         use tracing_subscriber::util::SubscriberInitExt;
+        // 默认只显示 warn;需要 per-span trace 时设 RUST_LOG=phimakor=trace。
+        let filter = tracing_subscriber::EnvFilter::try_from_env("RUST_LOG")
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
         let _ = tracing_subscriber::registry()
             .with(tracing_subscriber::fmt::layer().with_target(false).with_level(true)
                 .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE))
-            .with(tracing_subscriber::EnvFilter::new("phimakor=trace"))
+            .with(filter)
             .try_init();
     }
 
