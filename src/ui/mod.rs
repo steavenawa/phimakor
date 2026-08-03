@@ -105,6 +105,8 @@ pub struct IcedOverlay {
     /// Chart 面板的元数据网格(tool 0)。main.rs 每帧构建。
     pub chart_grid: Option<widgets::KeyValueGrid>,
     pub chart_grid_hover: Option<widgets::Area>,
+    /// 时间轴绘制 worker(PMCORE-55):后台画,主线程只上传。
+    pub tl_worker: Option<timeline_draw::TimelineWorker>,
     pub messages: Vec<OverlayMessage>,
     timeline_click: Option<f32>,
     layer_click: Option<f32>,
@@ -153,7 +155,7 @@ impl IcedOverlay {
             w: w.max(1), h: h.max(1), panel_progress: 0.0, events_progress: 0.0,
             notes_progress: 0.0, mouse_pos: None, show_overlay: true, tl_visible: false,
             tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 5],
-            panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, messages: Vec::new(), timeline_click: None,
+            panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, tl_worker: Some(timeline_draw::TimelineWorker::new(w.max(1), h.max(1))), messages: Vec::new(), timeline_click: None,
             layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, gui_scale: 1.0,
             timeline_dirty: false,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
@@ -193,6 +195,8 @@ impl IcedOverlay {
         (self.texture, self.bind_group) = Self::make_texture(device, tex_bgl, sampler, w, h, "overlay");
         (self.iced_tex, self.iced_bg) = Self::make_texture(device, tex_bgl, sampler, w, h, "iced-cache");
         (self.timeline_tex, self.timeline_bg) = Self::make_texture(device, tex_bgl, sampler, w, h, "timeline");
+        // 尺寸变化 → 重建 worker(像素缓冲大小跟随)。
+        self.tl_worker = Some(timeline_draw::TimelineWorker::new(w, h));
     }
 
     pub fn bind_group(&self) -> &wgpu::BindGroup { &self.timeline_bg }
@@ -794,32 +798,48 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
 
     fn upload_timeline_to(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let _s = trace_span!("upload_timeline");
-        // MUST clear first: this runs both from redraw_iced (pre-cleared) and
-        // directly from redraw_timeline's playing/animation path — without the
-        // fill, the previous frame's playhead lines/notes/seek fill would
-        // remain and ghost under the new content.
-        // PMCORE-55:绘制拆成纯函数(timeline_draw),快照 → Pixmap → 上传。
+        // PMCORE-55:绘制挪到 worker 线程(纯函数 draw_timeline_pixmap)。
+        // 主线程:animate + 快照 → 发 job → 收上一帧结果 → 上传 GPU。
+        // 像素零拷贝:直接上传 worker 的 pending,不走 pixmap 中转。
         self.animate_all();
         self.notes_cache = info.notes.clone();
-        // 播放中 tl_follow 滚动更新(纯函数内也更新,但这里先同步一次,
-        // 让 hit-test/其他逻辑读到最新值)。
         if self.tl_visible && self.tl_follow {
             self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
         }
-        let mut st = timeline_draw::TimelineDrawState::from_overlay(self);
-        let pm = timeline_draw::draw_timeline_pixmap(&st, info);
-        // 回写纯函数内可能更新的滚动状态(手动滚动后的重新跟随)。
-        self.tl_scroll = st.tl_scroll;
-        self.tl_follow = st.tl_follow;
-        // 拷贝到 overlay pixmap(上传源),并同步 playhead-free base。
-        self.pixmap.data_mut().copy_from_slice(pm.data());
-        self.base_pixmap.data_mut().copy_from_slice(pm.data());
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            self.pixmap.data(),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
-            wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
-        );
+        let st = timeline_draw::TimelineDrawState::from_overlay(self);
+        // 手动滚动后的重新跟随由 worker 内快照处理,主线程同步一次。
+        if !st.tl_follow {
+            let b = info.chart_beat as f32;
+            if b < st.tl_scroll || b > st.tl_scroll + st.tl_zoom {
+                self.tl_follow = true;
+            }
+        }
+        let Some(worker) = &mut self.tl_worker else { return };
+        // 发最新帧给 worker;收 worker 完成的上一帧(零拷贝,移动 Vec)。
+        worker.submit(st, info.clone());
+        worker.poll();
+        if worker.has_frame() {
+            let data = worker.pixels();
+            // 同步 playhead-free base(仅静态路径用,拷贝一次可接受)。
+            self.base_pixmap.data_mut().copy_from_slice(data);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
+                wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+            );
+        } else {
+            // 首帧 worker 未完成:上传空白(避免显示旧谱残留)。
+            self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
+            let data = self.pixmap.data();
+            self.base_pixmap.data_mut().copy_from_slice(data);
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                data,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
+                wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
+            );
+        }
     }
 }
 

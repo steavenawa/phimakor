@@ -7,6 +7,9 @@
 
 use tiny_skia::{Paint, Pixmap, PixmapMut, Rect, Transform};
 
+use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::thread::JoinHandle;
+
 use super::model::GameInfo;
 use super::panels::PanelDef;
 use super::panel_ui::{draw_effects_panel, draw_panel_def, draw_quick_panel};
@@ -205,6 +208,91 @@ impl TimelineDrawState {
         }
         if info.show_menu {
             draw_menu(&mut pm.as_mut(), vw, vh, s);
+        }
+    }
+}
+
+// ── 绘制 worker(PMCORE-55 第二阶段)──
+
+/// 绘制请求:状态快照 + 帧数据(均为 Send)。
+struct DrawJob {
+    state: TimelineDrawState,
+    info: GameInfo,
+}
+
+/// 时间轴绘制 worker:后台线程跑 [`draw_timeline_pixmap`](最重的 CPU 活),
+/// 主线程只收完成的像素并上传 GPU。双缓冲:worker 画 N+1 帧时主线程上传 N 帧。
+pub struct TimelineWorker {
+    tx: SyncSender<DrawJob>,
+    rx: Receiver<Vec<u8>>,
+    /// 上一帧完成的像素(主线程上传源)。
+    pending: Vec<u8>,
+    w: u32,
+    h: u32,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl TimelineWorker {
+    /// 启动 worker(持有一个线程 + 两条 channel)。
+    pub fn new(w: u32, h: u32) -> Self {
+        // 容量 1:worker 忙时 submit 丢弃旧帧(try_send),保持最新。
+        let (job_tx, job_rx) = sync_channel::<DrawJob>(1);
+        let (out_tx, out_rx) = channel::<Vec<u8>>();
+        let handle = std::thread::Builder::new()
+            .name("timeline-draw".into())
+            .spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let pm = draw_timeline_pixmap(&job.state, &job.info);
+                    // Pixmap::take 拿到 owned buffer,不复制。
+                    if out_tx.send(pm.take()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .ok();
+        Self {
+            tx: job_tx,
+            rx: out_rx,
+            pending: Vec::new(),
+            w,
+            h,
+            handle,
+        }
+    }
+
+    /// 提交一帧绘制请求(最新快照 + 帧数据)。若 worker 忙(channel 满),
+    /// 丢弃旧 job(只保留最新)。
+    pub fn submit(&self, state: TimelineDrawState, info: GameInfo) {
+        // try_send:worker 忙时丢弃(双缓冲最多滞后一帧,保持最新)。
+        let _ = self.tx.try_send(DrawJob { state, info });
+    }
+
+    /// 取回 worker 完成的像素(若可用),存为 pending。返回是否有新结果。
+    pub fn poll(&mut self) -> bool {
+        if let Ok(raw) = self.rx.try_recv() {
+            if raw.len() == (self.w as usize * self.h as usize * 4) {
+                self.pending = raw;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 主线程上传源:上一帧完成的像素(无结果时为全透明)。
+    pub fn pixels(&self) -> &[u8] {
+        &self.pending
+    }
+
+    /// 是否已有可上传的像素。
+    pub fn has_frame(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// 停止 worker。
+    pub fn shutdown(mut self) {
+        drop(self.tx);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
         }
     }
 }

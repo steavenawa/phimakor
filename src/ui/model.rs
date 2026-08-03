@@ -83,6 +83,7 @@ pub struct KfRow {
     pub easing: i32,
 }
 
+#[derive(Clone)]
 pub struct GameInfo {
     pub chart_time: f64, pub chart_beat: f64, pub audio_time: f64, pub fps: f64,
     pub combo: u32, pub hits: u32, pub note_count: usize, pub score: u32,
