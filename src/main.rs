@@ -293,19 +293,46 @@ impl App {
     /// Leave the editor and return to the splash screen: stop the audio
     /// thread, rescan the library, and swap in a fresh splash state.
     fn back_to_splash(&mut self, event_loop: &ActiveEventLoop) {
-        if let Some(s) = &self.state {
-            if let Some(a) = &s.audio { a.quit(); }
+        // 复用当前 State 的 window/renderer/overlay,只切到 splash 数据
+        // (PMCORE-63,避免 create_window 重建)。
+        if let Some(state) = &mut self.state {
+            if let Some(a) = &state.audio { a.quit(); }
+            state.audio = None;
+            let charts = scan_charts();
+            state.splash_mode = true;
+            state.splash_charts = charts;
+            state.splash_search.clear();
+            state.splash_sel = None;
+            state.splash_sort = 0;
+            state.splash_scroll = 0.0;
+            state.show_settings = false;
+            state.show_properties = false;
+            state.show_events = false;
+            state.show_notes = false;
+            state.ui_dirty = true;
+            return;
         }
         let charts = scan_charts();
-        self.state = None;
         if let Some(s) = self.create_splash_state(event_loop, charts) {
             self.state = Some(s);
         }
     }
 
-    /// Drop the current state and open a chart directory (shared by the
-    /// drag-and-drop, splash-click, and reload paths).
+    /// Reuse the current editor state and reload a chart directory, keeping
+    /// the window/renderer/overlay alive (no create_window on switch).
     fn open_chart(&mut self, event_loop: &ActiveEventLoop, path: &std::path::Path) {
+        // 已有 State(编辑器或 splash):复用窗口重载谱面(PMCORE-63)。
+        // splash 模式的 doc/chart 是临时空谱,reload 直接替换。
+        if let Some(state) = &mut self.state {
+            match state.reload_chart(path) {
+                Ok(()) => {
+                    state.splash_mode = false;
+                    return;
+                }
+                Err(e) => { eprintln!("failed to reload {path:?}: {e:#}"); }
+            }
+        }
+        // 首次启动(无 State):创建完整状态。
         self.state = None;
         match self.create_state(event_loop, &path.to_path_buf()) {
             Ok(st) => self.state = Some(st),
@@ -581,6 +608,85 @@ impl State {
         self.renderer.clear_hit_fx();
         self.cache_valid = false;
         self.selected_event_idx = None;
+    }
+
+    /// 切谱面:复用 window/renderer/overlay,只重载 chart 数据。
+    /// 避免 create_window 重建窗口(PMCORE-63)。
+    fn reload_chart(&mut self, dir: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(a) = &self.audio { a.quit(); }
+        self.audio = None;
+        let res_dir = PathBuf::from("res");
+        // 清掉旧谱纹理(note: 内置保留)。
+        self.renderer.clear_chart_textures();
+
+        let doc = ChartDocument::open(dir)?;
+        let info = doc.info().clone();
+        self.renderer.set_line_length(info.line_length);
+        let chart = core::chart::Chart::from_rpe_chart(doc.chart(), info.use_rpe_170_speed == Some(true))?;
+        self.renderer.post.chart_dir = Some(dir.to_path_buf());
+
+        for name in chart.textures() {
+            if let Ok(bytes) = std::fs::read(dir.join(&name)) {
+                if let Err(e) = self.renderer.load_texture(&name, &bytes) { eprintln!("warning: texture {name}: {e:#}"); }
+            }
+        }
+        let tex_dir = dir.join("Texture2D");
+        if tex_dir.is_dir() {
+            let custom_map: [(&str, &str); 4] = [("Tap", "click"), ("Drag", "drag"), ("Flick", "flick"), ("Hold", "hold")];
+            for (file, key_suffix) in &custom_map {
+                for ext in &[".png", ".jpg"] {
+                    let path = tex_dir.join(format!("{file}{ext}"));
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let key = format!("note:{key_suffix}");
+                        if let Err(e) = self.renderer.load_texture(&key, &bytes) { eprintln!("warning: custom {file}: {e}"); }
+                        break;
+                    }
+                }
+            }
+        }
+        if let Ok(bytes) = std::fs::read(dir.join(&info.illustration)) {
+            if let Err(e) = self.renderer.set_background(&bytes, info.background_dim) { eprintln!("warning: bg: {e:#}"); }
+        }
+
+        let extra = std::fs::read(dir.join("extra.json")).ok()
+            .and_then(|b| core::extra::parse_extra(&b).ok());
+        self.audio = audio::spawn_audio_thread(res_dir.as_path(), dir).ok();
+
+        // 替换数据,保留 window/renderer/overlay。
+        self.chart_dir = dir.to_path_buf();
+        self.doc = doc;
+        self.info = info;
+        self.chart = chart;
+        self.extra = extra;
+        self.note_count = self.chart.max_combo();
+        self.combo = 0;
+        self.hits = 0;
+        self.selected_line = 0;
+        self.selected_layer = 0;
+        self.selected_event_idx = None;
+        self.event_edit_target = 0;
+        self.scroll_target = None;
+        self.pending_seek = None;
+        self.chart_time_last = 0.0;
+        self.cache_valid = false;
+        self.cached_events = Arc::new(Vec::new());
+        self.cached_notes = Arc::new(Vec::new());
+        self.selected_effect = None;
+        self.eff_kf_var = None;
+        self.eff_kf_sel = None;
+        self.num_edit = None;
+        self.bpm_form = None;
+        self.bpm_focus = None;
+        self.bpm_dragging = false;
+        self.settings_form = None;
+        self.settings_dragging = false;
+        self.overlay.bpm_form = None;
+        self.overlay.settings_form = None;
+        self.overlay.line_list = None;
+        self.overlay.chart_grid = None;
+        self.chart.state_at(0.0);
+        self.ui_dirty = true;
+        Ok(())
     }
 
     /// 每帧重建 BPM 面板表单(从 ChartDocument),保留焦点/拖拽状态。

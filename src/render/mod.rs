@@ -838,6 +838,13 @@ impl Renderer {
         Ok(())
     }
 
+    /// 清掉全部 chart 纹理(切谱面时调用,避免旧谱纹理累积泄漏)。
+    /// 保留 `note:` 前缀的内置 hitsound 纹理(与 chart 无关)。
+    pub fn clear_chart_textures(&mut self) {
+        self.textures.retain(|k, _| k.starts_with("note:"));
+        self.hit_fx.clear();
+    }
+
     /// Draw one frame. wgpu 30 removed `wgpu::SurfaceError`; acquisition
     /// failures are reported via `wgpu::CurrentSurfaceTexture`. Lost/Outdated
     /// are handled here by reconfiguring with the stored size (frame skipped);
