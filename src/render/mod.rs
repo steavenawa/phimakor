@@ -846,6 +846,21 @@ impl Renderer {
         self.hit_fx.clear();
     }
 
+    /// 直载预解码 RGBA 纹理(跳过 image 解码,PMCORE 加载优化)。
+    pub fn load_texture_rgba(&mut self, name: &str, rgba: &[u8], w: u32, h: u32) {
+        let texture = Self::create_texture(&self.device, &self.queue, rgba, w, h);
+        let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
+        self.textures.insert(name.to_string(), TexEntry { bind_group, size: [w as f32, h as f32] });
+    }
+
+    /// 直载预解码背景(已模糊 + 翻转)。
+    pub fn set_background_rgba(&mut self, rgba: &[u8], w: u32, h: u32, dim: f32) {
+        let texture = Self::create_texture(&self.device, &self.queue, rgba, w, h);
+        let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
+        self.background = Some((bind_group, [w as f32, h as f32]));
+        self.background_dim = dim;
+    }
+
     /// Draw one frame. wgpu 30 removed `wgpu::SurfaceError`; acquisition
     /// failures are reported via `wgpu::CurrentSurfaceTexture`. Lost/Outdated
     /// are handled here by reconfiguring with the stored size (frame skipped);

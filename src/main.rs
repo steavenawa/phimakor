@@ -3,7 +3,7 @@ mod core;
 mod render;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -351,24 +351,45 @@ impl App {
         }
     }
 }
-/// 后台线程加载的谱面数据(纯 IO + 解析,不碰 GPU)。
+/// 后台预解码的图片(RGBA + 尺寸,主线程直接建纹理)。
+struct DecodedImage {
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+}
+
+/// 后台线程加载的谱面数据(纯 IO + 解析 + 图片解码,不碰 GPU)。
 /// 注意:core::chart::Chart 含 `Rc<dyn TweenFunction>`(easing 缓存),不是
 /// Send,不能跨线程传回——主线程在 apply 时构建 Chart。
 struct LoadedChart {
     doc: ChartDocument,
     /// 谱面目录名(加载屏显示)。
     name: String,
-    /// chart 纹理: (名字, 字节)。从 RPEChart 的 line texture 提取。
-    textures: Vec<(String, Vec<u8>)>,
-    /// 自定义 note 纹理: (key, 字节)。
-    custom_textures: Vec<(String, Vec<u8>)>,
-    /// 背景图字节。
-    bg: Option<Vec<u8>>,
+    /// chart 纹理: (名字, 预解码)。从 RPEChart 的 line texture 提取。
+    textures: Vec<(String, DecodedImage)>,
+    /// 自定义 note 纹理: (key, 预解码)。
+    custom_textures: Vec<(String, DecodedImage)>,
+    /// 背景图(预解码 + 已高斯模糊,σ=8)。
+    bg: Option<DecodedImage>,
+    /// 背景 dim。
+    bg_dim: f32,
     /// extra.json 解析结果。
     extra: Option<core::extra::ExtraRoot>,
+    /// 音频句柄(在后台线程等 ready,不阻塞主线程)。
+    audio: Option<audio::AudioHandle>,
 }
 
-/// 后台加载:读 + 解析谱面(ChartDocument::open 是最重的部分)。
+/// 解码图片 + 垂直翻转(wgpu v=0 是顶行,与 upload_image 一致)。
+fn decode_image(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
+    let mut img = image::load_from_memory(bytes)
+        .map_err(|e| anyhow::anyhow!("failed to decode image: {e}"))?
+        .to_rgba8();
+    image::imageops::flip_vertical_in_place(&mut img);
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    Ok(DecodedImage { rgba: img.into_raw(), w, h })
+}
+
+/// 后台加载:读 + 解析谱面 + 预解码纹理/背景 + 音频就绪。
 fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
     let doc = ChartDocument::open(&dir)?;
     let info = doc.info().clone();
@@ -382,7 +403,11 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
             continue;
         }
         if let Ok(bytes) = std::fs::read(dir.join(&line.texture)) {
-            textures.push((line.texture.clone(), bytes));
+            if let Ok(img) = decode_image(&bytes) {
+                textures.push((line.texture.clone(), img));
+            } else {
+                eprintln!("warning: decode texture {}", line.texture);
+            }
         }
     }
     let mut custom_textures = Vec::new();
@@ -393,17 +418,37 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
             for ext in &[".png", ".jpg"] {
                 let path = tex_dir.join(format!("{file}{ext}"));
                 if let Ok(bytes) = std::fs::read(&path) {
-                    custom_textures.push((format!("note:{key_suffix}"), bytes));
+                    if let Ok(img) = decode_image(&bytes) {
+                        custom_textures.push((format!("note:{key_suffix}"), img));
+                    }
                     break;
                 }
             }
         }
     }
-    let bg = std::fs::read(dir.join(&info.illustration)).ok();
+    // 背景:解码 + σ=8 高斯模糊(重活,放后台)。
+    let (bg, bg_dim) = match std::fs::read(dir.join(&info.illustration)) {
+        Ok(bytes) => {
+            let blurred = image::load_from_memory(&bytes)
+                .ok()
+                .map(|im| im.to_rgba8())
+                .map(|img| image::imageops::blur(&img, 8.0));
+            let bg = blurred.map(|img| {
+                let mut img = img;
+                image::imageops::flip_vertical_in_place(&mut img);
+                let (w, h) = (img.width().max(1), img.height().max(1));
+                DecodedImage { rgba: img.into_raw(), w, h }
+            });
+            (bg, info.background_dim)
+        }
+        Err(_) => (None, info.background_dim),
+    };
     let extra = std::fs::read(dir.join("extra.json")).ok()
         .and_then(|b| core::extra::parse_extra(&b).ok());
+    // 音频就绪等待也放后台(音乐解码可能慢)。
+    let audio = audio::spawn_audio_thread(Path::new("res"), &dir).ok();
 
-    Ok(LoadedChart { doc, name, textures, custom_textures, bg, extra })
+    Ok(LoadedChart { doc, name, textures, custom_textures, bg, bg_dim, extra, audio })
 }
 
 impl State {
@@ -693,20 +738,21 @@ impl State {
     }
 
     /// 主线程应用后台加载结果(renderer 相关的上传/创建)。
+    /// 纹理已预解码(RGBA),音频已就绪——这里只做 GPU 创建/上传,轻量。
     fn apply_loaded_chart(&mut self, loaded: LoadedChart) -> anyhow::Result<()> {
-        let LoadedChart { doc, name: _name, textures, custom_textures, bg, extra } = loaded;
+        let LoadedChart { doc, name: _name, textures, custom_textures, bg, bg_dim, extra, audio } = loaded;
         let info = doc.info().clone();
         self.renderer.set_line_length(info.line_length);
         let chart = core::chart::Chart::from_rpe_chart(doc.chart(), info.use_rpe_170_speed == Some(true))?;
         self.renderer.post.chart_dir = Some(self.chart_dir.clone());
-        for (k, bytes) in &textures {
-            if let Err(e) = self.renderer.load_texture(k, bytes) { eprintln!("warning: texture {k}: {e:#}"); }
+        for (k, img) in &textures {
+            self.renderer.load_texture_rgba(k, &img.rgba, img.w, img.h);
         }
-        for (k, bytes) in &custom_textures {
-            if let Err(e) = self.renderer.load_texture(k, bytes) { eprintln!("warning: custom {k}: {e:#}"); }
+        for (k, img) in &custom_textures {
+            self.renderer.load_texture_rgba(k, &img.rgba, img.w, img.h);
         }
         // res 内置 note 纹理(音符/命中特效)。splash 首次进谱面也走此路径,
-        // 必须在这里加载,否则音符贴图缺失。
+        // 必须在这里加载,否则音符贴图缺失。体积小,主线程解码可接受。
         let res_dir = PathBuf::from("res");
         for kind in ["click", "drag", "flick", "hold", "click_mh", "drag_mh", "flick_mh", "hold_mh", "hit_fx"] {
             let path = res_dir.join(format!("{kind}.png"));
@@ -715,10 +761,11 @@ impl State {
                 if let Err(e) = self.renderer.load_texture(&key, &bytes) { eprintln!("warning: {kind}: {e:#}"); }
             }
         }
-        if let Some(bytes) = &bg {
-            if let Err(e) = self.renderer.set_background(bytes, info.background_dim) { eprintln!("warning: bg: {e:#}"); }
+        if let Some(img) = &bg {
+            self.renderer.set_background_rgba(&img.rgba, img.w, img.h, bg_dim);
         }
-        self.audio = audio::spawn_audio_thread(res_dir.as_path(), &self.chart_dir).ok();
+        // 音频已在后台线程就绪(spawn_audio_thread 的 ready 等待不阻塞主线程)。
+        self.audio = audio;
 
         self.doc = doc;
         self.info = info;
