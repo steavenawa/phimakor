@@ -11,6 +11,7 @@ use phimakor::trace_span;
 use core::bpm::Triple;
 use core::edit::{ChartDocument, EventKind};
 use ui::panels::LayoutDef;
+use ui::widgets::Widget;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
@@ -100,6 +101,24 @@ struct State {
     /// keyframe row.
     eff_kf_var: Option<usize>,
     eff_kf_sel: Option<usize>,
+
+    // ── BPM panel (widgets 组件库试点,tool 4)──
+    /// 每帧从 ChartDocument 重建的 BPM 表单(持有交互焦点/拖拽状态)。
+    bpm_form: Option<ui::widgets::RealtimeForm>,
+    /// BPM 表单的交互焦点行(跨帧保留)。
+    bpm_focus: Option<usize>,
+    /// BPM 表单是否正在拖拽(滚轮/拖动期间不重建,避免状态丢失)。
+    bpm_dragging: bool,
+
+    // ── Settings panel (widgets 组件库,tool 2)──
+    /// 每帧从 SettingsData 重建的设置表单。
+    settings_form: Option<ui::widgets::RealtimeForm>,
+    /// 设置表单是否正在拖拽。
+    settings_dragging: bool,
+
+    // ── Line panel (widgets 组件库,tool 1)──
+    /// 线列表滚动条是否正在拖拽。
+    line_dragging: bool,
 }
 
 /// Target of an in-progress numeric edit (double-clicked value field).
@@ -173,6 +192,9 @@ impl App {
             splash_hover: ui::SplashHover::None, show_settings: false, settings,
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()),
             extra: None, selected_effect: None, eff_edit_field: 0, num_edit: None, last_eff_click: (std::time::Instant::now(), None, 0), eff_kf_var: None, eff_kf_sel: None,
+            bpm_form: None, bpm_focus: None, bpm_dragging: false,
+            settings_form: None, settings_dragging: false,
+            line_dragging: false,
         })
     }
 
@@ -256,6 +278,9 @@ impl App {
             cache_valid: false, cached_events: Arc::new(Vec::new()), cached_notes: Arc::new(Vec::new()), extra,
             selected_effect: None, eff_edit_field: 0, num_edit: None,
             last_eff_click: (std::time::Instant::now(), None, 0), eff_kf_var: None, eff_kf_sel: None,
+            bpm_form: None, bpm_focus: None, bpm_dragging: false,
+            settings_form: None, settings_dragging: false,
+            line_dragging: false,
         })
     }
 
@@ -558,6 +583,131 @@ impl State {
         self.selected_event_idx = None;
     }
 
+    /// 每帧重建 BPM 面板表单(从 ChartDocument),保留焦点/拖拽状态。
+    /// 若 overlay 已有表单(拖拽/滚轮中间态),保留其已编辑的值。
+    /// 注意:这里只构建用于绘制的表单,不写回文档(写回在 bpm_apply,
+    /// 由鼠标释放/滚轮事件调用,避开 render_frame 的 frame 借用)。
+    /// 调用时机:render_frame 内 frame 借用期间 → 拆成字段级操作,
+    /// 只用 `self.doc` 与 `self.overlay`(与 `self.chart` 借用不冲突)。
+    fn bpm_refresh_form(&mut self) {
+        // 注意:render_frame 里 `self.chart.state_at()` 持有对 self.chart
+        // 的可变借用,这里不能拿 `&mut self` 全量。字段级借用即可。
+        let s = self.gui_scale;
+        let pp = self.overlay.props_progress();
+        let pan_w = ui::PANEL_W * s;
+        let px = self.window.inner_size().width as f32 - pp * pan_w;
+        let py = 56.0 * s;
+        let focus = if self.bpm_dragging {
+            self.bpm_form.as_ref().and_then(|f| f.focus_row)
+        } else {
+            self.bpm_focus
+        };
+        // 拖拽/滚轮中:保留 overlay 表单的已编辑值(不重建)。
+        if self.bpm_dragging {
+            if let Some(form) = self.overlay.bpm_form.as_mut() {
+                form.x = px;
+                form.y = py;
+                form.w = pan_w;
+                return;
+            }
+        }
+        let rows: Vec<(f64, f64)> = self.doc.chart().bpm_list.iter()
+            .map(|b| (b.start_time.beats(), b.bpm)).collect();
+        let form = ui::bpm_panel::build_form(px, py, pan_w, &rows, focus, s);
+        self.overlay.bpm_form = Some(form);
+    }
+
+    /// 提交 BPM 表单改动(拖拽/滚轮结束、或面板切换时)。
+    fn bpm_apply(&mut self) {
+        let Some(form) = self.overlay.bpm_form.as_ref().map(|f| f.clone()) else { return };
+        let new_rows = ui::bpm_panel::rows_of(&form);
+        let old_rows: Vec<(f64, f64)> = self.doc.chart().bpm_list.iter()
+            .map(|b| (b.start_time.beats(), b.bpm)).collect();
+        if new_rows == old_rows {
+            return;
+        }
+        // 增:行数变多 → 末尾新增(Add 按钮的 "var{n}" 标签解析为 beat=0/bpm=0,
+        // 沿用最后一行)。
+        if new_rows.len() > old_rows.len() {
+            let n = old_rows.len();
+            let (last_beat, last_bpm) = old_rows.last().copied().unwrap_or((0.0, 120.0));
+            for (beat, bpm) in new_rows.iter().skip(n) {
+                let beat = if *beat == 0.0 { last_beat + 0.01 } else { *beat };
+                let bpm = if *bpm == 0.0 { last_bpm } else { *bpm };
+                let _ = self.doc.add_bpm(bpm, beat);
+            }
+        }
+        // 减:行数变少 → 删末尾(保留至少一行)。
+        if new_rows.len() < old_rows.len() {
+            while self.doc.chart().bpm_list.len() > new_rows.len().max(1) {
+                let last = self.doc.chart().bpm_list.len() - 1;
+                if self.doc.chart().bpm_list.len() <= 1 {
+                    break;
+                }
+                let _ = self.doc.remove_bpm(last);
+            }
+        }
+        // 替换:逐行 diff(值或起始拍变化)。
+        for (i, (beat, bpm)) in new_rows.iter().enumerate() {
+            let Some(item) = self.doc.chart().bpm_list.get(i) else { break };
+            if (bpm - item.bpm).abs() > 1e-9 || (beat - item.start_time.beats()).abs() > 1e-9 {
+                let _ = self.doc.replace_bpm(i, *bpm, *beat);
+            }
+        }
+        self.rebuild_chart();
+        self.cache_valid = false;
+        self.ui_dirty = true;
+    }
+
+    /// 每帧重建设置面板表单(从 SettingsData),保留拖拽状态。
+    /// 与 bpm_refresh_form 同:frame 借用期间字段级操作。
+    fn settings_refresh_form(&mut self) {
+        let s = self.gui_scale;
+        let pp = self.overlay.props_progress();
+        let pan_w = ui::PANEL_W * s;
+        let px = self.window.inner_size().width as f32 - pp * pan_w;
+        let py = 56.0 * s;
+        // 拖拽中:保留 overlay 表单的已编辑值(不重建)。
+        if self.settings_dragging {
+            if let Some(form) = self.overlay.settings_form.as_mut() {
+                form.x = px;
+                form.y = py;
+                form.w = pan_w;
+                return;
+            }
+        }
+        let mut form = ui::settings::build_settings_form(px, py, pan_w, s, &self.settings);
+        // 保留上次表单的 Combo open 状态(下拉展开期间不能被重建收起)。
+        if let Some(prev) = &self.overlay.settings_form {
+            for (a, b) in form.rows.iter_mut().zip(prev.rows.iter()) {
+                if let (ui::widgets::RTControl::Combo { open, .. }, ui::widgets::RTControl::Combo { open: prev_open, .. }) =
+                    (&mut a.1, &b.1)
+                {
+                    *open = *prev_open;
+                }
+            }
+        }
+        self.overlay.settings_form = Some(form);
+    }
+
+    /// 提交设置表单改动 → SettingsData + 应用(vsync/fullscreen/scale)+ 持久化。
+    fn settings_apply(&mut self) {
+        let Some(form) = self.overlay.settings_form.as_ref().map(|f| f.clone()) else { return };
+        if !ui::settings::apply_settings_form(&form, &mut self.settings) {
+            return;
+        }
+        // 应用即时生效的设置。
+        self.renderer.set_vsync(self.settings.vsync);
+        self.gui_scale = self.settings.gui_scale;
+        if self.settings.fullscreen {
+            self.window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        } else {
+            self.window.set_fullscreen(None);
+        }
+        save_settings(&self.settings);
+        self.ui_dirty = true;
+    }
+
     /// Print a memory breakdown to the console (F7, or PHIMAKOR_MEMLOG=1
     /// every 5 s). Tracks the allocations the app itself controls.
     /// `include_gpu`: the wgpu registry report walks internal registries under
@@ -707,6 +857,14 @@ impl State {
         static PERF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let perf = *PERF.get_or_init(|| std::env::var("PHIMAKOR_PERF").is_ok());
         let t_eval = std::time::Instant::now();
+        // BPM 面板(tool 4):每帧重建表单(在 frame 借用之前,避开借用冲突)。
+        if self.show_overlay && self.show_properties && self.overlay.selected_tool == 4 {
+            self.bpm_refresh_form();
+        }
+        // 设置面板(tool 2):每帧重建表单。
+        if self.show_overlay && self.show_properties && self.overlay.selected_tool == 2 {
+            self.settings_refresh_form();
+        }
         let frame = self.chart.state_at(chart_time);
 
         let pf_aspect = self.renderer.playfield_aspect();
@@ -873,6 +1031,69 @@ impl State {
             },
         };
         if self.show_overlay {
+            // Chart 面板(tool 0):元数据键值网格(每帧重建,实时值)。
+            if self.show_properties && self.overlay.selected_tool == 0 {
+                let s = self.gui_scale;
+                let pp = self.overlay.props_progress();
+                let pan_w = ui::PANEL_W * s;
+                let px = self.window.inner_size().width as f32 - pp * pan_w;
+                let py = 56.0 * s;
+                let mut grid = ui::widgets::KeyValueGrid::new(px, py, pan_w, vec![
+                    ("name".into(), self.info.name.clone()),
+                    ("composer".into(), self.info.composer.clone()),
+                    ("level".into(), self.info.level.clone()),
+                    ("difficulty".into(), format!("{:.1}", self.info.difficulty)),
+                    ("notes".into(), format!("{}", self.note_count)),
+                    ("duration".into(), format!("{:.2}s", duration)),
+                    ("fps".into(), format!("{:.0}", self.fps)),
+                    ("combo".into(), format!("{}", self.combo)),
+                    ("score".into(), format!("{:07}", score)),
+                ]);
+                grid.row_h = 22.0 * s;
+                grid.gap = 4.0 * s;
+                grid.title = "Chart".to_string();
+                self.overlay.chart_grid = Some(grid);
+            }
+            // Line 面板(tool 1):实时线数据滚动列表(每帧从 frame 构建)。
+            if self.show_properties && self.overlay.selected_tool == 1 {
+                let s = self.gui_scale;
+                let pp = self.overlay.props_progress();
+                let pan_w = ui::PANEL_W * s;
+                let px = self.window.inner_size().width as f32 - pp * pan_w;
+                // 面板上方配置信息高度:约 28+8*22*s,列表从下方开始。
+                let py = (28.0 + 8.0 * 22.0) * s + 4.0 * s;
+                let vh = self.window.inner_size().height as f32;
+                let list_h = (vh - 48.0 * s - py).max(60.0);
+                let visible = (list_h / (22.0 * s + 4.0 * s)) as usize;
+                let labels: Vec<String> = frame.lines.iter().enumerate().map(|(i, l)| {
+                    let name = self.doc.chart().judge_line_list.get(i)
+                        .map(|jl| jl.name.as_str()).unwrap_or("");
+                    format!("L{i} {name} x:{:.1} y:{:.1} r:{:.0}° a:{:.2}",
+                        l.position[0], l.position[1],
+                        l.rotation.to_degrees() % 360.0, l.alpha)
+                }).collect();
+                let mut list = ui::widgets::ScrollList::new(px, py, pan_w, frame.lines.len(), visible.max(1));
+                list.row_h = 22.0 * s;
+                list.gap = 4.0 * s;
+                list.labels = labels;
+                list.selected = Some(self.selected_line);
+                // 保留滚动位置;仅当选中的线变化时,才对齐使其可见
+                // (手动滚轮/拖拽滚动不应被每帧重建拉回去)。
+                let prev_scroll = self.overlay.line_list.as_ref().map(|l| l.scroll).unwrap_or(0.0);
+                let prev_selected = self.overlay.line_list.as_ref().and_then(|l| l.selected);
+                list.scroll = prev_scroll.clamp(0.0, list.max_scroll_pub());
+                if prev_selected != list.selected {
+                    if let Some(sel) = list.selected {
+                        let top = sel as f32;
+                        if top < list.scroll { list.scroll = top; }
+                        let bottom = top + 1.0;
+                        if bottom > list.scroll + visible as f32 {
+                            list.scroll = (bottom - visible as f32).max(0.0);
+                        }
+                    }
+                }
+                self.overlay.line_list = Some(list);
+            }
             if let Some(ev_idx) = self.overlay.take_timeline_click(&info, self.overlay.props_progress()) {
                 self.selected_event_idx = Some(ev_idx); self.ui_dirty = true;
             }
@@ -1233,6 +1454,55 @@ impl ApplicationHandler for App {
                         } else {
                             state.eff_wheel(dy);
                         }
+                    } else if !state.splash_mode
+                        && state.show_properties
+                        && state.overlay.selected_tool == 4
+                        && state.overlay.mouse_pos.is_some_and(|(mx, _)| {
+                            let s = state.overlay.gui_scale;
+                            let pp = state.overlay.props_progress();
+                            let pan_w = ui::PANEL_W * s;
+                            let props_x = state.window.inner_size().width as f32 - pp * pan_w;
+                            mx >= props_x && mx <= props_x + pan_w
+                        })
+                    {
+                        // BPM 面板滚轮:焦点行 Number 步进(组件库 on_wheel)。
+                        if let Some(form) = state.overlay.bpm_form.as_mut() {
+                            let focus = form.focus_row;
+                            form.on_wheel(dy);
+                            state.bpm_focus = focus.or(form.focus_row);
+                        }
+                        state.bpm_apply();
+                    } else if !state.splash_mode
+                        && state.show_properties
+                        && state.overlay.selected_tool == 2
+                        && state.overlay.mouse_pos.is_some_and(|(mx, _)| {
+                            let s = state.overlay.gui_scale;
+                            let pp = state.overlay.props_progress();
+                            let pan_w = ui::PANEL_W * s;
+                            let props_x = state.window.inner_size().width as f32 - pp * pan_w;
+                            mx >= props_x && mx <= props_x + pan_w
+                        })
+                    {
+                        // 设置面板滚轮(拖拽中由 on_drag 处理;非拖拽用焦点行步进)。
+                        if let Some(form) = state.overlay.settings_form.as_mut() {
+                            form.on_wheel(dy);
+                        }
+                        state.settings_apply();
+                    } else if !state.splash_mode
+                        && state.show_properties
+                        && state.overlay.selected_tool == 1
+                        && state.overlay.mouse_pos.is_some_and(|(mx, _)| {
+                            let s = state.overlay.gui_scale;
+                            let pp = state.overlay.props_progress();
+                            let pan_w = ui::PANEL_W * s;
+                            let props_x = state.window.inner_size().width as f32 - pp * pan_w;
+                            mx >= props_x && mx <= props_x + pan_w
+                        })
+                    {
+                        // Line 面板滚轮:滚动线列表。
+                        if let Some(list) = state.overlay.line_list.as_mut() {
+                            list.on_wheel(dy);
+                        }
                     } else if (state.show_events || state.show_notes) && state.overlay.is_over_timeline(state.overlay.props_progress()) {
                         if state.ctrl {
                             state.overlay.timeline_zoom_in(dy);
@@ -1482,9 +1752,40 @@ impl ApplicationHandler for App {
                                 state.ui_dirty = true;
                             }
                         }
-                        _ => {}
+                         _ => {}
+                         }
+                        // BPM 面板(tool 4)键盘:数字/退格/Enter/Esc/Tab/方向键
+                        // 转发到组件库 on_key(仅在 BPM 面板显示且有焦点行时)。
+                        if state.show_properties && state.overlay.selected_tool == 4
+                            && state.overlay.bpm_form.as_ref().is_some_and(|f| f.focus_row.is_some())
+                            && !state.ctrl
+                        {
+                            let k = match code {
+                                KeyCode::Backspace => Some(ui::widgets::WidgetKey::Backspace),
+                                KeyCode::Enter | KeyCode::NumpadEnter => Some(ui::widgets::WidgetKey::Enter),
+                                KeyCode::Escape => Some(ui::widgets::WidgetKey::Escape),
+                                KeyCode::Tab => Some(ui::widgets::WidgetKey::Tab),
+                                KeyCode::ArrowLeft => Some(ui::widgets::WidgetKey::Left),
+                                KeyCode::ArrowRight => Some(ui::widgets::WidgetKey::Right),
+                                KeyCode::Home => Some(ui::widgets::WidgetKey::Home),
+                                KeyCode::End => Some(ui::widgets::WidgetKey::End),
+                                _ => match &event.logical_key {
+                                    winit::keyboard::Key::Character(s) => s.chars().next()
+                                        .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                                        .map(ui::widgets::WidgetKey::Char),
+                                    _ => None,
+                                },
+                            };
+                            if let Some(k) = k {
+                                if let Some(form) = state.overlay.bpm_form.as_mut() {
+                                    form.on_key(k);
+                                    state.bpm_focus = form.focus_row;
+                                }
+                                state.bpm_apply();
+                                return;
+                            }
                         }
-                    },
+                     },
                     ElementState::Released => {
                         if code == KeyCode::ControlLeft || code == KeyCode::ControlRight {
                             state.ctrl = false;
@@ -1517,6 +1818,51 @@ impl ApplicationHandler for App {
                     state.splash_hover = ui::splash_hit_test(mx, my, vw, vh, gs, filtered_len, state.show_settings, state.splash_scroll);
                 }
                 state.overlay.handle_cursor(position.x, position.y);
+                // Chart 面板 hover。
+                if state.show_properties && state.overlay.selected_tool == 0 {
+                    let (mx, my) = (position.x as f32, position.y as f32);
+                    state.overlay.chart_grid_hover = state.overlay.chart_grid.as_ref()
+                        .and_then(|g| g.hit_area((mx, my)));
+                }
+                // Line 面板:滚动条拖拽中转发 on_drag;hover 命中更新。
+                if state.show_properties && state.overlay.selected_tool == 1 {
+                    let (mx, my) = (position.x as f32, position.y as f32);
+                    if state.line_dragging {
+                        if let Some(list) = state.overlay.line_list.as_mut() {
+                            list.on_drag((mx, my));
+                        }
+                    } else {
+                        state.overlay.line_list_hover = state.overlay.line_list.as_ref()
+                            .and_then(|l| l.hit_area((mx, my)));
+                    }
+                }
+                // 设置面板:拖拽中转发 on_drag;hover 命中更新。
+                if state.show_properties && state.overlay.selected_tool == 2 {
+                    let (mx, my) = (position.x as f32, position.y as f32);
+                    if state.settings_dragging {
+                        if let Some(form) = state.overlay.settings_form.as_mut() {
+                            form.on_drag((mx, my));
+                        }
+                    } else {
+                        state.overlay.settings_hover = state.overlay.settings_form.as_ref()
+                            .and_then(|f| f.hit_area((mx, my)));
+                    }
+                }
+                // BPM 面板:拖拽中转发 on_drag;hover 命中更新。
+                if state.show_properties && state.overlay.selected_tool == 4 {
+                    let (mx, my) = (position.x as f32, position.y as f32);
+                    if state.bpm_dragging {
+                        if let Some(form) = state.overlay.bpm_form.as_mut() {
+                            form.on_drag((mx, my));
+                            // 拖拽期间直接写回(值实时生效,但保留拖动行焦点)
+                            let focus = form.focus_row;
+                            state.bpm_focus = focus;
+                        }
+                    } else {
+                        state.overlay.bpm_hover = state.overlay.bpm_form.as_ref()
+                            .and_then(|f| f.hit_area((mx, my)));
+                    }
+                }
                 if state.overlay.seek_dragging && state.show_overlay {
                     let s = state.overlay.gui_scale;
                     let pp = state.overlay.props_progress();
@@ -1542,9 +1888,63 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                // Line panel (tool 1):按滚动条 → 拖拽滚动。
+                if btn_state == ElementState::Pressed
+                    && state.show_properties
+                    && state.overlay.selected_tool == 1
+                {
+                    if let Some((mx, my)) = state.overlay.mouse_pos {
+                        if let Some(list) = state.overlay.line_list.as_ref() {
+                            if let Some(a) = list.hit_area((mx, my)) {
+                                if a.kind == ui::widgets::AreaKind::ScrollBar {
+                                    state.line_dragging = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Settings panel (tool 2): press starts a drag on Slider rows.
+                // on_click 只在释放时发一次(Toggle 不会切两次)。
+                if btn_state == ElementState::Pressed
+                    && state.show_properties
+                    && state.overlay.selected_tool == 2
+                {
+                    if let Some((mx, my)) = state.overlay.mouse_pos {
+                        let hit = state.overlay.settings_form.as_ref().and_then(|f| f.hit_area((mx, my)));
+                        if let Some(a) = hit {
+                            if matches!(a.kind, ui::widgets::AreaKind::SliderTrack) {
+                                state.settings_dragging = true;
+                                // Slider 行点击即定位值(on_click 内处理,无副作用)。
+                                if let Some(form) = state.overlay.settings_form.as_mut() {
+                                    form.on_click((mx, my));
+                                }
+                            }
+                        }
+                    }
+                }
                 // Eff panel (tool 3) click handling — releases only, so the
                 // press (which the overlay may consume) and the release land
                 // in the same spot.
+                // BPM panel (tool 4): press starts a drag when hitting a
+                // Number row (live value editing). on_click 只在释放时发一次,
+                // 避免 Toggle 被按下/释放切两次。
+                if btn_state == ElementState::Pressed
+                    && state.show_properties
+                    && state.overlay.selected_tool == 4
+                {
+                    if let Some((mx, my)) = state.overlay.mouse_pos {
+                        let hit = state.overlay.bpm_form.as_ref().and_then(|f| f.hit_area((mx, my)));
+                        if let Some(a) = hit {
+                            if matches!(a.kind, ui::widgets::AreaKind::Field | ui::widgets::AreaKind::SliderTrack) {
+                                state.bpm_dragging = true;
+                                // 初始化拖动锚点(last_x),使首次 on_drag 增量正确。
+                                if let Some(form) = state.overlay.bpm_form.as_mut() {
+                                    form.on_click((mx, my));
+                                }
+                            }
+                        }
+                    }
+                }
                 if btn_state == ElementState::Released
                     && state.show_properties
                     && state.overlay.selected_tool == 3
@@ -1620,6 +2020,59 @@ impl ApplicationHandler for App {
                                 state.ui_dirty = true;
                             }
                             ui::EffHit::None => {}
+                        }
+                    }
+                }
+                // BPM panel (tool 4) click handling — component-library driven.
+                if btn_state == ElementState::Released
+                    && state.show_properties
+                    && state.overlay.selected_tool == 4
+                {
+                    if let Some((mx, my)) = state.overlay.mouse_pos {
+                        let mut applied = false;
+                        if let Some(form) = state.overlay.bpm_form.as_mut() {
+                            form.on_click((mx, my));
+                            applied = true;
+                        }
+                        // Add 按钮行为:行数超出 → 新行(apply 里处理)。
+                        if applied {
+                            state.bpm_dragging = false;
+                            state.bpm_focus = state.overlay.bpm_form.as_ref().and_then(|f| f.focus_row);
+                            state.bpm_apply();
+                        }
+                    }
+                }
+                // Settings panel (tool 2) click handling.
+                if btn_state == ElementState::Released
+                    && state.show_properties
+                    && state.overlay.selected_tool == 2
+                {
+                    if let Some((mx, my)) = state.overlay.mouse_pos {
+                        if let Some(form) = state.overlay.settings_form.as_mut() {
+                            form.on_click((mx, my));
+                        }
+                        state.settings_dragging = false;
+                        state.settings_apply();
+                    }
+                }
+                // Line panel (tool 1):点击线列表行 → 选中该线。
+                if btn_state == ElementState::Released
+                    && state.show_properties
+                    && state.overlay.selected_tool == 1
+                {
+                    state.line_dragging = false;
+                    if let Some((mx, my)) = state.overlay.mouse_pos {
+                        if let Some(list) = state.overlay.line_list.as_mut() {
+                            let before = list.selected;
+                            list.on_click((mx, my));
+                            if let Some(sel) = list.selected {
+                                if sel != state.selected_line {
+                                    state.selected_line = sel;
+                                    state.cache_valid = false;
+                                    state.ui_dirty = true;
+                                    let _ = before;
+                                }
+                            }
                         }
                     }
                 }
@@ -2119,6 +2572,9 @@ mod zip_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+
+
 
 
 

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 pub mod panels;
 pub mod widgets;
+use widgets::Widget as _;
 use phimakor::trace_span;
 
 // Global font fallback chain: the first font that has a glyph for a given
@@ -19,6 +20,7 @@ use phimakor::trace_span;
 // they load LAZILY, one at a time, and only up to the first font that covers
 // the requested glyph: a Chinese chart name touches msyh.ttc and stops there.
 
+pub mod bpm_panel;
 pub mod font;
 pub mod model;
 pub mod panel_ui;
@@ -87,8 +89,20 @@ pub struct IcedOverlay {
     tl_visible: bool,
     tool_hover: Option<usize>,
     pub selected_tool: usize,
-    tool_hover_progress: [f32; 4],
+    tool_hover_progress: [f32; 5],
     panel_defs: Vec<panels::PanelDef>,
+    /// BPM 面板组件(组件库试点,tool 4)。由 main.rs 每帧构建/更新。
+    pub bpm_form: Option<widgets::RealtimeForm>,
+    pub bpm_hover: Option<widgets::Area>,
+    /// 设置面板组件(组件库,tool 2)。由 main.rs 每帧构建/更新。
+    pub settings_form: Option<widgets::RealtimeForm>,
+    pub settings_hover: Option<widgets::Area>,
+    /// Line 面板的实时线数据滚动列表(tool 1)。main.rs 每帧构建。
+    pub line_list: Option<widgets::ScrollList>,
+    pub line_list_hover: Option<widgets::Area>,
+    /// Chart 面板的元数据网格(tool 0)。main.rs 每帧构建。
+    pub chart_grid: Option<widgets::KeyValueGrid>,
+    pub chart_grid_hover: Option<widgets::Area>,
     pub messages: Vec<OverlayMessage>,
     timeline_click: Option<f32>,
     layer_click: Option<f32>,
@@ -136,8 +150,8 @@ impl IcedOverlay {
             clip_mask: tiny_skia::Mask::new(w.max(1), h.max(1)).unwrap(),
             w: w.max(1), h: h.max(1), panel_progress: 0.0, events_progress: 0.0,
             notes_progress: 0.0, mouse_pos: None, show_overlay: true, tl_visible: false,
-            tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 4],
-            panel_defs: Vec::new(), messages: Vec::new(), timeline_click: None,
+            tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 5],
+            panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, messages: Vec::new(), timeline_click: None,
             layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, gui_scale: 1.0,
             timeline_dirty: false,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
@@ -210,7 +224,7 @@ impl IcedOverlay {
         let max_hp = self.tool_hover_progress.iter().cloned().reduce(f32::max).unwrap_or(0.0);
         let bg_extra = max_hp * 100.0 * s;
         let _bg_w = QP_W * s + bg_extra;
-        for i in 0..4 {
+        for i in 0..5 {
             let y0 = gap + i as f32 * (btn_base + gap);
             let extra = self.tool_hover_progress[i] * 80.0 * s;
             let bw = btn_base + extra;
@@ -360,19 +374,6 @@ impl IcedOverlay {
             }
             if let Some(i) = self.tool_hover {
                 self.selected_tool = i; return;
-            }
-            // Settings panel: toggle vsync on click
-            if !pressed && self.selected_tool == 2 && self.panel_progress > 0.5 {
-                let pp = self.panel_progress;
-                let pan_w = PANEL_W * s;
-                let pan_x = self.w as f32 - pp * pan_w;
-                if mx >= pan_x && mx <= pan_x + pan_w {
-                    let cell_h = 22.0 * s;
-                    let vsync_y = 28.0 * s + cell_h * (2.0 + 2.0 + 1.0 + 1.0 + 1.6 + 2.0 + 1.6);
-                    if my >= vsync_y && my <= vsync_y + cell_h * 2.0 {
-                        self.messages.push(OverlayMessage::ToggleVsync); return;
-                    }
-                }
             }
             self.timeline_click = Some(mx);
         }
@@ -734,7 +735,7 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
     }
 
     fn animate_tool_hover(&mut self) {
-        for i in 0..4 {
+        for i in 0..5 {
             let target = if self.tool_hover == Some(i) { 1.0 } else { 0.0 };
             let d = target - self.tool_hover_progress[i];
             if d.abs() > 0.005 {
@@ -855,6 +856,34 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         if info.show_properties && pp > 0.01 {
             if self.selected_tool == 3 {
                 draw_effects_panel(&mut self.pixmap.as_mut(), info, props_x, vw, vh, s);
+            } else if self.selected_tool == 4 {
+                if let Some(form) = &self.bpm_form {
+                    bpm_panel::draw_bpm_panel(&mut self.pixmap.as_mut(), form, self.bpm_hover.as_ref(), s);
+                }
+            } else if self.selected_tool == 2 {
+                if let Some(form) = &self.settings_form {
+                    bpm_panel::draw_bpm_panel(&mut self.pixmap.as_mut(), form, self.settings_hover.as_ref(), s);
+                }
+            } else if self.selected_tool == 0 {
+                // Chart 面板:元数据键值网格(组件库 KeyValueGrid)。
+                if let Some(grid) = &self.chart_grid {
+                    let mut cv = bpm_panel::SkiaCanvas { pm: &mut self.pixmap.as_mut() };
+                    let theme = widgets::Theme::default().scaled(s);
+                    grid.draw(&mut cv, &theme, self.chart_grid_hover.as_ref());
+                    grid.draw_overlay(&mut cv, &theme, self.chart_grid_hover.as_ref());
+                }
+            } else if self.selected_tool == 1 {
+                // Line 面板:上方保留配置信息,下方实时线数据滚动列表。
+                let idx = self.selected_tool.min(self.panel_defs.len().max(1) - 1);
+                if let Some(def) = self.panel_defs.get(idx) {
+                    draw_panel_def(&mut self.pixmap.as_mut(), def, info, props_x, vw, vh, s);
+                }
+                if let Some(list) = &self.line_list {
+                    let mut cv = bpm_panel::SkiaCanvas { pm: &mut self.pixmap.as_mut() };
+                    let theme = widgets::Theme::default().scaled(s);
+                    list.draw(&mut cv, &theme, self.line_list_hover.as_ref());
+                    list.draw_overlay(&mut cv, &theme, self.line_list_hover.as_ref());
+                }
             } else {
                 let idx = self.selected_tool.min(self.panel_defs.len().max(1) - 1);
                 if let Some(def) = self.panel_defs.get(idx) {

@@ -42,3 +42,74 @@ pub fn backend_cycle(backend: &Option<String>) -> Option<String> {
         _ => Some("dx12".to_string()),
     }
 }
+
+// ── 设置面板(widgets 组件库,挂在 tool 2)──
+
+use super::widgets::{RTControl, RealtimeForm};
+
+/// GUI scale 的滑条映射范围。
+const SCALE_MIN: f32 = 0.5;
+const SCALE_MAX: f32 = 2.0;
+
+/// 从 SettingsData 构建设置表单。
+pub fn build_settings_form(x: f32, y: f32, w: f32, s: f32, settings: &SettingsData) -> RealtimeForm {
+    let gui_scale = ((settings.gui_scale - SCALE_MIN) / (SCALE_MAX - SCALE_MIN)).clamp(0.0, 1.0);
+    let backend_idx = match settings.backend.as_deref() {
+        Some("dx12") => 1,
+        Some("vulkan") => 2,
+        Some("gl") => 3,
+        _ => 0,
+    };
+    let mut form = RealtimeForm::new(x, y, w, "Settings", vec![
+        ("gui scale".into(), RTControl::Slider { value: gui_scale }),
+        ("vsync".into(), RTControl::Toggle { on: settings.vsync, anim: if settings.vsync { 1.0 } else { 0.0 }, dir: if settings.vsync { 1.0 } else { -1.0 } }),
+        ("fullscreen".into(), RTControl::Toggle { on: settings.fullscreen, anim: if settings.fullscreen { 1.0 } else { 0.0 }, dir: if settings.fullscreen { 1.0 } else { -1.0 } }),
+        ("backend".into(), RTControl::Combo { items: vec!["Auto".into(), "DX12".into(), "Vulkan".into(), "GL".into()], selected: backend_idx, open: false }),
+    ]);
+    form.row_h = 24.0 * s;
+    form.gap = 4.0 * s;
+    form
+}
+
+/// 把设置表单的当前值应用到 SettingsData(返回是否有变化)。
+/// `backend` 变化需要重启渲染器才生效,单独标记。
+pub fn apply_settings_form(form: &RealtimeForm, settings: &mut SettingsData) -> bool {
+    let mut changed = false;
+    for (label, ctrl) in &form.rows {
+        match (label.as_str(), ctrl) {
+            ("gui scale", RTControl::Slider { value }) => {
+                let v = SCALE_MIN + value.clamp(0.0, 1.0) * (SCALE_MAX - SCALE_MIN);
+                if (v - settings.gui_scale).abs() > 0.005 {
+                    settings.gui_scale = v;
+                    changed = true;
+                }
+            }
+            ("vsync", RTControl::Toggle { on, .. }) => {
+                if *on != settings.vsync {
+                    settings.vsync = *on;
+                    changed = true;
+                }
+            }
+            ("fullscreen", RTControl::Toggle { on, .. }) => {
+                if *on != settings.fullscreen {
+                    settings.fullscreen = *on;
+                    changed = true;
+                }
+            }
+            ("backend", RTControl::Combo { selected, .. }) => {
+                let v = match selected {
+                    1 => Some("dx12".to_string()),
+                    2 => Some("vulkan".to_string()),
+                    3 => Some("gl".to_string()),
+                    _ => None,
+                };
+                if v != settings.backend {
+                    settings.backend = v;
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
+}

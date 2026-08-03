@@ -328,7 +328,7 @@ pub(crate) fn draw_effects_panel(pixmap: &mut tiny_skia::PixmapMut, info: &GameI
     }
 }
 
-pub(crate) fn draw_quick_panel(pixmap: &mut tiny_skia::PixmapMut, _tool_hover: Option<usize>, selected_tool: usize, hp: [f32; 4], info: &GameInfo, qp_w: f32, vw: f32, vh: f32, s: f32) {
+pub(crate) fn draw_quick_panel(pixmap: &mut tiny_skia::PixmapMut, _tool_hover: Option<usize>, selected_tool: usize, hp: [f32; 5], info: &GameInfo, qp_w: f32, vw: f32, vh: f32, s: f32) {
     let _s = trace_span!("draw_quick_panel");
     if !info.show_overlay { return; }
     if vh < 10.0 || vw < 10.0 { return; }
@@ -345,11 +345,12 @@ pub(crate) fn draw_quick_panel(pixmap: &mut tiny_skia::PixmapMut, _tool_hover: O
         fill_rect_clipped(pixmap, r, &bg);
     }
 
-    let tools: [(&str, [u8; 3]); 4] = [
+    let tools: [(&str, [u8; 3]); 5] = [
         ("Chart",  [100, 200, 255]),
         ("Line",   [100, 220, 100]),
         ("Settings", [180, 180, 190]),
         ("Eff",    [255, 150, 100]),
+        ("BPM",    [220, 180, 255]),
     ];
 
     let btn_base = 34.0 * s;
