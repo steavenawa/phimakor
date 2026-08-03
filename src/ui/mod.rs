@@ -30,6 +30,7 @@ pub mod settings;
 pub mod splash;
 pub mod text;
 pub mod timeline;
+pub mod timeline_draw;
 
 pub use font::font_mem_bytes;
 pub use model::{gameinfo_values, EffectRow, EventEntry, GameInfo, KfRow, NoteEntry};
@@ -797,148 +798,28 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         // directly from redraw_timeline's playing/animation path — without the
         // fill, the previous frame's playhead lines/notes/seek fill would
         // remain and ghost under the new content.
-        self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
+        // PMCORE-55:绘制拆成纯函数(timeline_draw),快照 → Pixmap → 上传。
         self.animate_all();
         self.notes_cache = info.notes.clone();
-        let s = self.gui_scale;
-        let vw = self.w as f32;
-        let vh = self.h as f32;
-        let ep = self.events_progress;
-        let np = self.notes_progress;
-        let pp = self.panel_progress;
-        let qp_w = QP_W * s;
-        let pan_w = PANEL_W * s;
-        let ev_w = TL_W * s;
-        let nt_w = NT_W * s;
-
-        // Left toolbar always visible (no animation)
-        draw_quick_panel(&mut self.pixmap.as_mut(), self.tool_hover, self.selected_tool, self.tool_hover_progress, info, qp_w, vw, vh, s);
-
-        // Layout: [QP] [Playfield] [Events→] [Notes→] [Properties→]
-        let props_x = vw - pp * pan_w;
-        let events_x = props_x - ep * ev_w;  // Events next to Properties
-        let notes_x = events_x - np * nt_w;  // Notes left of Events
-
-        if self.tl_visible {
-            if self.tl_follow {
-                self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
-            } else {
-                // 手动滚动后播放头跑出可视窗口 → 重新跟随播放头。
-                let b = info.chart_beat as f32;
-                if b < self.tl_scroll || b > self.tl_scroll + self.tl_zoom {
-                    self.tl_follow = true;
-                }
-            }
-            let _s2 = trace_span!("tl_notes_draw");
-            if info.show_notes {
-                draw_notes_timeline(&mut self.pixmap.as_mut(), self.tl_scroll, self.tl_zoom, info, notes_x, vh, s);
-            }
-            drop(_s2);
-            let _s3 = trace_span!("tl_events_draw");
-            if info.show_events {
-                draw_5col_timeline(&mut self.pixmap.as_mut(), self.tl_scroll, self.tl_zoom, info, events_x, vh, s);
-            }
-            drop(_s3);
+        // 播放中 tl_follow 滚动更新(纯函数内也更新,但这里先同步一次,
+        // 让 hit-test/其他逻辑读到最新值)。
+        if self.tl_visible && self.tl_follow {
+            self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
         }
-        // Selection rect (Ctrl+drag) + seek bar + context menu
-        {
-            let mut pm = self.pixmap.as_mut();
-            if let (Some(s), Some(e)) = (self.select_start, self.select_end) {
-                let mut sel = tiny_skia::Paint::default();
-                sel.set_color_rgba8(100, 150, 255, 60);
-                let rx = s.0.min(e.0);
-                let ry = s.1.min(e.1);
-                let rw = (s.0 - e.0).abs();
-                let rh = (s.1 - e.1).abs();
-                if rw > 2.0 && rh > 2.0 {
-                    if let Some(r) = tiny_skia::Rect::from_xywh(rx, ry, rw, rh) {
-                        fill_rect_clipped(&mut pm, r, &sel);
-                    }
-                }
-            }
-            if self.ctx_progress > 0.01 {
-                let (mx, my) = self.ctx_pos.unwrap_or((0.0, 0.0));
-                let mw = 160.0 * s; let mh = 120.0 * s;
-                let alpha = (self.ctx_progress * 230.0) as u8;
-                let mut mp = tiny_skia::Paint::default();
-                mp.set_color_rgba8(25, 25, 30, alpha);
-                if let Some(r) = tiny_skia::Rect::from_xywh(mx.min(vw - mw), my.min(vh - mh), mw, mh) {
-                    fill_rect_clipped(&mut pm, r, &mp);
-                }
-            }
-            // Seek bar: thin strip above bottom buttons, full playfield width
-            if info.show_overlay {
-                let sb_h = 12.0 * s;
-                let sb_y = vh - 56.0 * s;
-                let sb_x = qp_w;
-                let sb_w = (props_x - sb_x).max(20.0);
-                let mut sbg = tiny_skia::Paint::default();
-                sbg.set_color_rgba8(40, 45, 55, 200);
-                if let Some(r) = tiny_skia::Rect::from_xywh(sb_x, sb_y, sb_w, sb_h) {
-                    fill_rect_clipped(&mut pm, r, &sbg);
-                }
-                let prog = (info.chart_time / info.duration.max(0.01)) as f32;
-                if prog > 0.01 {
-                    let mut fp = tiny_skia::Paint::default();
-                    fp.set_color_rgba8(100, 180, 255, 200);
-                    if let Some(r) = tiny_skia::Rect::from_xywh(sb_x + 1.0 * s, sb_y + 1.0 * s, (sb_w - 2.0 * s) * prog.min(1.0), (sb_h - 2.0 * s).max(1.0)) {
-                        fill_rect_clipped(&mut pm, r, &fp);
-                    }
-                }
-            }
-        }
-
-        // Render panel definition matching selected tool
-        if info.show_properties && pp > 0.01 {
-            if self.selected_tool == 3 {
-                draw_effects_panel(&mut self.pixmap.as_mut(), info, props_x, vw, vh, s);
-            } else if self.selected_tool == 4 {
-                if let Some(form) = &self.bpm_form {
-                    bpm_panel::draw_bpm_panel(&mut self.pixmap.as_mut(), form, self.bpm_hover.as_ref(), s);
-                }
-            } else if self.selected_tool == 2 {
-                if let Some(form) = &self.settings_form {
-                    bpm_panel::draw_bpm_panel(&mut self.pixmap.as_mut(), form, self.settings_hover.as_ref(), s);
-                }
-            } else if self.selected_tool == 0 {
-                // Chart 面板:元数据键值网格(组件库 KeyValueGrid)。
-                if let Some(grid) = &self.chart_grid {
-                    let mut cv = bpm_panel::SkiaCanvas { pm: &mut self.pixmap.as_mut() };
-                    let theme = widgets::Theme::default().scaled(s);
-                    grid.draw(&mut cv, &theme, self.chart_grid_hover.as_ref());
-                    grid.draw_overlay(&mut cv, &theme, self.chart_grid_hover.as_ref());
-                }
-            } else if self.selected_tool == 1 {
-                // Line 面板:上方保留配置信息,下方实时线数据滚动列表。
-                let idx = self.selected_tool.min(self.panel_defs.len().max(1) - 1);
-                if let Some(def) = self.panel_defs.get(idx) {
-                    draw_panel_def(&mut self.pixmap.as_mut(), def, info, props_x, vw, vh, s);
-                }
-                if let Some(list) = &self.line_list {
-                    let mut cv = bpm_panel::SkiaCanvas { pm: &mut self.pixmap.as_mut() };
-                    let theme = widgets::Theme::default().scaled(s);
-                    list.draw(&mut cv, &theme, self.line_list_hover.as_ref());
-                    list.draw_overlay(&mut cv, &theme, self.line_list_hover.as_ref());
-                }
-            } else {
-                let idx = self.selected_tool.min(self.panel_defs.len().max(1) - 1);
-                if let Some(def) = self.panel_defs.get(idx) {
-                    draw_panel_def(&mut self.pixmap.as_mut(), def, info, props_x, vw, vh, s);
-                }
-            }
-        }
-        // Floating menu (topmost)
-        if info.show_menu {
-            draw_menu(&mut self.pixmap.as_mut(), vw, vh, s);
-        }
+        let mut st = timeline_draw::TimelineDrawState::from_overlay(self);
+        let pm = timeline_draw::draw_timeline_pixmap(&st, info);
+        // 回写纯函数内可能更新的滚动状态(手动滚动后的重新跟随)。
+        self.tl_scroll = st.tl_scroll;
+        self.tl_follow = st.tl_follow;
+        // 拷贝到 overlay pixmap(上传源),并同步 playhead-free base。
+        self.pixmap.data_mut().copy_from_slice(pm.data());
+        self.base_pixmap.data_mut().copy_from_slice(pm.data());
         queue.write_texture(
             wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             self.pixmap.data(),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
             wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
         );
-        // Sync the playhead-free base for per-frame redraw_timeline.
-        self.base_pixmap.data_mut().copy_from_slice(self.pixmap.data());
     }
 }
 
