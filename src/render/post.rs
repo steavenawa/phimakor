@@ -308,9 +308,66 @@ impl PostPipe {
         let _s = crate::trace_span!("post_apply");
         if self.active.is_empty() { return; }
 
+        // 优化(PMCORE-53/54):裁剪无效 pass。
+        // 1) 零强度特效(主参数 = 0 时输出与输入相同)直接跳过;
+        // 2) 连续完全相同的实例只保留一个。
+        let mut active: Vec<&ActiveEffect> = Vec::with_capacity(self.active.len());
+        let mut prev_key: Option<(usize, Option<&str>, &[f32])> = None;
+        for ae in &self.active {
+            if is_effect_noop(ae) {
+                continue;
+            }
+            let key = (ae.shader_idx, ae.custom_name.as_deref(), ae.uniform_values.as_slice());
+            if prev_key == Some(key) {
+                continue; // 连续重复实例去重
+            }
+            prev_key = Some(key);
+            active.push(ae);
+        }
+        if active.is_empty() {
+            // 全部裁剪:输出 = 输入。做一次 src→target blit 保持
+            // last_view() 语义(调用方随后 blit 到 surface)。
+            let Some(blit) = &self.blit_pipeline else { self.last_output = 0; return };
+            let bg = {
+                let view_key = src as *const wgpu::TextureView as usize;
+                match self.blit_bgs.get(&view_key) {
+                    Some(bg) => bg.clone(),
+                    None => {
+                        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("blit-bg"),
+                            layout: &self.screen_bgl,
+                            entries: &[
+                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
+                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                            ],
+                        });
+                        self.blit_bgs.insert(view_key, bg.clone());
+                        bg
+                    }
+                }
+            };
+            let out = self.target_views[0].as_ref().unwrap();
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("effect-noop-blit"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: out,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(blit);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+            drop(pass);
+            self.last_output = 0;
+            return;
+        }
+
         // Phase 1: ensure all pipelines exist
         // Copy active descriptors: (pipeline_key, uniform_values, uniform_count)
-        let descriptors: Vec<(String, Vec<f32>, usize)> = self.active.iter().map(|ae| {
+        let descriptors: Vec<(String, Vec<f32>, usize)> = active.iter().map(|ae| {
             let key = if ae.shader_idx < usize::MAX {
                 EFFECTS.get(ae.shader_idx).map(|d| d.name.to_string()).unwrap_or_default()
             } else {
@@ -411,6 +468,65 @@ impl PostPipe {
     /// After `apply()`, returns the texture view containing the final result.
     pub fn last_view(&self) -> &wgpu::TextureView {
         self.target_views[self.last_output].as_ref().unwrap()
+    }
+}
+
+/// 特效是否无效(输出与输入相同,可安全跳过)。
+/// 各内置特效的主强度参数 = 0 时视为 no-op;自定义 shader 无法判定,保留。
+fn is_effect_noop(ae: &ActiveEffect) -> bool {
+    let v = ae.uniform_values.as_slice();
+    if ae.shader_idx == usize::MAX {
+        return false; // 自定义:无法判定,保守执行
+    }
+    let name = EFFECTS.get(ae.shader_idx).map(|d| d.name).unwrap_or("");
+    match name {
+        "grayscale" => v.first().is_some_and(|f| *f == 0.0),   // factor
+        "chromatic" => v.first().is_some_and(|f| *f == 0.0),   // power
+        "glitch" => v.first().is_some_and(|f| *f == 0.0),      // power
+        "fisheye" => v.first().is_some_and(|f| *f == 0.0),     // power
+        "noise" => v.get(1).is_some_and(|f| *f == 0.0),        // power(第二个)
+        "radialBlur" => v.first().is_some_and(|f| *f == 0.0),  // power
+        "pixel" => v.first().is_some_and(|f| *f == 0.0),       // size
+        "circleBlur" => v.first().is_some_and(|f| *f == 0.0),  // size
+        "vignette" => v.get(3).is_some_and(|f| *f == 0.0),     // color_a
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fx(name: &str, vals: &[f32]) -> ActiveEffect {
+        let si = EFFECTS.iter().position(|d| d.name == name).unwrap();
+        ActiveEffect {
+            shader_idx: si,
+            custom_name: None,
+            priority: 0,
+            uniform_values: vals.to_vec(),
+            uniform_count: vals.len(),
+        }
+    }
+
+    #[test]
+    fn noop_detection() {
+        // grayscale factor=0 → no-op
+        assert!(is_effect_noop(&fx("grayscale", &[0.0])));
+        assert!(!is_effect_noop(&fx("grayscale", &[0.5])));
+        // chromatic power=0 → no-op
+        assert!(is_effect_noop(&fx("chromatic", &[0.0, 3.0, 0.0, 0.0])));
+        // vignette color_a=0 → no-op
+        assert!(is_effect_noop(&fx("vignette", &[0.0, 0.0, 0.0, 0.0, 0.25, 15.0])));
+        assert!(!is_effect_noop(&fx("vignette", &[0.0, 0.0, 0.0, 1.0, 0.25, 15.0])));
+        // 自定义 shader 不跳过
+        let custom = ActiveEffect {
+            shader_idx: usize::MAX,
+            custom_name: Some("x.frag".into()),
+            priority: 0,
+            uniform_values: vec![0.0],
+            uniform_count: 1,
+        };
+        assert!(!is_effect_noop(&custom));
     }
 }
 
