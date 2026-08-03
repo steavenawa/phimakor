@@ -426,18 +426,24 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
             }
         }
     }
-    // 背景:解码 + σ=8 高斯模糊(重活,放后台)。
+    // 背景:解码 + 高斯模糊(重活,放后台)。fastblur(SIMD)替代
+    // image::imageops::blur(σ=8,快 10-100x,PMCORE-66)。
     // 注意:背景不翻转(原 set_background 无 flip,与 upload_image 不同)。
     let (bg, bg_dim) = match std::fs::read(dir.join(&info.illustration)) {
         Ok(bytes) => {
-            let blurred = image::load_from_memory(&bytes)
+            let bg = image::load_from_memory(&bytes)
                 .ok()
-                .map(|im| im.to_rgba8())
-                .map(|img| image::imageops::blur(&img, 8.0));
-            let bg = blurred.map(|img| {
-                let (w, h) = (img.width().max(1), img.height().max(1));
-                DecodedImage { rgba: img.into_raw(), w, h }
-            });
+                .map(|im| im.to_rgb8())
+                .map(|mut img| {
+                    let (w, h) = (img.width().max(1), img.height().max(1));
+                    let mut raw: Vec<[u8; 3]> = img.as_raw().chunks_exact(3)
+                        .map(|c| [c[0], c[1], c[2]])
+                        .collect();
+                    fastblur::gaussian_blur(&mut raw, w as usize, h as usize, 8.0);
+                    // RGB → RGBA(alpha=255)
+                    let rgba: Vec<u8> = raw.into_iter().flat_map(|[r, g, b]| [r, g, b, 255]).collect();
+                    DecodedImage { rgba, w, h }
+                });
             (bg, info.background_dim)
         }
         Err(_) => (None, info.background_dim),

@@ -23,6 +23,7 @@ wgpu-core = "30"
 pollster = "*"
 rodio = "*"
 image = "*"
+fastblur = "0.1"
 bytemuck = { version = "*", features = ["derive"] }
 fontdue = "*"
 softbuffer = "*"
