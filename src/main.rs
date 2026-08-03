@@ -1874,14 +1874,18 @@ impl ApplicationHandler for App {
                             state.ui_dirty = true;
                         }
                         KeyCode::Space => {
-                            // Resuming after the track ended: the audio thread
-                            // re-appends the source and replays from the start,
-                            // but combo/hits/score only reset in `seek` — so a
-                            // restart from the end kept the previous run's
-                            // stats. Detect the end-of-chart resume and seek 0.
+                            // 播放到末尾后音频队列排空(playing 仍是 true,
+                            // is_paused() 检测不到),空格 resume 会重播但
+                            // combo/hits/score 不清。用时间回绕检测:
+                            // 末尾 or 时间越过末尾 → 一律 seek(0) 清统计。
                             let at_end = state.chart_time_last >= state.chart.duration() - 0.1;
                             let paused = state.audio.as_ref().is_some_and(|a| a.is_paused());
                             if paused && at_end {
+                                // 暂停在末尾:seek 清零后恢复播放。
+                                state.seek(0.0);
+                            } else if !paused && at_end {
+                                // 队列排空的"假播放"状态:seek(0) 清统计,
+                                // 音频线程 set_paused(false) 会 re-append 重播。
                                 state.seek(0.0);
                             }
                             if let Some(a) = &state.audio {

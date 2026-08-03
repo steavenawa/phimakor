@@ -322,6 +322,15 @@ pub fn spawn_audio_thread(res_dir: &Path, chart_dir: &Path) -> anyhow::Result<Au
                 }
                 let t = clock.time();
                 time2.store(t.to_bits(), Ordering::Relaxed);
+                // Track ended: the queue drained but `playing` stays true
+                // (rodio has no end callback), so the main thread can't tell
+                // "paused at the end" from "still playing". Report it as
+                // paused — Space then sees `paused && at_end` and seeks 0,
+                // which resets combo/hits/score before the replay.
+                if clock.playing.get() && clock.player.empty() {
+                    clock.playing.set(false);
+                    paused2.store(true, Ordering::Relaxed);
+                }
                 let chart_time = (t - total_offset).max(0.0);
                 // Lightweight fired-only scan (no animation/visibility work).
                 for fired in chart2.advance_fired(chart_time) {
