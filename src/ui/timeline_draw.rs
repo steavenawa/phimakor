@@ -53,6 +53,8 @@ pub struct TimelineDrawState {
     pub line_list_hover: Option<Area>,
     /// 右上角性能提示开关(设置里开启)。
     pub perf_hint: bool,
+    /// 右上角常驻帧时间叠层(设置里开启,任何状态恒显示)。
+    pub fps_overlay: bool,
     /// 鼠标位置(自定义 GPU 光标用)。
     pub mouse_pos: Option<(f32, f32)>,
     /// 光标样式:true = 自定义 GPU 光标(系统光标已隐藏)。
@@ -87,6 +89,7 @@ impl TimelineDrawState {
             chart_grid: o.chart_grid.clone(), chart_grid_hover: o.chart_grid_hover,
             line_list: o.line_list.clone(), line_list_hover: o.line_list_hover,
             perf_hint: o.perf_hint,
+            fps_overlay: o.fps_overlay,
             mouse_pos: o.mouse_pos,
             custom_cursor: o.custom_cursor,
             cursor_move: o.cursor_move,
@@ -239,10 +242,11 @@ impl TimelineDrawState {
         if info.show_menu {
             draw_menu(&mut pm.as_mut(), vw, vh, s);
         }
-        // 右上角性能提示(PMCORE-68):设置开启 + 播放中 + 帧延迟过大才显示。
-        // 极小英文文字,画在时间轴/面板之上(worker 管线内,非阻塞)。
-        if self.perf_hint && info.playing && info.frame_latency_ms > 25.0 {
-            let txt = format!("frame {:.0}ms / {:.0}fps", info.frame_latency_ms, info.fps);
+        // 右上角性能提示(PMCORE-68):perf hint 开关 = 播放中帧延迟过大才显示;
+        // fps overlay 开关 = 任何状态恒显示帧时间叠层。两者可共存。
+        let show_fps = self.fps_overlay || (self.perf_hint && info.playing && info.frame_latency_ms > 25.0);
+        if show_fps {
+            let txt = format!("frame {:.1}ms / {:.0}fps", info.frame_latency_ms, info.fps);
             let size = 9.0 * s;
             let tw = {
                 let mut cv = bpm_panel::SkiaCanvas { pm: &mut pm.as_mut() };
@@ -256,8 +260,14 @@ impl TimelineDrawState {
             if let Some(r) = Rect::from_xywh(x - 2.0 * s, y - size, tw + 4.0 * s, size + 4.0 * s) {
                 fill_rect_clipped(&mut pm.as_mut(), r, &bgp);
             }
-            // 帧延迟大 → 红色,轻微 → 黄
-            let color = if info.frame_latency_ms > 50.0 { [255, 90, 90] } else { [255, 210, 90] };
+            // 常驻叠层:帧延迟大 → 红,轻微 → 黄,正常 → 青白
+            let color = if info.frame_latency_ms > 50.0 {
+                [255, 90, 90]
+            } else if info.frame_latency_ms > 25.0 {
+                [255, 210, 90]
+            } else {
+                [160, 230, 200]
+            };
             let mut cv = bpm_panel::SkiaCanvas { pm: &mut pm.as_mut() };
             cv.text(&txt, x, y, size, color);
         }

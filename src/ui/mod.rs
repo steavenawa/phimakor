@@ -116,6 +116,8 @@ pub struct IcedOverlay {
     pub tl_worker: Option<timeline_draw::TimelineWorker>,
     /// 右上角性能提示开关(设置里开启,播放帧延迟大时显示)。
     pub perf_hint: bool,
+    /// 右上角常驻帧时间叠层(设置里开启,恒显示 frame ms / fps)。
+    pub fps_overlay: bool,
     /// 自定义 GPU 光标(系统光标隐藏,worker 管线画动态光标)。
     pub custom_cursor: bool,
     /// 光标移动强度 0..1(移动时顶点外扩,静止回落)。
@@ -179,7 +181,7 @@ impl IcedOverlay {
             w: w.max(1), h: h.max(1), panel_progress: 0.0, events_progress: 0.0,
             notes_progress: 0.0, mouse_pos: None, show_overlay: true, tl_visible: false,
             tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 5],
-            panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, tl_worker: Some(timeline_draw::TimelineWorker::new(w.max(1), h.max(1))), perf_hint: false, custom_cursor: false, cursor_move: 0.0, cursor_click: 0.0, cursor_trail: Vec::new(), cursor_time: 0.0, cursor_dirty: false, last_anim_iced: false, messages: Vec::new(), timeline_click: None,
+            panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, tl_worker: Some(timeline_draw::TimelineWorker::new(w.max(1), h.max(1))), perf_hint: false, fps_overlay: true, custom_cursor: false, cursor_move: 0.0, cursor_click: 0.0, cursor_trail: Vec::new(), cursor_time: 0.0, cursor_dirty: false, last_anim_iced: false, messages: Vec::new(), timeline_click: None,
             layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, gui_scale: 1.0,
             timeline_dirty: false,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,

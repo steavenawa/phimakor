@@ -17,6 +17,8 @@ pub struct SettingsData {
     pub charts_dir: Option<String>,
     /// 右上角极小性能提示(播放中帧延迟过大时显示)。默认关,设置里开。
     pub perf_hint: bool,
+    /// 右上角常驻帧时间叠层(显示 frame ms / fps)。默认开。
+    pub fps_overlay: bool,
     /// 自定义 GPU 光标(隐藏系统光标,worker 画动态光标)。默认关。
     pub custom_cursor: bool,
     /// 过激优化位标志(默认 0 = 全关):见 [`AGGRESSIVE_*`] 常量。
@@ -33,7 +35,7 @@ pub use phimakor::render::AGGRESSIVE_HOLD_CLIP;
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, custom_cursor: false, aggressive: 0, half_res_fx: true }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, fps_overlay: true, custom_cursor: false, aggressive: 0, half_res_fx: true }
     }
 }
 
@@ -80,6 +82,7 @@ pub fn build_settings_form(x: f32, y: f32, w: f32, s: f32, settings: &SettingsDa
         ("fullscreen".into(), RTControl::Toggle { on: settings.fullscreen, anim: if settings.fullscreen { 1.0 } else { 0.0 }, dir: if settings.fullscreen { 1.0 } else { -1.0 } }),
         ("backend".into(), RTControl::Combo { items: vec!["Auto".into(), "DX12".into(), "Vulkan".into(), "GL".into()], selected: backend_idx, open: false }),
         ("perf hint".into(), RTControl::Toggle { on: settings.perf_hint, anim: if settings.perf_hint { 1.0 } else { 0.0 }, dir: if settings.perf_hint { 1.0 } else { -1.0 } }),
+        ("fps overlay".into(), RTControl::Toggle { on: settings.fps_overlay, anim: if settings.fps_overlay { 1.0 } else { 0.0 }, dir: if settings.fps_overlay { 1.0 } else { -1.0 } }),
         ("custom cursor".into(), RTControl::Toggle { on: settings.custom_cursor, anim: if settings.custom_cursor { 1.0 } else { 0.0 }, dir: if settings.custom_cursor { 1.0 } else { -1.0 } }),
         ("aggressive cull".into(), RTControl::Toggle { on: settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0, anim: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { 0.0 }, dir: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { -1.0 } }),
         ("half-res fx".into(), RTControl::Toggle { on: settings.half_res_fx, anim: if settings.half_res_fx { 1.0 } else { 0.0 }, dir: if settings.half_res_fx { 1.0 } else { -1.0 } }),
@@ -129,6 +132,12 @@ pub fn apply_settings_form(form: &RealtimeForm, settings: &mut SettingsData) -> 
             ("perf hint", RTControl::Toggle { on, .. }) => {
                 if *on != settings.perf_hint {
                     settings.perf_hint = *on;
+                    changed = true;
+                }
+            }
+            ("fps overlay", RTControl::Toggle { on, .. }) => {
+                if *on != settings.fps_overlay {
+                    settings.fps_overlay = *on;
                     changed = true;
                 }
             }

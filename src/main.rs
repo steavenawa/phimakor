@@ -65,6 +65,9 @@ struct State {
     show_notes: bool,
     full_notes: bool,
     gui_scale: f32,
+    /// 系统 DPI scale factor(高分屏缩放)。预乘进 gui_scale:UI 在 150%/200%
+    /// 缩放下保持逻辑尺寸显示,不需要用户手动调大设置里的 gui scale。
+    dpi_scale: f32,
     snap: f32, // snap interval in beats: 0.25, 0.5, 1.0
     vertical_split: u32, // number of vertical columns in notes panel (1 = no split)
     ui_dirty: bool,
@@ -190,6 +193,7 @@ impl App {
         let doc = ChartDocument::open(&tmp).ok()?;
         let chart = core::chart::Chart::from_rpe_chart(doc.chart(), false).ok()?;
         let info = doc.info().clone();
+        let dpi = window.scale_factor() as f32;
         Some(State {
             window, chart_dir: PathBuf::new(), renderer, overlay, doc, chart, info,
             audio: None, started: Instant::now(), fps_since: Instant::now(),
@@ -202,7 +206,7 @@ impl App {
             drag_was_playing: false,
             selected_line: 0, selected_event_idx: None, drag_origin: None, drag_preview: None, scroll_target: None,
             pending_seek: None, chart_time_last: 0.0, focused: true, ctrl: false,
-            gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0, event_edit_target: 0,
+            gui_scale: settings.gui_scale * dpi, dpi_scale: dpi, snap: 0.25, selected_layer: 0, event_edit_target: 0,
             vertical_split: 14, ui_dirty: true, show_menu: false, splash_mode: true, splash_charts: charts,
             splash_search: String::new(), splash_sel: None, splash_sort: 0, splash_scroll: 0.0,
             splash_lib_path: charts_dir().display().to_string(),
@@ -285,6 +289,7 @@ impl App {
         let mut overlay = ui::IcedOverlay::new(renderer.device(), renderer.tex_bgl(), renderer.sampler(), 1200, 800);
         overlay.set_panels(layout.panels.clone());
         overlay.perf_hint = settings.perf_hint;
+        overlay.fps_overlay = settings.fps_overlay;
         overlay.custom_cursor = settings.custom_cursor;
         renderer.aggressive = settings.aggressive;
         renderer.post.half_res_enabled = settings.half_res_fx;
@@ -294,6 +299,7 @@ impl App {
         if settings.custom_cursor {
             window.set_cursor_visible(false);
         }
+        let dpi = window.scale_factor() as f32;
         Ok(State {
             window, chart_dir: dir.to_path_buf(), renderer, overlay, doc, chart, info, audio,
             started: Instant::now(), fps_since: Instant::now(), aspect_idx: 0,
@@ -305,7 +311,7 @@ impl App {
             drag_was_playing: false,
             selected_line: 0, selected_event_idx: None, drag_origin: None, drag_preview: None, event_edit_target: 0,
             scroll_target: None, pending_seek: None, chart_time_last: 0.0,
-            focused: true, ctrl: false, gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0,
+            focused: true, ctrl: false, gui_scale: settings.gui_scale * dpi, dpi_scale: dpi, snap: 0.25, selected_layer: 0,
             vertical_split: 14, ui_dirty: true, show_menu: false, splash_mode: false,
             splash_charts: vec![], splash_search: String::new(), splash_sel: None, splash_sort: 0, splash_scroll: 0.0,
             splash_lib_path: String::new(), splash_hover: ui::SplashHover::None,
@@ -983,12 +989,14 @@ impl State {
         if !ui::settings::apply_settings_form(&form, &mut self.settings) {
             return;
         }
-        // 应用即时生效的设置。
+        // 即时生效的设置。gui_scale 预乘系统 DPI scale(高分屏保持逻辑尺寸)。
         self.renderer.set_vsync(self.settings.vsync);
         self.renderer.aggressive = self.settings.aggressive;
         self.renderer.post.half_res_enabled = self.settings.half_res_fx;
-        self.gui_scale = self.settings.gui_scale;
+        self.dpi_scale = self.window.scale_factor() as f32;
+        self.gui_scale = self.settings.gui_scale * self.dpi_scale;
         self.overlay.perf_hint = self.settings.perf_hint;
+        self.overlay.fps_overlay = self.settings.fps_overlay;
         // 自定义 GPU 光标:隐藏系统光标。
         if self.settings.custom_cursor != self.overlay.custom_cursor {
             self.overlay.custom_cursor = self.settings.custom_cursor;
@@ -1822,6 +1830,9 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(s) => {
                 state.renderer.resize(s.width, s.height);
                 state.overlay.resize(state.renderer.device(), state.renderer.tex_bgl(), state.renderer.sampler(), s.width, s.height);
+                // DPI 变化(拖到不同缩放显示器)时刷新预乘。
+                state.dpi_scale = state.window.scale_factor() as f32;
+                state.gui_scale = state.settings.gui_scale * state.dpi_scale;
                 state.ui_dirty = true;
                 state.render_frame();
             }
