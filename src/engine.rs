@@ -123,7 +123,7 @@ impl ChartSession {
         let chart_beat = chart.time_to_beat(chart_time);
         // Hit FX: pure time function — query the trigger window BEFORE
         // state_at (which mutably borrows chart; the frame borrows it too).
-        let triggers = chart.fx_in_window(chart_time - 0.5, chart_time, 16);
+        let triggers = chart.fx_in_window(chart_time - 0.5, chart_time);
         let frame = chart.state_at(chart_time);
         self.last_fired.clear();
         self.last_fired.extend(frame.fired.iter().map(|f| core::chart::FiredNote {

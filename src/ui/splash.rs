@@ -112,12 +112,12 @@ pub fn splash_hit_test(mx: f32, my: f32, vw: f32, vh: f32, s: f32, filtered_len:
         if hit(my, y) { return SplashHover::Backend; }
         y += row_h + 6.0 * s;
         if hit(my, y) { return SplashHover::ScaleRow; }
+        // +- 按钮与 GUI Scale 数值同行(行右侧):+(最右),-(其左)。
+        let bw = 60.0 * s;
+        if mx >= rx - bw && mx <= rx && hit(my, y) { return SplashHover::ScalePlus; }
+        if mx >= rx - bw * 2.0 - 8.0 * s && mx <= rx - bw - 8.0 * s && hit(my, y) { return SplashHover::ScaleMinus; }
         y += row_h + 6.0 * s;
         if hit(my, y) { return SplashHover::Library; }
-        y += row_h + 6.0 * s;
-        let bw = 60.0 * s;
-        if mx >= lx && mx <= lx + bw && hit(my, y) { return SplashHover::ScaleMinus; }
-        if mx >= lx + bw + 8.0 * s && mx <= lx + bw * 2.0 + 8.0 * s && hit(my, y) { return SplashHover::ScalePlus; }
         let by = vh - SPLASH_BAR_H * s - row_h - 10.0 * s;
         if hit(my, by) && mx <= lx + 100.0 * s { return SplashHover::Back; }
         return SplashHover::None;
@@ -519,6 +519,7 @@ fn draw_splash_settings(pm: &mut tiny_skia::PixmapMut, cfg: &SettingsData, lib_p
         ("GUI Scale", format!("{:.1}", cfg.gui_scale), SplashHover::ScaleRow),
         ("Chart Library", lib_short, SplashHover::Library),
     ];
+    let mut scale_y = 0.0; // GUI Scale 行 y(+- 按钮与其数值同行)
     for (label, value, target) in rows {
         let hovered = hover == target;
         if let Some(r) = tiny_skia::Rect::from_xywh(lx, y, rx - lx, row_h) {
@@ -526,22 +527,31 @@ fn draw_splash_settings(pm: &mut tiny_skia::PixmapMut, cfg: &SettingsData, lib_p
         }
         if let Some(font) = font {
             draw_text_on_pixmap(pm, label, lx + 12.0 * s, y + row_h * 0.5, 14.0 * s, font);
+            // GUI Scale 行:数值右移,给右侧 [-] [+] 按钮留位。
             let tw = text_width(&value, 14.0 * s);
-            draw_text_on_pixmap(pm, &value, rx - tw - 12.0 * s, y + row_h * 0.5, 14.0 * s, font);
+            let vx = if target == SplashHover::ScaleRow {
+                rx - 60.0 * s * 2.0 - 20.0 * s - tw
+            } else {
+                rx - tw - 12.0 * s
+            };
+            draw_text_on_pixmap(pm, &value, vx, y + row_h * 0.5, 14.0 * s, font);
+        }
+        if target == SplashHover::ScaleRow {
+            scale_y = y;
         }
         y += row_h + 6.0 * s;
     }
-    // Scale +/- buttons row
-    let scale_row = y;
+    // Scale +/- buttons:与 GUI Scale 数值同一行,位于行右侧。
     let bw = 60.0 * s;
     for (idx, (target, label)) in [(0usize, (SplashHover::ScaleMinus, "-")), (1usize, (SplashHover::ScalePlus, "+"))] {
         let hovered = hover == target;
-        let bx = lx + idx as f32 * (bw + 8.0 * s);
-        if let Some(r) = tiny_skia::Rect::from_xywh(bx, scale_row, bw, row_h) {
+        // 从右往左:+(最右),-(其左)。
+        let bx = rx - bw - idx as f32 * (bw + 8.0 * s);
+        if let Some(r) = tiny_skia::Rect::from_xywh(bx, scale_y, bw, row_h) {
             fill_rect_clipped(pm, r, &row_bg(hovered));
         }
         if let Some(font) = font {
-            draw_text_on_pixmap(pm, label, bx + bw * 0.5 - 4.0 * s, scale_row + row_h * 0.5, 16.0 * s, font);
+            draw_text_on_pixmap(pm, label, bx + bw * 0.5 - 4.0 * s, scale_y + row_h * 0.5, 16.0 * s, font);
         }
     }
     // Back button

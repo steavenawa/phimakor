@@ -23,6 +23,8 @@ const HIT_FX_COLS: u32 = 5;
 const HIT_FX_ROWS: u32 = 6;
 const HIT_FX_FRAMES: u32 = 30;
 const HIT_FX_SECS: f64 = 0.5;
+    /// 每 fx 的碎片粒子数。
+    const SHARD_COUNT: usize = 24;
 
 /// 碎片粒子种子:由触发时间派生(确定性,可倒退渲染)。
 fn fx_seed_of(t0: f64) -> u64 {
@@ -35,12 +37,10 @@ impl Renderer {
     /// `triggers` = 窗口内命中特效触发点 `(谱面时间 t0, 画布位置)`——
     /// 由 `Chart::fx_in_window` 查询生成,再经线变换换算成画布坐标。
     /// `now` = 当前谱面时间:age = now - t0,倒退/跳转自然对齐。
-    /// `shards` = 每 fx 的碎片粒子数(密集段落降档控制成本)。
     /// `letterbox` is the canvas px → NDC playfield transform.
     /// `white` = 1×1 白色纹理(纯正方形粒子用)。
     pub(super) fn push_hit_fx<'a>(
         triggers: &[(f64, [f32; 2])],
-        shards: usize,
         textures: &'a HashMap<String, TexEntry>,
         white: &'a wgpu::BindGroup,
         cmds: &mut Vec<DrawCmd<'a>>,
@@ -90,7 +90,7 @@ impl Renderer {
             // 碎片粒子:随机(方向/大小/距离,种子由 t0 派生——确定性,
             // 倒退渲染时粒子形状一致),向外扩散,不旋转。
             let t = (age / HIT_FX_SECS as f32).clamp(0.0, 1.0);
-            for i in 0..shards {
+            for i in 0..SHARD_COUNT {
                 let s = seed.wrapping_mul(0x9E3779B1).wrapping_add(i as u64 * 0x85EBCA6B);
                 let rnd = |salt: u64| -> f32 {
                     let x = s.wrapping_mul(salt).wrapping_add(0x27D4EB2F);

@@ -1648,8 +1648,7 @@ impl Renderer {
         // Field-split call: `cmds` already borrows `self.textures`/`self.white`.
         // fx 纯时间函数:host 查询的 frame_fx + 当前谱面时间(frame.time)
         // 渲染——倒退/跳转时 age = now - t0 自然对齐。
-        let shards = if self.frame_fx.len() > 8 { 12 } else { 24 };
-        Self::push_hit_fx(&self.frame_fx, shards, &self.textures, &self.white, &mut cmds, &letterbox, ev_x, ev_y, frame.time);
+        Self::push_hit_fx(&self.frame_fx, &self.textures, &self.white, &mut cmds, &letterbox, ev_x, ev_y, frame.time);
 
         // Text overlay (Phaser UI), on top of everything; queue is per-frame.
         text::push_text(

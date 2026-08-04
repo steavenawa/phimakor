@@ -1264,7 +1264,7 @@ impl State {
             self.settings_refresh_form();
         }
         // fx 触发点查询必须在 state_at 之前(chart 可变借用冲突)。
-        let fx_triggers = self.chart.fx_in_window(chart_time - 0.5, chart_time, 16);
+        let fx_triggers = self.chart.fx_in_window(chart_time - 0.5, chart_time);
         let frame = self.chart.state_at(chart_time);
 
         for fired in &frame.fired {

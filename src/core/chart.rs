@@ -1354,9 +1354,8 @@ impl Chart {
     /// - hold 半拍 tick:反向解算——`beat(time)` 秒→拍,对齐半拍步进,
     ///   `time_beats` 拍→秒(周期化回调,BPM 相关)
     ///
-    /// 成本调控:`max` 限制返回数量(密集段落取最近的),查询为每线二分
-    /// O(log N) + 窗口内遍历。
-    pub fn fx_in_window(&self, t_lo: f64, t_hi: f64, max: usize) -> Vec<FxTrigger> {
+    /// 不裁剪:窗口内全部触发点都返回(密集段落靠粒子渲染自身承担成本)。
+    pub fn fx_in_window(&self, t_lo: f64, t_hi: f64) -> Vec<FxTrigger> {
         let mut out: Vec<FxTrigger> = Vec::new();
         // 局部 BpmList(反向解算 tick 用;beat/time_beats 需要 &mut cursor)。
         let mut bpm = BpmList::new(self.bpm_list.elements().iter().map(|&(b, _, v)| (b, v)).collect());
@@ -1394,11 +1393,8 @@ impl Chart {
                 }
             }
         }
-        // 按时间升序,超上限保留最近的 max 个。
+        // 按时间升序(渲染顺序规整)。
         out.sort_by(|a, b| a.t0.total_cmp(&b.t0));
-        if out.len() > max {
-            out.drain(..out.len() - max);
-        }
         out
     }
 
@@ -2128,19 +2124,20 @@ previewStart: 12
         }"#;
         let chart = Chart::from_rpe(&src, false).unwrap();
         // 窗口 [0.8, 1.2]:只有 tap 头 @1.0。
-        let fx = chart.fx_in_window(0.8, 1.2, 16);
+        let fx = chart.fx_in_window(0.8, 1.2);
         assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), vec![1.0]);
         // 窗口 [2.0, 4.0]:头 2.0 + tick 2.25..3.75(0.25s 间隔) + 尾 4.0。
         let expect_full: Vec<f64> = (0..9).map(|i| 2.0 + i as f64 * 0.25).collect();
-        let fx = chart.fx_in_window(2.0, 4.0, 16);
+        let fx = chart.fx_in_window(2.0, 4.0);
         assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), expect_full);
         // 窗口 [2.9, 3.1]:只含 tick @3.0。
-        let fx = chart.fx_in_window(2.9, 3.1, 16);
+        let fx = chart.fx_in_window(2.9, 3.1);
         assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), vec![3.0]);
-        // 上限:cap=3 保留最近 3 个(3.5/3.75/4.0)。
-        let fx = chart.fx_in_window(0.0, 4.0, 3);
-        assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), vec![3.5, 3.75, 4.0]);
-        // fake note 不出现在触发点。
+        // 全窗口:全部触发点都在(不裁剪),fake note 排除。
+        let fx = chart.fx_in_window(0.0, 4.0);
+        let mut expect_all = vec![1.0];
+        expect_all.extend(expect_full);
+        assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), expect_all);
         assert!(fx.iter().all(|f| f.t0 != 1.5));
     }
 }
