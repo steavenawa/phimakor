@@ -1049,8 +1049,6 @@ impl State {
         if t > prev {
             self.chart.reposition(ct);
         }
-        // 粒子是瞬时特效:seek 跳转后旧粒子不该残留(也不该"倒退播放")。
-        self.renderer.clear_hit_fx();
         self.hits = self.chart.hits_before(ct) as u32;
         self.combo = self.hits;
         self.seek_dim_until = Instant::now() + Duration::from_millis(400);
@@ -1073,8 +1071,6 @@ impl State {
         if t > prev {
             self.chart.reposition(ct);
         }
-        // 粒子是瞬时特效:seek 跳转后旧粒子不该残留(也不该"倒退播放")。
-        self.renderer.clear_hit_fx();
         self.hits = self.chart.hits_before(ct) as u32;
         self.combo = self.hits;
         self.seek_dim_until = Instant::now() + Duration::from_millis(400);
