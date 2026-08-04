@@ -1191,9 +1191,13 @@ impl Chart {
         // multi-level chains resolve recursively.
         {
             // Resolve rotations first (phira fetch_rot, recursive).
+            // phira: fetch_rot(i) = rot_i + (i.rot_with_parent ? fetch_rot(parent) : 0),
+            // 递归展开 = 逐级检查"当前节点"自己的 rot_with_parent,为 true 则累加
+            // 父线旋转并上移。注意:检查的是当前节点(首层为 i),不是父线!
             let mut rot_resolved = vec![0.0f32; frame.lines.len()];
             for i in 0..frame.lines.len() {
                 let mut rot = frame.lines[i].rotation;
+                let mut node = i;
                 let mut cur = frame.lines[i].parent;
                 let mut visited: Vec<usize> = Vec::new();
                 while let Some(pidx) = cur {
@@ -1201,10 +1205,11 @@ impl Chart {
                         break;
                     }
                     visited.push(pidx);
-                    if !frame.lines[pidx].rot_with_parent {
+                    if !frame.lines[node].rot_with_parent {
                         break;
                     }
                     rot += frame.lines[pidx].rotation;
+                    node = pidx;
                     cur = frame.lines[pidx].parent;
                 }
                 rot_resolved[i] = rot;
@@ -1406,51 +1411,59 @@ impl Chart {
     /// 幂等:只对事件轨道 set_time(无游标副作用),不会扰动 notes 可见性
     /// 游标或 fired 状态,可安全插在任何 state_at 调用之间。
     pub fn line_pose_at(&mut self, line_idx: usize, time: f64) -> ([f32; 2], f32) {
-        let mut rot_resolved = vec![0.0f32; self.lines.len()];
-        for i in 0..self.lines.len() {
-            let line = &mut self.lines[i];
-            line.move_x.set_time(time);
-            line.move_y.set_time(time);
-            line.rotation.set_time(time);
-        }
-        for i in 0..self.lines.len() {
-            let mut rot = self.lines[i].rotation.now().to_radians();
-            let mut cur = self.lines[i].parent;
-            let mut visited: Vec<usize> = Vec::new();
-            while let Some(pidx) = cur {
-                if pidx >= self.lines.len() || visited.contains(&pidx) || pidx == i {
-                    break;
-                }
-                visited.push(pidx);
-                if !self.lines[pidx].rot_with_parent {
-                    break;
-                }
-                rot += self.lines[pidx].rotation.now().to_radians();
-                cur = self.lines[pidx].parent;
-            }
-            rot_resolved[i] = rot;
-        }
-        // Position: root-first composition (same as state_at).
-        let mut acc = [self.lines[line_idx].move_x.now(), self.lines[line_idx].move_y.now()];
+        // 只 set_time 目标线 + 其父链(位姿组合只依赖这些线),其余线不动。
+        // 密集谱面每帧多次调用时这是数量级差异(全量 set_time → 定向)。
+        let mut chain: Vec<usize> = vec![line_idx];
         let mut cur = self.lines[line_idx].parent;
-        let mut stack: Vec<usize> = Vec::new();
         let mut visited: Vec<usize> = Vec::new();
         while let Some(pidx) = cur {
             if pidx >= self.lines.len() || visited.contains(&pidx) || pidx == line_idx {
                 break;
             }
             visited.push(pidx);
-            stack.push(pidx);
+            chain.push(pidx);
             cur = self.lines[pidx].parent;
         }
-        for &pidx in stack.iter().rev() {
-            let pr = rot_resolved[pidx];
+        for &i in &chain {
+            let line = &mut self.lines[i];
+            line.move_x.set_time(time);
+            line.move_y.set_time(time);
+            line.rotation.set_time(time);
+        }
+        // 每个链成员的解析旋转:自身 + 父链累加(逐级检查当前节点自己的
+        // rot_with_parent,与 state_at/phira fetch_rot 一致)。祖先都在 chain 内。
+        let mut rot_resolved = vec![0.0f32; chain.len()];
+        for (ci, &i) in chain.iter().enumerate() {
+            let mut rot = self.lines[i].rotation.now().to_radians();
+            let mut node = i;
+            let mut cur = self.lines[i].parent;
+            let mut seen: Vec<usize> = Vec::new();
+            while let Some(pidx) = cur {
+                if pidx >= self.lines.len() || seen.contains(&pidx) || pidx == i {
+                    break;
+                }
+                seen.push(pidx);
+                if !self.lines[node].rot_with_parent {
+                    break;
+                }
+                rot += self.lines[pidx].rotation.now().to_radians();
+                node = pidx;
+                cur = self.lines[pidx].parent;
+            }
+            rot_resolved[ci] = rot;
+        }
+        // Position: root-first composition (same as state_at).
+        let mut acc = [self.lines[line_idx].move_x.now(), self.lines[line_idx].move_y.now()];
+        // chain = [self, parent, ..., root];rev 后跳过 self → root first。
+        for &pidx in chain.iter().rev().skip(1) {
+            let ci = chain.iter().position(|&c| c == pidx).unwrap();
+            let pr = rot_resolved[ci];
             let (cos, sin) = (pr.cos(), pr.sin());
             let (lx, ly) = (acc[0], acc[1]);
             acc[0] = self.lines[pidx].move_x.now() + cos * lx - sin * ly;
             acc[1] = self.lines[pidx].move_y.now() + sin * lx + cos * ly;
         }
-        (acc, rot_resolved[line_idx])
+        (acc, rot_resolved[0])
     }
 
     /// Total chart duration in seconds.
@@ -2241,5 +2254,47 @@ previewStart: 12
         let frame_b = chart.state_at(2.0);
         let l_b = frame_b.lines[0].position;
         assert_eq!(l_a, l_b);
+    }
+
+    #[test]
+    fn line_pose_at_with_parent_chain_matches_state_at() {
+        // 双线父链:line0 旋转 0°→90°,line1 挂到 line0(father=0)+ rotateWithFather,
+        // 自身不动。子线位姿应随父线旋转继承 + 位置继承。
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "parent", "Texture": "line.png", "father": -1, "rotateWithFather": false,
+                    "eventLayers": [
+                        { "rotateEvents": [ { "start": 0.0, "end": 90.0, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 } ] },
+                        null
+                    ],
+                    "isCover": 0, "notes": []
+                },
+                {
+                    "Name": "child", "Texture": "line.png", "father": 0, "rotateWithFather": true,
+                    "eventLayers": [ null, null ],
+                    "isCover": 0, "notes": []
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(&src, false).unwrap();
+        // 0.5s:父线旋转到 22.5°。子线解析旋转 = 自身(0) + 父(22.5°),位置 = 父位(0) + R(父旋转)×子偏移(0)。
+        for t in [0.0, 0.5, 1.0, 2.0] {
+            let (fpos, frot) = {
+                let frame = chart.state_at(t);
+                (frame.lines[1].position, frame.lines[1].rotation)
+            };
+            let (pos, rot) = chart.line_pose_at(1, t);
+            assert!((pos[0] - fpos[0]).abs() < 1e-3, "t={t} px");
+            assert!((pos[1] - fpos[1]).abs() < 1e-3, "t={t} py");
+            assert!((rot - frot).abs() < 1e-3, "t={t} rot: {rot} vs {frot}");
+        }
+        // 2s 时父线旋转 90°:子线旋转应继承父线位姿的旋转(rot_with_parent)。
+        let (_, rot) = chart.line_pose_at(1, 2.0);
+        let (_, pro) = chart.line_pose_at(0, 2.0);
+        assert!((rot - pro).abs() < 1e-3, "子线应继承父旋转: {}/{} rad", rot, pro);
+        assert!(pro.to_degrees().abs() > 10.0, "父线在 2s 应有明显旋转: {}°", pro.to_degrees());
     }
 }
