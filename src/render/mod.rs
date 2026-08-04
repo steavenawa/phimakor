@@ -79,8 +79,7 @@ fn mat_translate(x: f32, y: f32) -> Mat3 {
     [[1., 0., 0., 0.], [0., 1., 0., 0.], [x, y, 1., 0.]]
 }
 
-fn mat_scale(x: f32, y: f32) -> Mat3 {
-    [[x, 0., 0., 0.], [0., y, 0., 0.], [0., 0., 1., 0.]]
+fn mat_scale(x: f32, y: f32) -> Mat3 {    [[x, 0., 0., 0.], [0., y, 0., 0.], [0., 0., 1., 0.]]
 }
 
 fn mat_rotate(rad: f32) -> Mat3 {
@@ -97,6 +96,52 @@ fn mat_mul(a: &Mat3, b: &Mat3) -> Mat3 {
         }
     }
     r
+}
+
+/// Liang-Barsky line-vs-AABB clipping. Returns the visible sub-segment as
+/// `(t0, t1)` in `[0, 1]` along `p0 → p1`, or `None` when fully outside.
+fn clip_segment(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    xmin: f32,
+    xmax: f32,
+    ymin: f32,
+    ymax: f32,
+) -> Option<(f32, f32)> {
+    let (dx, dy) = (p1.0 - p0.0, p1.1 - p0.1);
+    let (mut t0, mut t1) = (0.0f32, 1.0f32);
+    // For each boundary: p·t ≤ q keeps the segment inside.
+    let edges: [(f32, f32); 4] = [
+        (-dx, p0.0 - xmin),
+        (dx, xmax - p0.0),
+        (-dy, p0.1 - ymin),
+        (dy, ymax - p0.1),
+    ];
+    for (p, q) in edges {
+        if p.abs() < 1e-9 {
+            if q < 0.0 {
+                return None; // parallel and outside
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                if r > t1 {
+                    return None;
+                }
+                if r > t0 {
+                    t0 = r;
+                }
+            } else {
+                if r < t0 {
+                    return None;
+                }
+                if r < t1 {
+                    t1 = r;
+                }
+            }
+        }
+    }
+    Some((t0, t1))
 }
 
 /// CPU-side per-quad assembly record; converted to [`Instance`] at upload.
@@ -1265,40 +1310,45 @@ impl Renderer {
                                 };
                                 let bh = (h1 - h0).abs();
                                 if bh > 1e-5 {
-                                    // [C] Hold body Y-clip: when the line is
-                                    // (nearly) unrotated the body runs along
-                                    // canvas Y, so clip it to the visible
-                                    // range — a multi-second hold is a
-                                    // full-height quad otherwise, pure
-                                    // off-screen overdraw. UVs scale with
-                                    // the clipped fraction. Rotated lines
-                                    // fall back to the bounding-circle test
-                                    // (correct, just less aggressive).
-                                    if cxn >= 0.996 {
-                                        let (b0, b1) = (h0, h1);
-                                        let lo = b0.min(b1).max(-CANVAS_H);
-                                        let hi = b0.max(b1).min(CANVAS_H);
-                                        if hi - lo > 1e-5 {
-                                            let t_lo = (lo - b0) / (b1 - b0);
-                                            let t_hi = (hi - b0) / (b1 - b0);
+                                    // [C] Hold body clip: the body runs along the
+                                    // line direction, so clip the segment
+                                    // (head edge → tail edge, INCLUDING line
+                                    // rotation) against the canvas box with
+                                    // Liang-Barsky, then re-derive the visible
+                                    // length with Pythagoras (斜对角线长度 =
+                                    // sqrt(dx²+dy²)). UVs map by the fraction
+                                    // along the body direction, so the head-end
+                                    // gradient stays anchored to the head under
+                                    // speed events / any rotation.
+                                    let (ax, ay) = to_canvas(x, h0);
+                                    let (bx, by) = to_canvas(x, h1);
+                                    let (dx, dy) = (bx - ax, by - ay);
+                                    let len = (dx * dx + dy * dy).sqrt();
+                                    if let Some((t0, t1)) = clip_segment(
+                                        (ax, ay), (bx, by),
+                                        -CANVAS_W, CANVAS_W, -CANVAS_H, CANVAS_H,
+                                    ) {
+                                        if t1 - t0 > 1e-6 {
+                                            let (x0, y0) = (ax + dx * t0, ay + dy * t0);
+                                            let (x1, y1) = (ax + dx * t1, ay + dy * t1);
+                                            let vis_len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+                                            // Visible segment midpoint, rotated
+                                            // back into line-local space (the
+                                            // quad's local Y axis then aligns
+                                            // with the body direction again).
+                                            let rel_x = (x0 + x1) * 0.5 - ctrl_px;
+                                            let rel_y = (y0 + y1) * 0.5 - ctrl_py;
+                                            let lcx = cxn * rel_x + cyn * rel_y;
+                                            let lcy = -cyn * rel_x + cxn * rel_y;
                                             let body_len = 1.0 - head_uv - tail_uv;
                                             cmds.push(DrawCmd {
                                                 uniform: DrawUniform {
-                                                    model: mat_mul(&hd((lo + hi) * 0.5), &mat_scale(1.0, (hi - lo) / w)),
+                                                    model: mat_mul(&note_m, &mat_mul(
+                                                        &mat_translate(lcx, lcy),
+                                                        &mat_scale(w, vis_len),
+                                                    )),
                                                     color: tint,
-                                                    uv_rect: v_at(head_uv + body_len * t_lo, body_len * (t_hi - t_lo)),
-                                                },
-                                                tex: &t.bind_group,
-                                            });
-                                        }
-                                    } else {
-                                        let (bcx, bcy) = to_canvas(x, (h0 + h1) * 0.5);
-                                        if !outside(bcx, bcy, (w * w + bh * bh).sqrt() * 0.5) {
-                                            cmds.push(DrawCmd {
-                                                uniform: DrawUniform {
-                                                    model: mat_mul(&hd((h0 + h1) * 0.5), &mat_scale(1.0, bh / w)),
-                                                    color: tint,
-                                                    uv_rect: v_at(head_uv, 1. - head_uv - tail_uv),
+                                                    uv_rect: v_at(head_uv + body_len * t0, body_len * (t1 - t0)),
                                                 },
                                                 tex: &t.bind_group,
                                             });
@@ -1823,6 +1873,32 @@ mod tests {
         assert!((x - 3.).abs() < 1e-6 && (y + 1.).abs() < 1e-6, "({x}, {y})");
         assert!(p[6] == 0. && p[7] == 0., "pad must stay zero");
         assert_eq!(size_of::<Instance>(), 64);
+    }
+
+    #[test]
+    fn clip_segment_basic() {
+        let (xmin, xmax, ymin, ymax) = (-675.0, 675.0, -450.0, 450.0);
+        // Fully inside: unchanged.
+        let (t0, t1) = clip_segment((-100., -100.), (100., 100.), xmin, xmax, ymin, ymax).unwrap();
+        assert!((t0 - 0.0).abs() < 1e-6 && (t1 - 1.0).abs() < 1e-6);
+        // Fully outside (above): none.
+        assert!(clip_segment((0., 500.), (0., 900.), xmin, xmax, ymin, ymax).is_none());
+        // Vertical body crossing the top edge: head inside (0,-100),
+        // tail far above (0, 1200). Visible part t0=0 (head), t1 where y=450.
+        let (t0, t1) = clip_segment((0., -100.), (0., 1200.), xmin, xmax, ymin, ymax).unwrap();
+        assert!((t0 - 0.0).abs() < 1e-6);
+        assert!((t1 - (450.0 - (-100.0)) / 1300.0).abs() < 1e-4, "t1={t1}");
+        // Diagonal (rotated line): clip both ends, visible length via
+        // Pythagoras must equal the clipped sub-segment's hypotenuse.
+        let (t0, t1) = clip_segment((-900., -200.), (900., 600.), xmin, xmax, ymin, ymax).unwrap();
+        assert!(t0 > 0.0 && t1 < 1.0);
+        let (dx, dy) = (1800.0, 800.0);
+        let vis = ((dx * (t1 - t0)).powi(2) + (dy * (t1 - t0)).powi(2)).sqrt();
+        // Cross-check against manual endpooints:
+        let (x0, y0) = (-900. + dx * t0, -200. + dy * t0);
+        let (x1, y1) = (-900. + dx * t1, -200. + dy * t1);
+        assert!(((x0 - x1).powi(2) + (y0 - y1).powi(2)).sqrt() - vis < 1e-3);
+        assert!(x0 >= xmin && x1 <= xmax && y0 >= ymin && y1 <= ymax);
     }
 
     #[test]
