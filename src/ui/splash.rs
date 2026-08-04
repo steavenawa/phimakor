@@ -111,11 +111,14 @@ pub fn splash_hit_test(mx: f32, my: f32, vw: f32, vh: f32, s: f32, filtered_len:
         y += row_h + 6.0 * s;
         if hit(my, y) { return SplashHover::Backend; }
         y += row_h + 6.0 * s;
-        if hit(my, y) { return SplashHover::ScaleRow; }
-        // +- 按钮与 GUI Scale 数值同行(行右侧):+(最右),-(其左)。
+        // +/- 按钮与 GUI Scale 数值同行(行右侧):+(最右),-(其左)。
+        // 必须优先于 ScaleRow(slider 拖拽整行),否则被整行检查吞掉点不到。
         let bw = 60.0 * s;
-        if mx >= rx - bw && mx <= rx && hit(my, y) { return SplashHover::ScalePlus; }
-        if mx >= rx - bw * 2.0 - 8.0 * s && mx <= rx - bw - 8.0 * s && hit(my, y) { return SplashHover::ScaleMinus; }
+        if hit(my, y) {
+            if mx >= rx - bw && mx <= rx { return SplashHover::ScalePlus; }
+            if mx >= rx - bw * 2.0 - 8.0 * s && mx <= rx - bw - 8.0 * s { return SplashHover::ScaleMinus; }
+            return SplashHover::ScaleRow;
+        }
         y += row_h + 6.0 * s;
         if hit(my, y) { return SplashHover::Library; }
         let by = vh - SPLASH_BAR_H * s - row_h - 10.0 * s;

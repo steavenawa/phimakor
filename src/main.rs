@@ -1795,8 +1795,8 @@ impl ApplicationHandler for App {
                             st.window.set_cursor_visible(true);
                             save_settings(&st.settings);
                         }
-                        ui::SplashHover::ScaleMinus => { st.settings.gui_scale = (st.settings.gui_scale - 0.1).max(0.5); st.gui_scale = st.settings.gui_scale; save_settings(&st.settings); }
-                        ui::SplashHover::ScalePlus => { st.settings.gui_scale = (st.settings.gui_scale + 0.1).min(2.0); st.gui_scale = st.settings.gui_scale; save_settings(&st.settings); }
+                        ui::SplashHover::ScaleMinus => { st.settings.gui_scale = (st.settings.gui_scale - 0.1).max(0.5); st.gui_scale = st.settings.gui_scale * st.dpi_scale; save_settings(&st.settings); }
+                        ui::SplashHover::ScalePlus => { st.settings.gui_scale = (st.settings.gui_scale + 0.1).min(2.0); st.gui_scale = st.settings.gui_scale * st.dpi_scale; save_settings(&st.settings); }
                         ui::SplashHover::Library => { open_in_explorer(&charts_dir()); }
                         ui::SplashHover::Refresh => { st.splash_charts = scan_charts(); st.splash_sel = None; st.splash_scroll = 0.0; }
                         ui::SplashHover::Sort => { st.splash_sort = (st.splash_sort + 1) % 2; }
