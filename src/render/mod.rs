@@ -860,6 +860,13 @@ impl Renderer {
     /// Viewport size in pixels.
     pub fn size(&self) -> [u32; 2] { self.size }
 
+    /// 预热全部内置特效 pipeline(启动/切谱加载屏调用)。
+    /// 消除"特效首次出现时惰性编译卡帧"。
+    pub fn warmup_effects(&mut self) {
+        self.post.start_warmup();
+        let _ = self.post.tick_warmup(&self.device, 4096);
+    }
+
     /// Enable or disable V-sync (reconfigures the surface present mode).
     ///
     /// With V-sync off, prefer `Mailbox` when the surface supports it — it

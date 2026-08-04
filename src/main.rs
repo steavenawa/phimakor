@@ -293,6 +293,9 @@ impl App {
         overlay.custom_cursor = settings.custom_cursor;
         renderer.aggressive = settings.aggressive;
         renderer.post.half_res_enabled = settings.half_res_fx;
+        // 启动时同步预热全部内置特效 pipeline(一次性编译 ~15 个 shader,
+        // 启动多花 1-3s;之后特效首次出现不再卡帧)。切谱加载屏也会预热。
+        renderer.warmup_effects();
         if settings.custom_cursor {
             window.set_cursor_visible(false);
         }
@@ -1158,6 +1161,9 @@ impl State {
                 let elapsed = self.loading_start.elapsed().as_secs_f32();
                 // 假进度(加载中动画):缓慢逼近 0.95。
                 let progress = (elapsed * 0.25).min(0.95);
+                // 加载屏空档:预热全部内置特效 pipeline(编译卡顿在加载屏
+                // 期间发生,进入谱面后特效首次出现不再卡帧)。
+                self.renderer.warmup_effects();
                 let name = self.loading_name.clone().unwrap_or_default();
                 self.overlay.render_loading(self.renderer.queue(), &name, progress, self.gui_scale);
                 let ui_bg = Some(self.overlay.bind_group());

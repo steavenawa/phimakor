@@ -58,6 +58,10 @@ pub struct PostPipe {
     /// 用于排查特效质量问题(如尺寸参数型特效在 half 下变味)。
     pub half_res_enabled: bool,
 
+    /// 预热队列:启动/切谱时预编译内置特效 pipeline,消除"特效首次出现
+    /// 时编译卡顿"(ensure_effect 是惰性的,第一次用某个特效会卡一帧)。
+    warmup_pending: Vec<String>,
+
     /// Viewport width in pixels.
     pub width: u32,
     /// Viewport height in pixels.
@@ -179,6 +183,7 @@ impl PostPipe {
             chart_dir: None,
             active: Vec::new(),
             half_res_enabled: true,
+            warmup_pending: Vec::new(),
             width: 0, height: 0, tex_format: tex_fmt,
         };
         pipe.resize(device, width, height);
@@ -297,6 +302,29 @@ impl PostPipe {
         if self.pipelines.contains_key(def.name) { return; }
         let pipe = self.build_eff_pipe(device, def.name, def.frag);
         self.pipelines.insert(def.name.to_string(), pipe);
+    }
+
+    /// Queue ALL built-in effect pipelines for pre-compilation.
+    /// Call during startup / chart-switch (loading screen covers the cost);
+    /// afterwards `tick_warmup` compiles them in batches.
+    pub fn start_warmup(&mut self) {
+        if self.warmup_pending.is_empty() {
+            self.warmup_pending = EFFECTS.iter().map(|d| d.name.to_string()).collect();
+        }
+    }
+
+    /// Compile up to `budget` pending pipelines. Returns `true` when done.
+    /// A pipeline compile is a blocking GPU call (~tens of ms each) — call
+    /// this only in contexts where a stall is acceptable (startup, loading
+    /// screen), never in the steady-state frame.
+    pub fn tick_warmup(&mut self, device: &wgpu::Device, budget: usize) -> bool {
+        for _ in 0..budget {
+            let Some(name) = self.warmup_pending.pop() else { return true };
+            if let Some(def) = EFFECTS.iter().find(|d| d.name == name.as_str()) {
+                self.ensure_effect(device, def);
+            }
+        }
+        self.warmup_pending.is_empty()
     }
 
     /// Load and compile a custom WGSL shader from the chart directory.
