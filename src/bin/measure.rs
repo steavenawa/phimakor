@@ -1,3 +1,5 @@
+#![allow(dead_code)] // 测量工具:只构建被测路径,未用 API 属正常
+
 //! Headless perf measurement for the performance-experimental branch.
 //!
 //! Usage: cargo run --release --bin measure -- <chart_dir> [frames]

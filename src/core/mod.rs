@@ -53,6 +53,8 @@ pub const SPEED_RATIO: f64 = 10. / 45. / HEIGHT_RATIO;
 /// Renderer draws this verbatim: for each line, apply line transform
 /// (translate → rotate → scale), draw line quad, then draw each note at
 /// its relative offset under the same transform.
+/// 视图适配器(renderer 用,当前主程序未直接构造)。
+#[allow(dead_code)]
 pub struct FrameStateView<'a> {
     pub time: f64,
     pub frame: &'a FrameState,

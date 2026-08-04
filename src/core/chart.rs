@@ -1,3 +1,5 @@
+#![allow(dead_code)] // 库 API: Python 绑定/embedding/备用接口,主程序未全部使用
+
 // Derived from TeamFlos/phira prpr, GPL-3.0.
 //! RPE chart loading and per-frame state evaluation.
 //! Lowering ported from `prpr/src/parse/rpe.rs` (`parse_rpe`); note/line

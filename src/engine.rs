@@ -19,8 +19,7 @@
 
 use crate::core;
 use crate::render;
-use crate::audio;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Wraps the full chart lifecycle: load → evaluate → render → readback.
 ///
@@ -34,7 +33,6 @@ pub struct ChartSession {
     engine: render::preview::PreviewEngine,
     chart: Option<core::chart::Chart>,
     info: Option<core::model::ChartInfo>,
-    audio: Option<audio::AudioHandle>,
     extra: Option<core::extra::ExtraRoot>,
     width: u32,
     height: u32,
@@ -52,7 +50,6 @@ impl ChartSession {
             engine,
             chart: None,
             info: None,
-            audio: None,
             extra: None,
             width,
             height,

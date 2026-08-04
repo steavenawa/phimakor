@@ -453,6 +453,7 @@ pub struct PgrNote {
     position_x: f32,
     hold_time: Option<f64>,
     speed: Option<f32>,
+    #[allow(dead_code)] // 格式字段:保留结构,反序列化忽略
     floor_position: Option<f32>,
 }
 
@@ -471,6 +472,7 @@ struct PgrJudgeLine {
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PgrChart {
+    #[allow(dead_code)] // 格式字段:保留结构,反序列化忽略
     format_version: Option<i32>,
     offset: f64,
     judge_line_list: Vec<PgrJudgeLine>,

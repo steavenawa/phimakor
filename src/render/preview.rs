@@ -1,3 +1,5 @@
+#![allow(dead_code)] // 库 API: Python 绑定/embedding/备用接口,主程序未全部使用
+
 //! Surfaceless offscreen preview renderer: the same quad pipeline as the
 //! window path, drawn into an Rgba8Unorm target and read back to CPU memory
 //! (embedding path for the iced editor / mobile readback).
@@ -156,29 +158,26 @@ impl PreviewEngine {
             let _ = tx.send(res);
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(8);
-        let mut mapped = false;
-        loop {
+        let mapped = loop {
             if let Ok(Ok(())) = rx.try_recv() {
-                mapped = true;
-                break;
+                break true;
             }
             if std::time::Instant::now() > deadline {
                 // Rare: previous frame still in flight. Poll until the map
                 // resolves (must unmap to keep the slot reusable) but skip
                 // the pixel copy — keep last frame's pixels.
-                mapped = false;
                 loop {
                     if let Ok(Ok(())) = rx.try_recv() { break; }
-                    self.renderer.device().poll(wgpu::PollType::Wait {
+                    let _ = self.renderer.device().poll(wgpu::PollType::Wait {
                         submission_index: None,
                         timeout: Some(std::time::Duration::from_millis(1)),
                     });
                 }
-                break;
+                break false;
             }
-            self.renderer.device().poll(wgpu::PollType::Poll);
+            let _ = self.renderer.device().poll(wgpu::PollType::Poll);
             std::thread::yield_now();
-        }
+        };
         if mapped {
             if let Ok(data) = slice.get_mapped_range() {
                 let row = (self.width * 4) as usize;

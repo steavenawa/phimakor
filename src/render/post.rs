@@ -14,6 +14,7 @@ pub struct ActiveEffect {
     /// Custom shader filename used when `shader_idx` is `usize::MAX`.
     pub custom_name: Option<String>,
     /// Execution order within the effect chain (lower = earlier).
+    #[allow(dead_code)] // 排序由 effects_chain 保证,字段保留供调试
     pub priority: u32,
     /// Float values written into the effect's uniform buffer each frame.
     pub uniform_values: Vec<f32>,
@@ -72,7 +73,6 @@ pub struct PostPipe {
 
 struct EffPipe {
     pipeline: wgpu::RenderPipeline,
-    pl: wgpu::PipelineLayout,
     bgl: wgpu::BindGroupLayout,     // group 1 (uniforms)
     uniform_buf: wgpu::Buffer,
     uniform_size: u64,
@@ -294,7 +294,7 @@ impl PostPipe {
             mapped_at_creation: false,
         });
 
-        EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size, uniform_bg: None }
+        EffPipe { pipeline, bgl, uniform_buf, uniform_size, uniform_bg: None }
     }
 
     /// Ensure the pipeline + resources exist for a given effect.
@@ -543,7 +543,7 @@ impl PostPipe {
         src: &wgpu::TextureView,
         dst: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
-        is_half: bool,
+        _is_half: bool,
     ) {
         let Some(blit) = &self.blit_pipeline else { return };
         // Bind group built fresh every call — same stack-address caveat as

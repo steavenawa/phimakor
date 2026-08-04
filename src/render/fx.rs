@@ -52,7 +52,7 @@ impl Renderer {
     /// `white` = 1×1 白色纹理(纯正方形粒子用)。
     /// Free function with field-split borrows: `cmds` already holds shared
     /// borrows of `self.textures`, so a `&mut self` method would not compile.
-    pub(crate) fn push_hit_fx<'a>(
+    pub(super) fn push_hit_fx<'a>(
         hit_fx: &mut Vec<HitFx>,
         textures: &'a HashMap<String, TexEntry>,
         white: &'a wgpu::BindGroup,

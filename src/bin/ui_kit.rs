@@ -619,6 +619,7 @@ fn main() {
         let event_loop = EventLoop::new().expect("event loop");
         // Poll + about_to_wait 持续请求重绘 → 动画 slider 每帧摆动。
         event_loop.set_control_flow(ControlFlow::Poll);
+        #[allow(deprecated)] // ui_kit 测试工具:EventLoop::create_window 仍可用
         let window = Arc::new(
             event_loop
                 .create_window(WindowAttributes::default()

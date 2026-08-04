@@ -9,6 +9,11 @@
 //! - **线性布局**:VList/HList 足够覆盖编辑器面板(列表/按钮排/编辑行),
 //!   不做 flex 引擎。
 //!
+//! 组件库是增量开发的公共 API——大量构造器/方法当前只被部分面板使用,
+//! 属于备用接口而非死代码,模块级抑制 dead_code 警告。
+
+#![allow(dead_code)]
+//!
 //! 使用模式:绘制时用 `areas()` 拿到区域(同时用于绘制背景/高亮),命中时
 //! 用同一个布局函数 `hit()` 查指针位置。
 
@@ -122,8 +127,10 @@ pub trait Widget {
     /// 拖拽(按下后移动):更新值。`p` 为指针位置。
     fn on_drag(&mut self, _p: (f32, f32)) {}
     /// 键盘输入一个字符(焦点组件接收)。默认忽略。
+    #[allow(dead_code)] // trait 默认实现:被部分组件覆盖
     fn on_text(&mut self, _c: char) {}
     /// 键盘退格。默认忽略。
+    #[allow(dead_code)]
     fn on_backspace(&mut self) {}
     /// 通用按键(方向键/Tab/Enter 等)。默认忽略。
     fn on_key(&mut self, _k: WidgetKey) {}
@@ -792,6 +799,7 @@ impl ScrollList {
     }
 
     /// 最大滚动偏移(公开访问,供宿主对齐滚动位置)。
+    #[allow(dead_code)]
     pub fn max_scroll_pub(&self) -> f32 {
         self.max_scroll()
     }
@@ -1308,7 +1316,7 @@ impl Widget for TextInput {
     fn hit_area(&self, p: (f32, f32)) -> Option<Area> {
         inside(p, self.rect()).then(|| Area { kind: AreaKind::TextInput, id: 0, rect: self.rect() })
     }
-    fn on_click(&mut self, p: (f32, f32)) {
+    fn on_click(&mut self, _p: (f32, f32)) {
         // 点击定位光标:由宿主调 text_width 计算最近字符边界(简化:按宽度比例)。
     }
     fn on_text(&mut self, c: char) {
@@ -1590,7 +1598,7 @@ impl Widget for ListBox {
 #[derive(Clone, Debug)]
 pub enum FormField {
     Text { label: String, value: String, insert: usize, caret: f32 },
-    Number { label: String, value: f64, step: f64, min: f64, max: f64, buf: Option<String> },
+    Number { label: String, value: f64, #[allow(dead_code)] step: f64, min: f64, max: f64, buf: Option<String> },
     Combo { label: String, items: Vec<String>, selected: usize, open: bool },
     Toggle { label: String, on: bool, anim: f32, dir: f32 },
     Checkbox { label: String, checked: bool },
@@ -1924,6 +1932,7 @@ impl RealtimeForm {
         self.rows.push((label.into(), control));
     }
 
+    #[allow(dead_code)]
     pub fn remove_row(&mut self, i: usize) {
         if i < self.rows.len() {
             self.rows.remove(i);

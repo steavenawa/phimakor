@@ -410,7 +410,6 @@ fn draw_splash_detail(pm: &mut tiny_skia::PixmapMut, data: &SplashData, preview:
         let label = if ch.level.is_empty() { format!("Lv. {:.1}", ch.difficulty) } else { ch.level.clone() };
         draw_text_c(pm, "Level", x + 16.0 * s, my, 11.0 * s, font, [130, 130, 142]);
         draw_badge(pm, &label, x + w - 16.0 * s, my - 13.0 * s, 12.0 * s, level_color(&ch.level));
-        my += 22.0 * s;
     }
     // Hint
     draw_text_c(pm, "Click to open  ·  Enter", x + 16.0 * s, y + h - 14.0 * s, 11.0 * s, font, [120, 120, 132]);

@@ -23,11 +23,6 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
 }
 ";
 
-/// Combine vertex shader with an effect-specific fragment shader.
-macro_rules! effect_shader {
-    ($frag:expr) => { concat!($crate::render::shaders::VERT, "\n", $frag) };
-}
-
 pub const GRAYSCALE_FRAG: &str = r"
 @group(0) @binding(0) var screen_tex: texture_2d<f32>;
 @group(0) @binding(1) var screen_sampler: sampler;
@@ -231,6 +226,7 @@ pub struct EffectDef {
 }
 
 /// Passthrough shader (no uniforms) — test that effect pipeline works.
+#[allow(dead_code)]
 pub const PASSTHROUGH_FRAG: &str = r"
 @group(0) @binding(0) var screen_tex: texture_2d<f32>;
 @group(0) @binding(1) var screen_sampler: sampler;

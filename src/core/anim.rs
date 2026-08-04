@@ -96,6 +96,7 @@ impl<T: Tweenable> Anim<T> {
     }
 
     /// Returns true if the cursor has reached or passed the last keyframe.
+    #[allow(dead_code)] // 备用 API
     pub fn dead(&self) -> bool {
         self.cursor + 1 >= self.keyframes.len()
     }

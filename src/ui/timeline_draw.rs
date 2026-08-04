@@ -1,3 +1,4 @@
+#![allow(dead_code)] // 数据模型/绘制库: 字段与函数多为面板模板备用
 //! 时间轴 + 面板的纯绘制函数(PMCORE-55 第一阶段)。
 //!
 //! 把 `IcedOverlay::upload_timeline_to` 的 tiny_skia 绘制拆成纯函数:
@@ -7,7 +8,7 @@
 
 use tiny_skia::{Paint, Pixmap, PixmapMut, Rect, Transform};
 
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
 use std::thread::JoinHandle;
 
 use super::model::GameInfo;

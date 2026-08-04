@@ -172,6 +172,7 @@ impl AudioClock {
     }
 
     /// Whether playback is currently paused.
+    #[allow(dead_code)] // AudioClock 内部状态;触发线程直接读 playing
     pub fn is_paused(&self) -> bool {
         !self.playing.get()
     }

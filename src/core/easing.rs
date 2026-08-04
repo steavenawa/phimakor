@@ -1,3 +1,5 @@
+#![allow(dead_code)] // 库 API: Python 绑定/embedding/备用接口,主程序未全部使用
+
 // Derived from TeamFlos/phira prpr, GPL-3.0.
 //! Tween/easing functions, ported from `prpr/src/core/tween.rs`, plus the
 //! RPE-specific speed-integration tweens from `prpr/src/parse/rpe.rs` and the

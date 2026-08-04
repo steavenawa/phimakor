@@ -1,3 +1,4 @@
+#![allow(dead_code)] // 数据模型/绘制库: 字段与函数多为面板模板备用
 //! Display data models + iced UI builder.
 
 use super::timeline::{PANEL_W, QP_W, TL_W, NT_W};
@@ -8,7 +9,7 @@ use iced_tiny_skia::Renderer;
 
 #[derive(Clone)]
 pub struct EventEntry {
-    pub layer: usize, pub kind: String, pub index: usize,
+    pub layer: usize, pub kind: String, #[allow(dead_code)] pub index: usize,
     pub start_beats: f64, pub end_beats: f64,
     pub start: f32, pub end: f32, pub easing: i32,
 }
@@ -20,9 +21,9 @@ pub struct NoteEntry {
     pub start_beats: f64,
     pub end_beats: f64,
     pub x: f32,
-    pub speed: f32,
+    #[allow(dead_code)] pub speed: f32,
     pub scale: f32,      // note size multiplier
-    pub texture: String, // custom texture name, empty for default
+    #[allow(dead_code)] pub texture: String, // custom texture name, empty for default
 }
 
 /// Helper: build a value map from GameInfo for panel template resolution.

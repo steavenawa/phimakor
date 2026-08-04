@@ -1,3 +1,5 @@
+#![allow(dead_code)] // 库 API: Python 绑定/embedding/备用接口,主程序未全部使用
+
 //! `extra.json` parser: post-processing effects, video overlays, BPM overrides.
 //! Ported from `prpr/src/parse/extra.rs`.
 //!

@@ -41,15 +41,6 @@ const CANVAS_W: f32 = 675.0; // world x ±1 ↔ ±675 canvas px
 /// 勾股长度),长 hold 省大量 off-screen overdraw;视觉上等价但有回归风险。
 pub const AGGRESSIVE_HOLD_CLIP: u32 = 1 << 0;
 const CANVAS_H: f32 = 450.0; // world y ±1 ↔ ±450 canvas px
-/// Event-position x offset: positions (not sprites) are scaled by
-/// aspect/1.5 so they stretch from the 3:2 canvas width to fill the
-/// playfield box at any aspect (16:9 → ×1.19, 4:3 → ×0.89, 1:1 → ×0.67).
-/// y positions need no offset: y×aspect×fit is already constant (×1.5).
-const EVENT_X_OFFSET: f32 = 1.0;
-/// Positions (not sizes!) are stretched ×1.5 vertically so the RPE canvas
-/// (900 px tall) fills the playfield at any aspect, while sprites keep a
-/// uniform pixel scale (no texture distortion).
-const Y_STRETCH: f32 = CANVAS_W / CANVAS_H; // = 1.5
 /// Built-in line quad FULL length at the default `line_length = 6.0`:
 /// phira draws `draw_line(-len, 0, len, 0)` (half-length `len` in world
 /// units, 675 canvas px per world unit) → full length 2×len×675 = 8100 px.
@@ -233,17 +224,6 @@ pub(crate) fn letterbox_transform(window_aspect: f32, playfield_aspect: f32) -> 
 }
 fn instance_model(m: &Mat3) -> [f32; 8] {
     [m[0][0], m[0][1], m[1][0], m[1][1], m[2][0], m[2][1], 0., 0.]
-}
-
-/// Zero-overhead draw type tag — resolved at Instance construction, no
-/// runtime dispatch.
-enum DrawTag {
-    /// 3D scene element: full letterbox × T × R × S transform.
-    Scene,
-    /// Custom judge-line texture: pixel–world mapping via `RPE_HEIGHT / win_h`.
-    Texture { tex_w: f32, tex_h: f32, win_w: f32, win_h: f32 },
-    /// UI overlay: fullscreen NDC quad with optional V-flip.
-    Overlay,
 }
 
 const INSTANCE_LAYOUT: wgpu::VertexBufferLayout<'static> = wgpu::VertexBufferLayout {
@@ -972,6 +952,7 @@ impl Renderer {
     }
 
     /// Window-px rect of the pause button from the last drawn frame.
+    #[allow(dead_code)] // 备用 API(窗口侧用 hit_test_pause)
     pub fn pause_rect(&self) -> PauseHitRect {
         self.pause_rect
     }
@@ -1014,6 +995,7 @@ impl Renderer {
     /// failures are reported via `wgpu::CurrentSurfaceTexture`. Lost/Outdated
     /// are handled here by reconfiguring with the stored size (frame skipped);
     /// Timeout/Occluded skip silently; only Validation is returned as `Err`.
+    #[allow(dead_code)] // 备用 API(窗口路径用 draw_to_view)
     pub fn render(
         &mut self,
         frame: &FrameState,
@@ -1335,7 +1317,7 @@ impl Renderer {
                                         let (ax, ay) = to_canvas(x, h0);
                                         let (bx, by) = to_canvas(x, h1);
                                         let (dx, dy) = (bx - ax, by - ay);
-                                        let len = (dx * dx + dy * dy).sqrt();
+                                        let _len = (dx * dx + dy * dy).sqrt();
                                         let hw = w * 0.5;
                                         if let Some((t0, t1)) = clip_segment(
                                             (ax, ay), (bx, by),

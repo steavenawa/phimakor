@@ -65,7 +65,7 @@ impl<'a> Canvas for SkiaCanvas<'a> {
         fill_rect_clipped(self.pm, r, &p);
     }
 
-    fn text(&mut self, s: &str, x: f32, y: f32, size: f32, rgb: [u8; 3]) {
+    fn text(&mut self, s: &str, x: f32, y: f32, size: f32, _rgb: [u8; 3]) {
         if let Some(font) = super::font::get_font() {
             draw_text_on_pixmap(self.pm, s, x, y, size, font);
         }

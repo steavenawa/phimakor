@@ -1,3 +1,5 @@
+#![allow(dead_code)] // 库 API: Python 绑定/embedding/备用接口,主程序未全部使用
+
 //! Editor-facing document API: an [`RPEChart`] opened for mutation, with
 //! undo/redo command history (操作分支), debounced background saving, and
 //! first-class judge-line split/bind ops (拆线/绑线).

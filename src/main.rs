@@ -13,7 +13,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use phimakor::trace_span;
-use core::bpm::Triple;
 use core::edit::{ChartDocument, EventKind};
 use ui::panels::LayoutDef;
 use ui::widgets::Widget;
@@ -69,7 +68,6 @@ struct State {
     snap: f32, // snap interval in beats: 0.25, 0.5, 1.0
     vertical_split: u32, // number of vertical columns in notes panel (1 = no split)
     ui_dirty: bool,
-    overlay_last_render: Instant,
     show_menu: bool,
 
     // ── Selection ──
@@ -87,7 +85,6 @@ struct State {
     cached_notes: Arc<Vec<ui::NoteEntry>>,
 
     // ── Layout / panels ──
-    layout: LayoutDef,
     splash_mode: bool,
     splash_charts: Vec<ui::ChartEntry>,
     splash_search: String,
@@ -159,7 +156,6 @@ struct NumEdit {
 }
 
 impl State {
-    fn placeholder() -> Self { panic!("placeholder State used before init") }
 }
 
 /// Map the `backend` setting to wgpu backends (`None` = all / auto).
@@ -199,7 +195,7 @@ impl App {
             audio: None, started: Instant::now(), fps_since: Instant::now(),
             aspect_idx: 0, show_overlay: true,
             show_properties: false, show_events: false, show_notes: false, full_notes: false,
-            overlay_last_render: Instant::now(), combo: 0, hits: 0, note_count: 0,
+            combo: 0, hits: 0, note_count: 0,
             seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016,
             device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
@@ -207,8 +203,7 @@ impl App {
             selected_line: 0, selected_event_idx: None, drag_origin: None, drag_preview: None, scroll_target: None,
             pending_seek: None, chart_time_last: 0.0, focused: true, ctrl: false,
             gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0, event_edit_target: 0,
-            vertical_split: 14, layout: LayoutDef { panels: vec![] },
-            ui_dirty: true, show_menu: false, splash_mode: true, splash_charts: charts,
+            vertical_split: 14, ui_dirty: true, show_menu: false, splash_mode: true, splash_charts: charts,
             splash_search: String::new(), splash_sel: None, splash_sort: 0, splash_scroll: 0.0,
             splash_lib_path: charts_dir().display().to_string(),
             splash_hover: ui::SplashHover::None, show_settings: false, settings,
@@ -303,7 +298,7 @@ impl App {
             window, chart_dir: dir.to_path_buf(), renderer, overlay, doc, chart, info, audio,
             started: Instant::now(), fps_since: Instant::now(), aspect_idx: 0,
             show_overlay: true, show_properties: false, show_events: false, show_notes: false,
-            full_notes: false, overlay_last_render: Instant::now(), combo: 0, hits: 0, note_count,
+            full_notes: false, combo: 0, hits: 0, note_count,
             seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016,
             device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
@@ -311,7 +306,7 @@ impl App {
             selected_line: 0, selected_event_idx: None, drag_origin: None, drag_preview: None, event_edit_target: 0,
             scroll_target: None, pending_seek: None, chart_time_last: 0.0,
             focused: true, ctrl: false, gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0,
-            vertical_split: 14, layout, ui_dirty: true, show_menu: false, splash_mode: false,
+            vertical_split: 14, ui_dirty: true, show_menu: false, splash_mode: false,
             splash_charts: vec![], splash_search: String::new(), splash_sel: None, splash_sort: 0, splash_scroll: 0.0,
             splash_lib_path: String::new(), splash_hover: ui::SplashHover::None,
             show_settings: false, settings,
@@ -323,12 +318,6 @@ impl App {
             line_dragging: false,
             loading_name: None, loading_thread: None, loading_start: Instant::now(),
         })
-    }
-
-    fn rebuild_chart(&mut self) {
-        if let Some(state) = &mut self.state {
-            state.rebuild_chart();
-        }
     }
 
     /// Leave the editor and return to the splash screen: stop the audio
@@ -464,7 +453,7 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
             let bg = image::load_from_memory(&bytes)
                 .ok()
                 .map(|im| im.to_rgb8())
-                .map(|mut img| {
+                .map(|img| {
                     let (w, h) = (img.width().max(1), img.height().max(1));
                     let mut raw: Vec<[u8; 3]> = img.as_raw().chunks_exact(3)
                         .map(|c| [c[0], c[1], c[2]])
@@ -1774,7 +1763,7 @@ impl ApplicationHandler for App {
                             let ci = ui::filter_charts(&st.splash_charts, &st.splash_search, st.splash_sort).get(fi).copied();
                             let Some(ci) = ci else { return };
                             let path = st.splash_charts[ci].path.clone();
-                            drop(st);
+                            let _ = st;
                             self.open_chart(event_loop, &path);
                             return;
                         }
@@ -1998,7 +1987,7 @@ impl ApplicationHandler for App {
                                 }
                             }
                             if let Some(path) = open_path {
-                                drop(state);
+                                let _ = state;
                                 self.open_chart(event_loop, &path);
                             }
                             return;
@@ -2064,6 +2053,23 @@ impl ApplicationHandler for App {
                         KeyCode::Delete if state.show_properties && state.overlay.selected_tool == 3 => {
                             state.eff_remove_selected();
                         }
+                        // Event editing (F2 = cycle target, Ctrl+arrows = edit).
+                        // 守卫分支必须放在无守卫的 ArrowLeft/Right(seek)之前,
+                        // 否则永远 unreachable(ctrl 编辑实际没生效)。
+                        KeyCode::ArrowLeft if ctrl && has_event => {
+                            state.edit_selected_event(|ev| match edit_target {
+                                0 => ev.start_time = core::bpm::Triple::from_beats((ev.start_time.beats() - snap).max(0.0)),
+                                1 => ev.end_time = core::bpm::Triple::from_beats((ev.end_time.beats() - snap).max(0.0)),
+                                _ => {}
+                            });
+                        }
+                        KeyCode::ArrowRight if ctrl && has_event => {
+                            state.edit_selected_event(|ev| match edit_target {
+                                0 => ev.start_time = core::bpm::Triple::from_beats(ev.start_time.beats() + snap),
+                                1 => ev.end_time = core::bpm::Triple::from_beats(ev.end_time.beats() + snap),
+                                _ => {}
+                            });
+                        }
                         KeyCode::ArrowLeft | KeyCode::ArrowRight => {
                             let d = if code == KeyCode::ArrowLeft { -5.0 } else { 5.0 };
                             let t = state.audio.as_ref().map(|a| a.time()).unwrap_or(0.0) + d;
@@ -2097,26 +2103,12 @@ impl ApplicationHandler for App {
                         // Ctrl+Q = back to the splash screen (exit the app
                         // from there with Ctrl+Q again)
                         KeyCode::KeyQ if state.ctrl => {
-                            drop(state);
+                            let _ = state;
                             self.back_to_splash(event_loop);
                             return;
                         }
                         // Event editing (F2 = cycle target, Ctrl+arrows = edit)
                         KeyCode::F2 if has_event => { state.event_edit_target = (state.event_edit_target + 1) % 5; state.ui_dirty = true; }
-                        KeyCode::ArrowLeft if ctrl && has_event => {
-                            state.edit_selected_event(|ev| match edit_target {
-                                0 => ev.start_time = core::bpm::Triple::from_beats((ev.start_time.beats() - snap).max(0.0)),
-                                1 => ev.end_time = core::bpm::Triple::from_beats((ev.end_time.beats() - snap).max(0.0)),
-                                _ => {}
-                            });
-                        }
-                        KeyCode::ArrowRight if ctrl && has_event => {
-                            state.edit_selected_event(|ev| match edit_target {
-                                0 => ev.start_time = core::bpm::Triple::from_beats(ev.start_time.beats() + snap),
-                                1 => ev.end_time = core::bpm::Triple::from_beats(ev.end_time.beats() + snap),
-                                _ => {}
-                            });
-                        }
                         KeyCode::ArrowUp if ctrl && has_event => {
                             state.edit_selected_event(|ev| match edit_target {
                                 2 => { let v = ev.start + 0.01; ev.start = v.min(1.0).max(-1.0); },
@@ -2415,7 +2407,7 @@ impl ApplicationHandler for App {
                             }
                             ui::EffHit::KfRow(ri) => {
                                 // Click selects; double-click edits start beats.
-                                let (last_t, last_sel, last_f) = state.last_eff_click;
+                                let (last_t, _last_sel, last_f) = state.last_eff_click;
                                 let is_double = state.eff_kf_sel == Some(ri)
                                     && last_f == 200 && last_t.elapsed() < std::time::Duration::from_millis(300);
                                 state.eff_kf_sel = Some(ri);
@@ -2515,7 +2507,7 @@ impl ApplicationHandler for App {
                             state.ui_dirty = true;
                         }
                         ui::OverlayMessage::MenuQuit => {
-                            drop(state);
+                            let _ = state;
                             self.back_to_splash(event_loop);
                             break;
                         }

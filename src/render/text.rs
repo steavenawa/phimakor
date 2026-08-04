@@ -1,3 +1,5 @@
+#![allow(dead_code)] // 库 API: Python 绑定/embedding/备用接口,主程序未全部使用
+
 //! Text overlay rendering (Phaser UI): fontdue-rasterized single-line
 //! sprites, cached by `(text, anchor)` and drawn through the quad pipeline.
 //!

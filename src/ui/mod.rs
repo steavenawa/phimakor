@@ -32,18 +32,23 @@ pub mod text;
 pub mod timeline;
 pub mod timeline_draw;
 
+#[allow(unused_imports)] // re-export: 各 bin(phimakor/measure/ui_kit)按需使用
 pub use font::font_mem_bytes;
-pub use model::{gameinfo_values, EffectRow, EventEntry, GameInfo, KfRow, NoteEntry};
-pub use panel_ui::draw_panel_def;
+#[allow(unused_imports)]
+pub use model::{EffectRow, EventEntry, GameInfo, KfRow, NoteEntry};
+#[allow(unused_imports)]
 pub use primitives::fill_rect_clipped;
-pub use settings::{backend_cycle, backend_label, SettingsData};
-pub use splash::{draw_splash, filter_charts, splash_detail_x, splash_hit_test, splash_list_right, ChartEntry, SplashData, SplashHover};
+#[allow(unused_imports)]
+pub use settings::{backend_cycle, SettingsData};
+#[allow(unused_imports)]
+pub use splash::{draw_splash, filter_charts, splash_hit_test, ChartEntry, SplashData, SplashHover};
+#[allow(unused_imports)]
 pub use timeline::{PANEL_W, QP_W};
 use self::text::draw_text_on_pixmap;
 use self::font::get_font;
 use self::primitives::hline;
-use self::timeline::{draw_5col_timeline, draw_notes_timeline, COL_GAP, COL_W, HEADER_H, NT_W, TL_W};
-use self::panel_ui::{draw_effects_panel, draw_quick_panel};
+use self::timeline::{COL_GAP, COL_W, HEADER_H, NT_W, TL_W};
+#[allow(unused_imports)] // 供 panel 命中测试,各 bin 按需使用
 pub(crate) use self::panel_ui::{effects_hit_test, EffHit};
 use self::model::build_ui;
 
@@ -59,12 +64,14 @@ static SKIP_CENTER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 #[derive(Debug, Clone, PartialEq)]
 pub enum OverlayMessage {
     ToggleEvents,
+    #[allow(dead_code)] // 备用消息(线选择用)
     SelectLayer(usize),
     /// Toggle the note-preview panel (quick toolbar button).
     ToggleNotes,
     ToggleMenu,
     MenuSave,
     MenuQuit,
+    #[allow(dead_code)] // 备用消息(vsync 开关走 F6/设置)
     ToggleVsync,
 }
 
@@ -412,6 +419,7 @@ impl IcedOverlay {
     }
 
     /// Get seek ratio (0..1) from a position in the seek bar area (main.rs uses this).
+    #[allow(dead_code)]
     pub fn seek_from_pos(&self, mx: f32, info: &GameInfo) -> f64 {
         let s = self.gui_scale;
         let qp_w = QP_W * s;
@@ -664,6 +672,7 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
 
     /// Lightweight playhead-only redraw: draw current-time lines on the
     /// existing pixmap and upload. No Iced rebuild, no full clear.
+    #[allow(dead_code)]
     pub fn redraw_playhead(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         let _s = trace_span!("redraw_playhead");
         self.tl_visible = info.show_events;
@@ -858,15 +867,6 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
                 self.tool_hover_progress[i] = target;
             }
         }
-    }
-
-    fn upload_iced(&mut self, queue: &wgpu::Queue) {
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &self.iced_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            self.iced_cache.data(),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
-            wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
-        );
     }
 
     fn upload_timeline_to(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
