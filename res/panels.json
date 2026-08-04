@@ -1,0 +1,58 @@
+{
+  "panels": [
+    {
+      "name": "Chart",
+      "width": 280,
+      "cells": [
+        { "type": "label", "label": "Chart", "span": 2 },
+        { "type": "field", "label": "Name", "value": "{chart_name}", "span": 2 },
+        { "type": "field", "label": "Composer", "value": "{composer}", "span": 2 },
+        { "type": "field", "label": "Level", "value": "{level}", "span": 1 },
+        { "type": "field", "label": "Difficulty", "value": "{difficulty}", "span": 1 },
+        { "type": "split" },
+        { "type": "field", "label": "BPM", "value": "120", "span": 1 },
+        { "type": "field", "label": "Offset", "value": "{offset}", "span": 1 },
+        { "type": "field", "label": "Duration", "value": "{duration}", "span": 1 },
+        { "type": "split" },
+        { "type": "label", "label": "Meta", "span": 2 },
+        { "type": "field", "label": "FPS", "value": "{fps}", "span": 1 },
+        { "type": "field", "label": "Notes", "value": "{note_count}", "span": 1 }
+      ]
+    },
+    {
+      "name": "Line",
+      "width": 280,
+      "cells": [
+        { "type": "label", "label": "Info", "span": 2 },
+        { "type": "field", "label": "Name", "value": "{line_name}", "span": 2 },
+        { "type": "field", "label": "Index", "value": "{selected_line}", "span": 1 },
+        { "type": "field", "label": "Events", "value": "{event_count}", "span": 1 },
+        { "type": "split" },
+        { "type": "label", "label": "Edit", "span": 2 },
+        { "type": "field", "label": "MoveX", "value": "0.000", "span": 1 },
+        { "type": "field", "label": "MoveY", "value": "0.000", "span": 1 },
+        { "type": "field", "label": "Rot", "value": "0.0 deg", "span": 1 },
+        { "type": "field", "label": "Alpha", "value": "1.00", "span": 1 },
+        { "type": "split" },
+        { "type": "label", "label": "Meta", "span": 2 },
+        { "type": "field", "label": "Time", "value": "{chart_time}", "span": 1 },
+        { "type": "field", "label": "Beat", "value": "{chart_beat}", "span": 1 },
+        { "type": "field", "label": "Snap", "value": "{snap}", "span": 1 }
+      ]
+    },
+    {
+      "name": "Settings",
+      "width": 280,
+      "cells": [
+        { "type": "label", "label": "Settings", "span": 2 },
+        { "type": "field", "label": "GUI Scale", "value": "{gui_scale}", "span": 2 },
+        { "type": "field", "label": "FPS", "value": "{fps}", "span": 1 },
+        { "type": "field", "label": "Snap", "value": "{snap}", "span": 1 },
+        { "type": "split" },
+        { "type": "field", "label": "Show Overlay", "value": "{show_overlay}", "span": 2 },
+        { "type": "split" },
+        { "type": "field", "label": "VSync", "value": "{vsync}", "span": 2 }
+      ]
+    }
+  ]
+}
