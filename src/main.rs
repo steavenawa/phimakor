@@ -751,7 +751,6 @@ impl State {
         }
         // Advance past current time so state_at doesn't re-fire all notes
         self.chart.state_at(cur_time);
-        self.renderer.clear_hit_fx();
         self.cache_valid = false;
         self.selected_event_idx = None;
     }
@@ -1264,22 +1263,15 @@ impl State {
         if self.show_overlay && self.show_properties && self.overlay.selected_tool == 2 {
             self.settings_refresh_form();
         }
+        // fx 触发点查询必须在 state_at 之前(chart 可变借用冲突)。
+        let fx_triggers = self.chart.fx_in_window(chart_time - 0.5, chart_time, 16);
         let frame = self.chart.state_at(chart_time);
 
-        let pf_aspect = self.renderer.playfield_aspect();
         for fired in &frame.fired {
-            let line = &frame.lines[fired.line];
-            let t = line.rotation;
-            let x = fired.x as f32;
-            let cx = (line.position[0] + t.cos() * x) * 675.0;
-            // Rotation term ×pf_aspect: ev_x/ev_y = 1/(1.5/P) = P/1.5, so the
-            // canvas-X rotation px (675) meets the canvas-Y ev scale at P.
-            let cy = (line.position[1] + t.sin() * x * pf_aspect) * 450.0;
             if fired.hold_tail { if !fired.fake { self.combo += 1; self.hits += 1; } continue; }
-            if fired.tick { self.renderer.spawn_hit_fx([cx, cy]); continue; }
+            if fired.tick { continue; }
             if fired.fake { continue; }
             self.combo += 1; self.hits += 1;
-            self.renderer.spawn_hit_fx([cx, cy]);
         }
 
         let size = self.window.inner_size();
@@ -1555,6 +1547,19 @@ impl State {
             visible: !self.show_overlay,
         });
         self.renderer.set_progress(audio_time as f32 / duration as f32);
+        // 命中特效:纯时间函数——查询当前谱面时间窗口内的触发点,
+        // 前进/倒退/跳转都按 chart_time 渲染对应帧。
+        {
+            let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().map(|tr| {
+                let line = &frame.lines[tr.line];
+                let rot = line.rotation as f64;
+                let x = tr.x as f64 * 675.0;
+                let cx = (line.position[0] as f64 + rot.cos() * x) * 675.0;
+                let cy = (line.position[1] as f64 + rot.sin() * x) * 450.0;
+                (tr.t0, [cx as f32, cy as f32])
+            }).collect();
+            self.renderer.set_frame_fx(fx);
+        }
         match self.renderer.surface_acquire() {
             Ok(st) => {
                 let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());

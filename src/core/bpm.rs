@@ -123,6 +123,11 @@ impl BpmList {
         let (beats, start_time, bpm) = &self.elements[self.cursor];
         beats + (time - start_time) / (60. / bpm)
     }
+
+    /// 只读访问内部 `(beats, time, bpm)` 表(用于重建局部 BpmList)。
+    pub fn elements(&self) -> &[(f64, f64, f64)] {
+        &self.elements
+    }
 }
 
 #[cfg(test)]

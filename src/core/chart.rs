@@ -761,6 +761,15 @@ pub(crate) fn load_info(dir: &std::path::Path) -> Result<ChartInfo> {
     Ok(info)
 }
 
+/// 一个命中特效触发点:谱面时间 `t0` + 线索引 + note 的 x(相对线中心,
+/// 画布单位)。渲染端用线变换把 x 换算成画布位置。
+#[derive(Clone, Copy, Debug)]
+pub struct FxTrigger {
+    pub t0: f64,
+    pub line: usize,
+    pub x: f32,
+}
+
 impl Chart {
     /// Fast-forward the fired-note cursors to `time` without reporting the
     /// notes that were jumped over. The editor calls this after a **forward**
@@ -1334,6 +1343,63 @@ impl Chart {
             out.notes.extend(visible_scratch.drain(..).map(|(_, n)| n));
         }
         frame
+    }
+
+    /// 查询 `[t_lo, t_hi]` 窗口内的所有命中特效触发点——**纯时间函数**:
+    /// 前进/后退/任意跳转都按当前谱面时间查询,天然可倒退渲染。
+    ///
+    /// 触发点来源:
+    /// - note 头:`note.time`
+    /// - hold 尾(释放):`note.end_time`
+    /// - hold 半拍 tick:反向解算——`beat(time)` 秒→拍,对齐半拍步进,
+    ///   `time_beats` 拍→秒(周期化回调,BPM 相关)
+    ///
+    /// 成本调控:`max` 限制返回数量(密集段落取最近的),查询为每线二分
+    /// O(log N) + 窗口内遍历。
+    pub fn fx_in_window(&self, t_lo: f64, t_hi: f64, max: usize) -> Vec<FxTrigger> {
+        let mut out: Vec<FxTrigger> = Vec::new();
+        // 局部 BpmList(反向解算 tick 用;beat/time_beats 需要 &mut cursor)。
+        let mut bpm = BpmList::new(self.bpm_list.elements().iter().map(|&(b, _, v)| (b, v)).collect());
+        for (line_idx, line) in self.lines.iter().enumerate() {
+            let start = line.order.partition_point(|&ni| {
+                let n = &line.notes[ni];
+                n.time.max(n.end_time) < t_lo
+            });
+            for &ni in &line.order[start..] {
+                let n = &line.notes[ni];
+                if n.fake {
+                    continue;
+                }
+                // 头:在窗口内
+                if n.time >= t_lo && n.time <= t_hi {
+                    out.push(FxTrigger { t0: n.time, line: line_idx, x: n.x });
+                }
+                // hold 尾:在窗口内
+                if n.kind == 2 && n.end_time >= t_lo && n.end_time <= t_hi {
+                    out.push(FxTrigger { t0: n.end_time, line: line_idx, x: n.x });
+                }
+                // hold 半拍 tick:窗口内 [max(t_lo, note.time), min(t_hi, end_time)]
+                if n.kind == 2 && n.end_time > n.time {
+                    let b_lo = bpm.beat(n.time.max(t_lo));
+                    let b_hi = bpm.beat(n.end_time.min(t_hi));
+                    // 从头的下一个半拍开始(反向解算:秒→拍)
+                    let mut tb = (b_lo * 2.0).floor() / 2.0 + 0.5;
+                    while tb < b_hi {
+                        let tt = bpm.time_beats(tb);
+                        if tt >= t_lo && tt <= t_hi {
+                            out.push(FxTrigger { t0: tt, line: line_idx, x: n.x });
+                        }
+                        tb += 0.5;
+                    }
+                }
+            }
+        }
+        // 按时间升序,超上限保留最近的 max 个。
+        out.sort_by(|a, b| a.t0.total_cmp(&b.t0));
+        if out.len() > max {
+            out.drain(..out.len() - max);
+        }
+        out
     }
 
     /// Total chart duration in seconds.
@@ -2039,5 +2105,42 @@ previewStart: 12
             hits.extend(chart.advance_fired(t).iter().filter(|f| !f.fake && !f.tick && !f.hold_tail).map(|f| f.kind));
         }
         assert_eq!(hits, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn fx_in_window_heads_ticks_tails_and_cap() {
+        // 120bpm(0.5s/拍,半拍 tick = 0.25s):tap @1s,hold 2s→4s。
+        // fake @1.5s。hold tick:2.25/2.5/.../3.75(头 2.0 + 尾 4.0)。
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [2, 0, 1], "endTime": [2, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 2, "above": 1, "startTime": [4, 0, 1], "endTime": [8, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [3, 0, 1], "endTime": [3, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 1, "visibleTime": 999999.0 }
+                    ]
+                }
+            ]
+        }"#;
+        let chart = Chart::from_rpe(&src, false).unwrap();
+        // 窗口 [0.8, 1.2]:只有 tap 头 @1.0。
+        let fx = chart.fx_in_window(0.8, 1.2, 16);
+        assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), vec![1.0]);
+        // 窗口 [2.0, 4.0]:头 2.0 + tick 2.25..3.75(0.25s 间隔) + 尾 4.0。
+        let expect_full: Vec<f64> = (0..9).map(|i| 2.0 + i as f64 * 0.25).collect();
+        let fx = chart.fx_in_window(2.0, 4.0, 16);
+        assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), expect_full);
+        // 窗口 [2.9, 3.1]:只含 tick @3.0。
+        let fx = chart.fx_in_window(2.9, 3.1, 16);
+        assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), vec![3.0]);
+        // 上限:cap=3 保留最近 3 个(3.5/3.75/4.0)。
+        let fx = chart.fx_in_window(0.0, 4.0, 3);
+        assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), vec![3.5, 3.75, 4.0]);
+        // fake note 不出现在触发点。
+        assert!(fx.iter().all(|f| f.t0 != 1.5));
     }
 }

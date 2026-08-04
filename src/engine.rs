@@ -121,25 +121,26 @@ impl ChartSession {
         let off = chart.offset() as f64 + info.offset as f64;
         let chart_time = (time - off).max(0.0);
         let chart_beat = chart.time_to_beat(chart_time);
+        // Hit FX: pure time function — query the trigger window BEFORE
+        // state_at (which mutably borrows chart; the frame borrows it too).
+        let triggers = chart.fx_in_window(chart_time - 0.5, chart_time, 16);
         let frame = chart.state_at(chart_time);
         self.last_fired.clear();
         self.last_fired.extend(frame.fired.iter().map(|f| core::chart::FiredNote {
             line: f.line, kind: f.kind, x: f.x,
             fake: f.fake, tick: f.tick, hold_tail: f.hold_tail,
         }));
-        // Trigger hit FX for notes that fired since the last state_at call
-        for fired in &frame.fired {
-            if fired.hold_tail || fired.fake { continue; }
-            if let Some(line) = frame.lines.get(fired.line) {
-                let t = line.rotation;
-                let x = fired.x as f32;
-                let cx = (line.position[0] + t.cos() * x) * 675.0;
-                // Rotation term ×playfield aspect: ev_x/ev_y = P/1.5, so the
-                // canvas-X rotation px (675) meets the canvas-Y ev scale at P
-                // (independent of the offscreen window aspect).
-                let cy = (line.position[1] + t.sin() * x * self.engine.playfield_aspect()) * 450.0;
-                self.engine.spawn_hit_fx([cx, cy]);
-            }
+        // Convert trigger points to canvas positions via line transforms.
+        {
+            let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().map(|tr| {
+                let line = &frame.lines[tr.line];
+                let rot = line.rotation as f64;
+                let x = tr.x as f64 * 675.0;
+                let cx = (line.position[0] as f64 + rot.cos() * x) * 675.0;
+                let cy = (line.position[1] as f64 + rot.sin() * x * self.engine.playfield_aspect() as f64) * 450.0;
+                (tr.t0, [cx as f32, cy as f32])
+            }).collect();
+            self.engine.set_frame_fx(fx);
         }
         // Evaluate post-processing effects
         if let Some(extra) = &self.extra {

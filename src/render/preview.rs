@@ -252,9 +252,10 @@ impl PreviewEngine {
     /// Read-only access to the last rendered RGBA frame.
     pub fn pixels(&self) -> &[u8] { &self.pixels }
 
-    /// Spawn a hit-effect burst at the given canvas position.
-    pub fn spawn_hit_fx(&mut self, pos_canvas: [f32; 2]) {
-        self.renderer.spawn_hit_fx(pos_canvas);
+    /// Set the current frame's hit-FX trigger points (pure time function,
+    /// queried by the host via `Chart::fx_in_window`).
+    pub fn set_frame_fx(&mut self, fx: Vec<(f64, [f32; 2])>) {
+        self.renderer.set_frame_fx(fx);
     }
 
     /// Queue a text overlay for the next frame.

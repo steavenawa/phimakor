@@ -454,10 +454,9 @@ pub struct Renderer {
     scene_tex: Option<wgpu::Texture>,
     scene_view: Option<wgpu::TextureView>,
 
-    /// Live hit-effect bursts (see `fx.rs`).
-    hit_fx: Vec<fx::HitFx>,
-    /// hit-fx 碎片随机种子(LCG,每次命中推进)。
-    fx_seed: u64,
+    /// 当前帧命中特效触发点 `(谱面时间 t0, 画布位置)`——由 host 每帧
+    /// 从 `Chart::fx_in_window` 查询生成(纯时间函数,见 `fx.rs`)。
+    frame_fx: Vec<(f64, [f32; 2])>,
     /// Text overlay state (see `text.rs`).
     text: text::TextState,
     /// Persistent single-instance buffer for UI overlay draws.
@@ -730,8 +729,7 @@ impl Renderer {
             post,
             scene_tex,
             scene_view,
-            hit_fx: Vec::new(),
-            fx_seed: 0x9E3779B97F4A7C15,
+            frame_fx: Vec::new(),
             text: text::TextState::new(),
             vsync: true,
             aggressive: 0,
@@ -834,8 +832,12 @@ impl Renderer {
         }
     }
 
-    /// Clear all pending hit-effect bursts.
-    pub fn clear_hit_fx(&mut self) { self.hit_fx.clear(); }
+    /// 设置当前帧的命中特效触发点列表 `(谱面时间 t0, 画布位置)`。
+    /// 由 host 每帧从 `Chart::fx_in_window` 查询生成——fx 是纯时间函数,
+    /// 前进/倒退/跳转都按当前谱面时间渲染对应帧。
+    pub fn set_frame_fx(&mut self, fx: Vec<(f64, [f32; 2])>) {
+        self.frame_fx = fx;
+    }
 
     /// Viewport size in pixels.
     pub fn size(&self) -> [u32; 2] { self.size }
@@ -973,7 +975,6 @@ impl Renderer {
     /// 保留 `note:` 前缀的内置 hitsound 纹理(与 chart 无关)。
     pub fn clear_chart_textures(&mut self) {
         self.textures.retain(|k, _| k.starts_with("note:"));
-        self.hit_fx.clear();
     }
 
     /// 直载预解码 RGBA 纹理(跳过 image 解码,PMCORE 加载优化)。
@@ -1645,7 +1646,10 @@ impl Renderer {
         }
 
         // Field-split call: `cmds` already borrows `self.textures`/`self.white`.
-        Self::push_hit_fx(&mut self.hit_fx, &self.textures, &self.white, &mut cmds, &letterbox, ev_x, ev_y);
+        // fx 纯时间函数:host 查询的 frame_fx + 当前谱面时间(frame.time)
+        // 渲染——倒退/跳转时 age = now - t0 自然对齐。
+        let shards = if self.frame_fx.len() > 8 { 12 } else { 24 };
+        Self::push_hit_fx(&self.frame_fx, shards, &self.textures, &self.white, &mut cmds, &letterbox, ev_x, ev_y, frame.time);
 
         // Text overlay (Phaser UI), on top of everything; queue is per-frame.
         text::push_text(
