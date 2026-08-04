@@ -56,6 +56,10 @@ pub struct PostPipe {
     /// Active effects for the current frame.
     pub active: Vec<ActiveEffect>,
 
+    /// 半分辨率特效降采样开关(设置里可关)。关闭时所有特效全分辨率跑,
+    /// 用于排查特效质量问题(如尺寸参数型特效在 half 下变味)。
+    pub half_res_enabled: bool,
+
     /// Viewport width in pixels.
     pub width: u32,
     /// Viewport height in pixels.
@@ -179,6 +183,7 @@ impl PostPipe {
             pipelines: HashMap::new(),
             chart_dir: None,
             active: Vec::new(),
+            half_res_enabled: true,
             width: 0, height: 0, tex_format: tex_fmt,
         };
         pipe.resize(device, width, height);
@@ -394,10 +399,11 @@ impl PostPipe {
         // 避免跨迭代的借用链。
         let mut read_view: wgpu::TextureView = src.clone();
         let half_sampler = self.half_sampler.clone();
+        let half_res = self.half_res_enabled;
         let mut write_idx = 0usize;
         let mut i = 0usize;
         while i < descriptors.len() {
-            if !effect_is_half_res(&descriptors[i].0) {
+            if !(half_res && effect_is_half_res(&descriptors[i].0)) {
                 let (key, uv, _) = &descriptors[i];
                 let write_view = self.target_views[write_idx].as_ref().unwrap().clone();
                 write_idx = 1 - write_idx;
@@ -409,7 +415,7 @@ impl PostPipe {
                 i += 1;
             } else {
                 let mut j = i + 1;
-                while j < descriptors.len() && effect_is_half_res(&descriptors[j].0) {
+                while j < descriptors.len() && half_res && effect_is_half_res(&descriptors[j].0) {
                     j += 1;
                 }
                 // Downscale: current full-res output → half-res ping-pong[0].
@@ -597,16 +603,19 @@ fn is_effect_noop(ae: &ActiveEffect) -> bool {
     }
 }
 
-/// 特效是否在 W/2×H/2 target 上执行。
+/// 特效是否在 W/2×H/2 target 上执行(且开关 [`PostPipe::half_res_enabled`]
+/// 打开时)。
+///
 /// 采样型/带宽型特效(glitch/chromatic/noise/模糊类)对分辨率不敏感,
-/// 半分辨率省 ~75% 像素带宽;grayscale/vignette/pixel 也是逐像素但
-/// 视觉上无感(纯色调/柔边/本来就低清),一并降采样。fisheye 是几何
-/// 畸变,半分辨率会糊,保持全分辨率。自定义 shader 保守全分辨率。
+/// 半分辨率省 ~75% 像素带宽;grayscale/vignette 纯色调/柔边也无感。
+/// **尺寸参数型特效排除**:circleBlur/pixel 的 size 是绝对像素值
+/// (`ps = 1/screen_size`),半分辨率下半径/块大小在屏幕上翻倍——视觉
+/// 错误;fisheye 几何畸变同理防糊。自定义 shader 保守全分辨率。
 fn effect_is_half_res(key: &str) -> bool {
     matches!(
         key,
-        "glitch" | "chromatic" | "noise" | "radialBlur" | "circleBlur"
-            | "grayscale" | "vignette" | "pixel"
+        "glitch" | "chromatic" | "noise" | "radialBlur"
+            | "grayscale" | "vignette"
     )
 }
 

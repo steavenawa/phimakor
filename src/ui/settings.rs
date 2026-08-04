@@ -22,6 +22,9 @@ pub struct SettingsData {
     /// 过激优化位标志(默认 0 = 全关):见 [`AGGRESSIVE_*`] 常量。
     /// 每一项都是有视觉风险、但收益明显的激进优化,设置里逐个开关。
     pub aggressive: u32,
+    /// 后处理半分辨率特效降采样(默认开,省 ~75% 像素带宽)。关闭后所有
+    /// 特效全分辨率跑,用于排查特效质量问题。
+    pub half_res_fx: bool,
 }
 
 /// 过激优化:hold 身体按视口裁剪(线段求交+勾股长度),长 hold 省大量
@@ -30,7 +33,7 @@ pub use phimakor::render::AGGRESSIVE_HOLD_CLIP;
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, custom_cursor: false, aggressive: 0 }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, custom_cursor: false, aggressive: 0, half_res_fx: true }
     }
 }
 
@@ -79,6 +82,7 @@ pub fn build_settings_form(x: f32, y: f32, w: f32, s: f32, settings: &SettingsDa
         ("perf hint".into(), RTControl::Toggle { on: settings.perf_hint, anim: if settings.perf_hint { 1.0 } else { 0.0 }, dir: if settings.perf_hint { 1.0 } else { -1.0 } }),
         ("custom cursor".into(), RTControl::Toggle { on: settings.custom_cursor, anim: if settings.custom_cursor { 1.0 } else { 0.0 }, dir: if settings.custom_cursor { 1.0 } else { -1.0 } }),
         ("aggressive cull".into(), RTControl::Toggle { on: settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0, anim: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { 0.0 }, dir: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { -1.0 } }),
+        ("half-res fx".into(), RTControl::Toggle { on: settings.half_res_fx, anim: if settings.half_res_fx { 1.0 } else { 0.0 }, dir: if settings.half_res_fx { 1.0 } else { -1.0 } }),
     ]);
     form.row_h = 24.0 * s;
     form.gap = 4.0 * s;
@@ -138,6 +142,12 @@ pub fn apply_settings_form(form: &RealtimeForm, settings: &mut SettingsData) -> 
                 let bit = if *on { AGGRESSIVE_HOLD_CLIP } else { 0 };
                 if settings.aggressive & AGGRESSIVE_HOLD_CLIP != bit {
                     settings.aggressive = (settings.aggressive & !AGGRESSIVE_HOLD_CLIP) | bit;
+                    changed = true;
+                }
+            }
+            ("half-res fx", RTControl::Toggle { on, .. }) => {
+                if *on != settings.half_res_fx {
+                    settings.half_res_fx = *on;
                     changed = true;
                 }
             }

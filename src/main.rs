@@ -292,6 +292,7 @@ impl App {
         overlay.perf_hint = settings.perf_hint;
         overlay.custom_cursor = settings.custom_cursor;
         renderer.aggressive = settings.aggressive;
+        renderer.post.half_res_enabled = settings.half_res_fx;
         if settings.custom_cursor {
             window.set_cursor_visible(false);
         }
@@ -989,6 +990,7 @@ impl State {
         // 应用即时生效的设置。
         self.renderer.set_vsync(self.settings.vsync);
         self.renderer.aggressive = self.settings.aggressive;
+        self.renderer.post.half_res_enabled = self.settings.half_res_fx;
         self.gui_scale = self.settings.gui_scale;
         self.overlay.perf_hint = self.settings.perf_hint;
         // 自定义 GPU 光标:隐藏系统光标。
