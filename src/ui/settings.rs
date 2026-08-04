@@ -19,14 +19,18 @@ pub struct SettingsData {
     pub perf_hint: bool,
     /// 自定义 GPU 光标(隐藏系统光标,worker 画动态光标)。默认关。
     pub custom_cursor: bool,
-    /// 过激优化:hold 身体按视口裁剪(线段求交+勾股长度),长 hold 省
-    /// 大量 off-screen overdraw;视觉上等价但有风险,默认关。
-    pub aggressive_cull: bool,
+    /// 过激优化位标志(默认 0 = 全关):见 [`AGGRESSIVE_*`] 常量。
+    /// 每一项都是有视觉风险、但收益明显的激进优化,设置里逐个开关。
+    pub aggressive: u32,
 }
+
+/// 过激优化:hold 身体按视口裁剪(线段求交+勾股长度),长 hold 省大量
+/// off-screen overdraw;视觉上等价但有回归风险。
+pub use phimakor::render::AGGRESSIVE_HOLD_CLIP;
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, custom_cursor: false, aggressive_cull: false }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, custom_cursor: false, aggressive: 0 }
     }
 }
 
@@ -74,7 +78,7 @@ pub fn build_settings_form(x: f32, y: f32, w: f32, s: f32, settings: &SettingsDa
         ("backend".into(), RTControl::Combo { items: vec!["Auto".into(), "DX12".into(), "Vulkan".into(), "GL".into()], selected: backend_idx, open: false }),
         ("perf hint".into(), RTControl::Toggle { on: settings.perf_hint, anim: if settings.perf_hint { 1.0 } else { 0.0 }, dir: if settings.perf_hint { 1.0 } else { -1.0 } }),
         ("custom cursor".into(), RTControl::Toggle { on: settings.custom_cursor, anim: if settings.custom_cursor { 1.0 } else { 0.0 }, dir: if settings.custom_cursor { 1.0 } else { -1.0 } }),
-        ("aggressive cull".into(), RTControl::Toggle { on: settings.aggressive_cull, anim: if settings.aggressive_cull { 1.0 } else { 0.0 }, dir: if settings.aggressive_cull { 1.0 } else { -1.0 } }),
+        ("aggressive cull".into(), RTControl::Toggle { on: settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0, anim: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { 0.0 }, dir: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { -1.0 } }),
     ]);
     form.row_h = 24.0 * s;
     form.gap = 4.0 * s;
@@ -131,8 +135,9 @@ pub fn apply_settings_form(form: &RealtimeForm, settings: &mut SettingsData) -> 
                 }
             }
             ("aggressive cull", RTControl::Toggle { on, .. }) => {
-                if *on != settings.aggressive_cull {
-                    settings.aggressive_cull = *on;
+                let bit = if *on { AGGRESSIVE_HOLD_CLIP } else { 0 };
+                if settings.aggressive & AGGRESSIVE_HOLD_CLIP != bit {
+                    settings.aggressive = (settings.aggressive & !AGGRESSIVE_HOLD_CLIP) | bit;
                     changed = true;
                 }
             }
