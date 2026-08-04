@@ -599,12 +599,14 @@ fn is_effect_noop(ae: &ActiveEffect) -> bool {
 
 /// 特效是否在 W/2×H/2 target 上执行。
 /// 采样型/带宽型特效(glitch/chromatic/noise/模糊类)对分辨率不敏感,
-/// 半分辨率省 ~75% 像素带宽;逐像素型(grayscale/pixel/vignette)与
-/// 几何畸变型(fisheye)保持全分辨率。自定义 shader 保守全分辨率。
+/// 半分辨率省 ~75% 像素带宽;grayscale/vignette/pixel 也是逐像素但
+/// 视觉上无感(纯色调/柔边/本来就低清),一并降采样。fisheye 是几何
+/// 畸变,半分辨率会糊,保持全分辨率。自定义 shader 保守全分辨率。
 fn effect_is_half_res(key: &str) -> bool {
     matches!(
         key,
         "glitch" | "chromatic" | "noise" | "radialBlur" | "circleBlur"
+            | "grayscale" | "vignette" | "pixel"
     )
 }
 
