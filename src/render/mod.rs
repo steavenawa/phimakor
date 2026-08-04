@@ -405,6 +405,9 @@ pub struct Renderer {
     /// Screen rect of the pause button (window px), for hit-testing.
     pause_rect: PauseHitRect,
     pub vsync: bool,
+    /// Present modes the surface/adapter supports (for vsync-off Mailbox
+    /// fallback); empty for surfaceless renderers.
+    present_modes: Vec<wgpu::PresentMode>,
     /// Post-processing pipeline (effects from extra.json).
     pub post: post::PostPipe,
     /// Intermediate scene texture (for post-processing).
@@ -538,7 +541,7 @@ impl Renderer {
             view_formats: vec![],
         };
         let (width, height) = (config.width, config.height);
-        Self::init(instance, Some((surface, config)), adapter, format, width, height).await
+        Self::init(instance, Some((surface, config)), adapter, format, width, height, caps.present_modes).await
     }
 
     /// Surfaceless constructor for offscreen rendering (preview / embedding).
@@ -551,7 +554,7 @@ impl Renderer {
             .request_adapter(&wgpu::RequestAdapterOptions::default())
             .await
             .context("no suitable GPU adapter")?;
-        Self::init(instance, None, adapter, wgpu::TextureFormat::Rgba8Unorm, width.max(1), height.max(1)).await
+        Self::init(instance, None, adapter, wgpu::TextureFormat::Rgba8Unorm, width.max(1), height.max(1), vec![]).await
     }
 
     /// Shared construction for the window and surfaceless paths: device/queue,
@@ -564,6 +567,7 @@ impl Renderer {
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        present_modes: Vec<wgpu::PresentMode>,
     ) -> anyhow::Result<Self> {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
@@ -689,6 +693,7 @@ impl Renderer {
             fx_seed: 0x9E3779B97F4A7C15,
             text: text::TextState::new(),
             vsync: true,
+            present_modes,
             ui_inst_buf,
         })
     }
@@ -794,10 +799,21 @@ impl Renderer {
     pub fn size(&self) -> [u32; 2] { self.size }
 
     /// Enable or disable V-sync (reconfigures the surface present mode).
+    ///
+    /// With V-sync off, prefer `Mailbox` when the surface supports it — it
+    /// latches the newest completed frame at the next vblank (triple
+    /// buffering): no CPU stall, no tearing, low latency. Fall back to the
+    /// driver default `AutoNoVsync` where Mailbox is unavailable.
     pub fn set_vsync(&mut self, enabled: bool) {
         self.vsync = enabled;
         if let Some(config) = &mut self.config {
-            config.present_mode = if enabled { wgpu::PresentMode::AutoVsync } else { wgpu::PresentMode::AutoNoVsync };
+            config.present_mode = if enabled {
+                wgpu::PresentMode::AutoVsync
+            } else if self.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+                wgpu::PresentMode::Mailbox
+            } else {
+                wgpu::PresentMode::AutoNoVsync
+            };
             self.reconfigure();
         }
     }
