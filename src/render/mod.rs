@@ -1324,9 +1324,17 @@ impl Renderer {
                                     let (bx, by) = to_canvas(x, h1);
                                     let (dx, dy) = (bx - ax, by - ay);
                                     let len = (dx * dx + dy * dy).sqrt();
+                                    // [C] Clip the CENTRE line against a box
+                                    // inflated by the body's half-width: when
+                                    // the line sits outside the viewport the
+                                    // body's edge can still be visible even
+                                    // though its centre line is not. The
+                                    // over-drawn fringe is culled by the GPU.
+                                    let hw = w * 0.5;
                                     if let Some((t0, t1)) = clip_segment(
                                         (ax, ay), (bx, by),
-                                        -CANVAS_W, CANVAS_W, -CANVAS_H, CANVAS_H,
+                                        -CANVAS_W - hw, CANVAS_W + hw,
+                                        -CANVAS_H - hw, CANVAS_H + hw,
                                     ) {
                                         if t1 - t0 > 1e-6 {
                                             let (x0, y0) = (ax + dx * t0, ay + dy * t0);
