@@ -3,12 +3,14 @@
 //! Bursts live in canvas-pixel space (1350×900, center origin); `render()`
 //! calls [`Renderer::push_hit_fx`] after notes so effects draw on top.
 //!
-//! 0.5s 内:中心贴图帧(固定尺寸,原始 30 帧动画)+ 14 个碎片粒子
+//! 0.5s 内:中心贴图帧(固定尺寸,原始 30 帧动画)+ 24 个碎片粒子
 //! (白色纹理染色成金色,与中心同色;大小不一,大小变化动画,
 //! 向外扩散,不旋转)。
+//!
+//! 动画由**谱面时间**驱动(`t0` 是谱面秒,非墙钟):暂停时粒子冻结,
+//! seek 后按谱面时间推进,与音频/画面同步。
 
 use std::collections::HashMap;
-use std::time::Instant;
 
 use super::{
     mat_mul, mat_scale, mat_translate, DrawCmd, DrawUniform, Mat3, Renderer, TexEntry, NOTE_SPRITE_W,
@@ -22,22 +24,25 @@ const HIT_FX_SECS: f32 = 0.5;
 /// 碎片粒子数量。
 const SHARD_COUNT: usize = 24;
 
-/// One live burst: canvas-pixel center + spawn time.
+/// One live burst: canvas-pixel center + spawn time (chart seconds).
 pub(crate) struct HitFx {
     pos: [f32; 2],
-    t0: Instant,
+    t0: f64,
     /// 随机种子(碎片方向/大小,创建时确定,帧率无关)。
     seed: u64,
 }
 
 impl Renderer {
     /// Spawn a hit-effect burst at a canvas-pixel position (1350×900 space,
-    /// center origin). Silently ignored when no `note:hitfx` texture is loaded.
-    pub fn spawn_hit_fx(&mut self, pos_canvas: [f32; 2]) {
+    /// center origin). `chart_time` is the current CHART time in seconds —
+    /// the burst animates on it, so it freezes while paused and stays in
+    /// sync with seeks. Silently ignored when no `note:hitfx` texture is
+    /// loaded.
+    pub fn spawn_hit_fx(&mut self, pos_canvas: [f32; 2], chart_time: f64) {
         if self.textures.contains_key("note:hitfx") {
             self.hit_fx.push(HitFx {
                 pos: pos_canvas,
-                t0: Instant::now(),
+                t0: chart_time,
                 seed: self.fx_seed,
             });
             self.fx_seed = self.fx_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
@@ -60,8 +65,11 @@ impl Renderer {
         letterbox: &Mat3,
         ev_x: f32,
         ev_y: f32,
+        now: f64,
     ) {
-        hit_fx.retain(|fx| fx.t0.elapsed().as_secs_f32() < HIT_FX_SECS);
+        // 谱面时间驱动:只保留"已出生且未超时"的粒子。seek 回跳时
+        // (now < t0)粒子属于已过去的时间,直接销毁而不是回放。
+        hit_fx.retain(|fx| fx.t0 <= now && now - fx.t0 < HIT_FX_SECS as f64);
         if hit_fx.is_empty() {
             return;
         }
@@ -72,7 +80,7 @@ impl Renderer {
         // 淡金色。
         const GOLD: [f32; 4] = [1.0, 0.92, 0.6, 1.0];
         for fx in hit_fx.iter() {
-            let age = fx.t0.elapsed().as_secs_f32();
+            let age = (now - fx.t0).max(0.0) as f32;
             // 中心贴图帧:原始逻辑(固定尺寸 + 固定金色)。
             let frame = ((age / HIT_FX_SECS) * HIT_FX_FRAMES as f32).min((HIT_FX_FRAMES - 1) as f32) as u32;
             let (col, row) = (frame % HIT_FX_COLS, frame / HIT_FX_COLS);

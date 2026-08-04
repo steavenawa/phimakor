@@ -1276,10 +1276,10 @@ impl State {
             // canvas-X rotation px (675) meets the canvas-Y ev scale at P.
             let cy = (line.position[1] + t.sin() * x * pf_aspect) * 450.0;
             if fired.hold_tail { if !fired.fake { self.combo += 1; self.hits += 1; } continue; }
-            if fired.tick { self.renderer.spawn_hit_fx([cx, cy]); continue; }
+            if fired.tick { self.renderer.spawn_hit_fx([cx, cy], chart_time); continue; }
             if fired.fake { continue; }
             self.combo += 1; self.hits += 1;
-            self.renderer.spawn_hit_fx([cx, cy]);
+            self.renderer.spawn_hit_fx([cx, cy], chart_time);
         }
 
         let size = self.window.inner_size();
