@@ -1787,24 +1787,16 @@ impl Renderer {
                 ..Default::default()
             });
             pass.set_pipeline(blit_pipe);
-            // Cache the blit bind group per view (views are stable across frames)
-            let view_key = final_view as *const wgpu::TextureView as usize;
-            let blit_bg = match self.post.blit_bgs.get(&(view_key, false)) {
-                Some(bg) => bg,
-                None => {
-                    let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("blit-bg"),
-                        layout: screen_bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(final_view) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                        ],
-                    });
-                    self.post.blit_bgs.insert((view_key, false), bg);
-                    self.post.blit_bgs.get(&(view_key, false)).unwrap()
-                }
-            };
-            pass.set_bind_group(0, blit_bg, &[]);
+            // Blit bind group built fresh (no caching — see post.rs).
+            let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("blit-bg"),
+                layout: screen_bgl,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(final_view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            });
+            pass.set_bind_group(0, &blit_bg, &[]);
             pass.draw(0..3, 0..1);
         }
         // Step 4: UI overlay (iced + timeline) on the surface, never post-processed

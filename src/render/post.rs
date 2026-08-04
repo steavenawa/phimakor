@@ -50,8 +50,6 @@ pub struct PostPipe {
     pub chart_dir: Option<std::path::PathBuf>,
     /// Blit pipeline: simple passthrough to copy final result to surface.
     pub blit_pipeline: Option<wgpu::RenderPipeline>,
-    /// Cached blit bind groups keyed by (texture-view pointer, half-res flag).
-    pub(crate) blit_bgs: HashMap<(usize, bool), wgpu::BindGroup>,
 
     /// Active effects for the current frame.
     pub active: Vec<ActiveEffect>,
@@ -76,8 +74,6 @@ struct EffPipe {
     uniform_size: u64,
     /// Cached uniform bind group (buffer is reused; content rewritten per frame).
     uniform_bg: Option<wgpu::BindGroup>,
-    /// Cached screen bind groups keyed by texture-view pointer.
-    screen_bgs: HashMap<usize, wgpu::BindGroup>,
 }
 
 impl PostPipe {
@@ -179,7 +175,6 @@ impl PostPipe {
             sampler,
             half_sampler,
             blit_pipeline,
-            blit_bgs: HashMap::new(),
             pipelines: HashMap::new(),
             chart_dir: None,
             active: Vec::new(),
@@ -194,14 +189,8 @@ impl PostPipe {
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
-        // Old texture views are being dropped — cached bind groups that
-        // reference them must go too, otherwise the old targets can never
-        // be freed (leak) and stale views could be bound.
-        self.blit_bgs.clear();
-        for ep in self.pipelines.values_mut() {
-            ep.uniform_bg = None;
-            ep.screen_bgs.clear();
-        }
+        // Old texture views are being dropped — nothing caches them anymore
+        // (bind groups are rebuilt per frame), so no stale references.
         for (i, (t, v)) in self.targets.iter_mut().zip(self.target_views.iter_mut()).enumerate() {
             *t = Some(Self::make_target(device, self.width, self.height, &format!("post-{i}"), self.tex_format));
             *v = Some(t.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
@@ -300,7 +289,7 @@ impl PostPipe {
             mapped_at_creation: false,
         });
 
-        EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size, uniform_bg: None, screen_bgs: HashMap::new() }
+        EffPipe { pipeline, pl, bgl, uniform_buf, uniform_size, uniform_bg: None }
     }
 
     /// Ensure the pipeline + resources exist for a given effect.
@@ -338,17 +327,6 @@ impl PostPipe {
     ) {
         let _s = crate::trace_span!("post_apply");
         if self.active.is_empty() { return; }
-
-        // Bind-group caches are keyed by texture-view POINTER; since the
-        // views travel through stack locals (read_view/h_read) the address
-        // is stable but the VALUE changes within a frame. Stale entries
-        // would sample the previous pass's texture (broken effect chains),
-        // so clear the per-frame caches up front — a handful of entries,
-        // recreation cost is negligible.
-        for ep in self.pipelines.values_mut() {
-            ep.screen_bgs.clear();
-        }
-        self.blit_bgs.clear();
 
         // 优化(PMCORE-53/54):裁剪无效 pass。
         // 零强度特效(主参数 = 0 时输出与输入相同)直接跳过。
@@ -492,24 +470,20 @@ impl PostPipe {
                 ep.uniform_bg.as_ref().unwrap()
             }
         };
-        // Cache the screen bind group per view; views only change on
-        // resize (ping-pong pair + scene/surface targets are stable).
-        let view_key = read_view as *const wgpu::TextureView as usize;
-        let screen_bg = match ep.screen_bgs.get(&view_key) {
-            Some(bg) => bg,
-            None => {
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("screen-bg-{key}")),
-                    layout: &self.screen_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    ],
-                });
-                ep.screen_bgs.insert(view_key, bg);
-                ep.screen_bgs.get(&view_key).unwrap()
-            }
-        };
+        // Screen bind group: built fresh every call. Caching by the view's
+        // STACK ADDRESS is wrong — within one frame the same local variable
+        // (&h_read) is passed for different textures, so a cache hit would
+        // bind the PREVIOUS effect's texture while the pass writes the new
+        // one → wgpu RESOURCE+COLOR_TARGET conflict on the same view.
+        // Bind-group creation is cheap; effect counts are small.
+        let screen_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(&format!("screen-bg-{key}")),
+            layout: &self.screen_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(&format!("effect-{key}")),
@@ -525,7 +499,7 @@ impl PostPipe {
             ..Default::default()
         });
         pass.set_pipeline(&ep.pipeline);
-        pass.set_bind_group(0, screen_bg, &[]);
+        pass.set_bind_group(0, &screen_bg, &[]);
         pass.set_bind_group(1, uniform_bg, &[]);
         pass.draw(0..3, 0..1);
         true
@@ -544,22 +518,17 @@ impl PostPipe {
         is_half: bool,
     ) {
         let Some(blit) = &self.blit_pipeline else { return };
-        let view_key = src as *const wgpu::TextureView as usize;
-        let bg = match self.blit_bgs.get(&(view_key, is_half)) {
-            Some(bg) => bg.clone(),
-            None => {
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("blit-bg"),
-                    layout: &self.screen_bgl,
-                    entries: &[
-                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                    ],
-                });
-                self.blit_bgs.insert((view_key, is_half), bg.clone());
-                bg
-            }
-        };
+        // Bind group built fresh every call — same stack-address caveat as
+        // run_effect: &read_view / &h_read can alias the same stack slot
+        // with different textures within one frame.
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit-bg"),
+            layout: &self.screen_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+            ],
+        });
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("effect-blit"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
