@@ -334,6 +334,17 @@ impl PostPipe {
         let _s = crate::trace_span!("post_apply");
         if self.active.is_empty() { return; }
 
+        // Bind-group caches are keyed by texture-view POINTER; since the
+        // views travel through stack locals (read_view/h_read) the address
+        // is stable but the VALUE changes within a frame. Stale entries
+        // would sample the previous pass's texture (broken effect chains),
+        // so clear the per-frame caches up front — a handful of entries,
+        // recreation cost is negligible.
+        for ep in self.pipelines.values_mut() {
+            ep.screen_bgs.clear();
+        }
+        self.blit_bgs.clear();
+
         // 优化(PMCORE-53/54):裁剪无效 pass。
         // 1) 零强度特效(主参数 = 0 时输出与输入相同)直接跳过;
         // 2) 连续完全相同的实例只保留一个。
@@ -355,7 +366,7 @@ impl PostPipe {
             // last_view() 语义(调用方随后 blit 到 surface)。
             let out = self.target_views[0].as_ref().unwrap().clone();
             let sampler = self.sampler.clone();
-            self.blit(encoder, device, src, &out, &sampler);
+            self.blit(encoder, device, src, &out, &sampler, false);
             self.last_output = 0;
             return;
         }
@@ -395,8 +406,11 @@ impl PostPipe {
                 let (key, uv, _) = &descriptors[i];
                 let write_view = self.target_views[write_idx].as_ref().unwrap().clone();
                 write_idx = 1 - write_idx;
-                self.run_effect(encoder, device, queue, key, uv, &read_view, &write_view);
-                read_view = write_view;
+                if self.run_effect(encoder, device, queue, key, uv, &read_view, &write_view) {
+                    read_view = write_view;
+                } else {
+                    write_idx = 1 - write_idx; // roll back; keep read_view
+                }
                 i += 1;
             } else {
                 let mut j = i + 1;
@@ -405,19 +419,22 @@ impl PostPipe {
                 }
                 // Downscale: current full-res output → half-res ping-pong[0].
                 let h0 = self.half_views[0].as_ref().unwrap().clone();
-                self.blit(encoder, device, &read_view, &h0, &half_sampler);
+                self.blit(encoder, device, &read_view, &h0, &half_sampler, true);
                 let mut h_read: wgpu::TextureView = h0;
                 let mut h_write = 1usize;
                 for (key, uv, _) in descriptors.iter().take(j).skip(i) {
                     let wv = self.half_views[h_write].as_ref().unwrap().clone();
                     h_write = 1 - h_write;
-                    self.run_effect(encoder, device, queue, key, uv, &h_read, &wv);
-                    h_read = wv;
+                    if self.run_effect(encoder, device, queue, key, uv, &h_read, &wv) {
+                        h_read = wv;
+                    } else {
+                        h_write = 1 - h_write; // roll back; keep h_read
+                    }
                 }
                 // Upscale: last half-res output → full-res ping-pong slot.
                 let fw = self.target_views[write_idx].as_ref().unwrap().clone();
                 write_idx = 1 - write_idx;
-                self.blit(encoder, device, &h_read, &fw, &half_sampler);
+                self.blit(encoder, device, &h_read, &fw, &half_sampler, true);
                 read_view = fw;
                 i = j;
             }
@@ -430,6 +447,9 @@ impl PostPipe {
 
     /// Run one effect pass: bind screen + uniform groups, draw the full-screen
     /// triangle into `write_view`, sampling from `read_view`.
+    /// Returns `false` when the pipeline is missing (custom shader failed to
+    /// load) — the caller must then keep `read_view`/indices untouched so the
+    /// chain doesn't sample an unwritten target.
     fn run_effect(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -439,8 +459,8 @@ impl PostPipe {
         uv: &[f32],
         read_view: &wgpu::TextureView,
         write_view: &wgpu::TextureView,
-    ) {
-        let Some(ep) = self.pipelines.get_mut(key) else { return };
+    ) -> bool {
+        let Some(ep) = self.pipelines.get_mut(key) else { return false };
         // Write uniform buffer (256 bytes)
         let mut uniform_data = vec![0u8; 256];
         for (i, &val) in uv.iter().enumerate() {
@@ -507,6 +527,7 @@ impl PostPipe {
         pass.set_bind_group(0, screen_bg, &[]);
         pass.set_bind_group(1, uniform_bg, &[]);
         pass.draw(0..3, 0..1);
+        true
     }
 
     /// Copy `src` into `dst` with the passthrough blit pipeline. Used for the
@@ -519,10 +540,10 @@ impl PostPipe {
         src: &wgpu::TextureView,
         dst: &wgpu::TextureView,
         sampler: &wgpu::Sampler,
+        is_half: bool,
     ) {
         let Some(blit) = &self.blit_pipeline else { return };
         let view_key = src as *const wgpu::TextureView as usize;
-        let is_half = std::ptr::eq(sampler, &self.half_sampler);
         let bg = match self.blit_bgs.get(&(view_key, is_half)) {
             Some(bg) => bg.clone(),
             None => {

@@ -36,6 +36,10 @@ const ASPECT: f32 = 3.0 / 2.0;
 
 // Contract render-semantics constants, in RPE CANVAS pixels (1350×900).
 const CANVAS_W: f32 = 675.0; // world x ±1 ↔ ±675 canvas px
+
+/// 过激优化位标志(设置里逐个开关):hold 身体按视口裁剪(线段求交+
+/// 勾股长度),长 hold 省大量 off-screen overdraw;视觉上等价但有回归风险。
+pub const AGGRESSIVE_HOLD_CLIP: u32 = 1 << 0;
 const CANVAS_H: f32 = 450.0; // world y ±1 ↔ ±450 canvas px
 /// Event-position x offset: positions (not sprites) are scaled by
 /// aspect/1.5 so they stretch from the 3:2 canvas width to fill the
@@ -459,9 +463,8 @@ pub struct Renderer {
     /// Screen rect of the pause button (window px), for hit-testing.
     pause_rect: PauseHitRect,
     pub vsync: bool,
-    /// 过激优化:hold body 视口裁剪(线段求交+勾股长度)。视觉上等价但
-    /// 有回归风险,默认关,设置里开。
-    pub aggressive_cull: bool,
+    /// 过激优化位标志(设置里开):见 `ui::settings::AGGRESSIVE_*`。
+    pub aggressive: u32,
     /// Present modes the surface/adapter supports (for vsync-off Mailbox
     /// fallback); empty for surfaceless renderers.
     present_modes: Vec<wgpu::PresentMode>,
@@ -751,7 +754,7 @@ impl Renderer {
             fx_seed: 0x9E3779B97F4A7C15,
             text: text::TextState::new(),
             vsync: true,
-            aggressive_cull: false,
+            aggressive: 0,
             present_modes,
             ui_inst_buf,
         })
@@ -1314,7 +1317,7 @@ impl Renderer {
                                 };
                                 let bh = (h1 - h0).abs();
                                 if bh > 1e-5 {
-                                    if self.aggressive_cull {
+                                    if self.aggressive & AGGRESSIVE_HOLD_CLIP != 0 {
                                         // [C] 过激优化(设置里开):hold body 沿
                                         // 线方向裁剪。线段(head边缘→tail边缘,
                                         // 含线旋转)与画布矩形求交(Liang-Barsky),
@@ -1742,7 +1745,10 @@ impl Renderer {
             // [C] Background sits at instance 0 (fully opaque, no-blend pass);
             // cmds follow at offset 1 with the alpha pipeline. The draw loop
             // keeps cmd ordering (translucent layering stays correct).
-            if bg_quad.is_some() {
+            // NOTE: the offset must track whether a background exists — with
+            // no background the cmds start at instance 0.
+            let base = usize::from(bg_quad.is_some());
+            if base == 1 {
                 pass.set_pipeline(&self.opaque_pipeline);
                 pass.set_bind_group(0, bg_quad.as_ref().unwrap().2, &[]);
                 pass.draw(0..4, 0..1);
@@ -1752,7 +1758,7 @@ impl Renderer {
             for i in 1..=cmds.len() {
                 if i == cmds.len() || !std::ptr::eq(cmds[i].tex, cmds[start].tex) {
                     pass.set_bind_group(0, cmds[start].tex, &[]);
-                    pass.draw(0..4, start as u32 + 1..i as u32 + 1);
+                    pass.draw(0..4, (start + base) as u32..(i + base) as u32);
                     start = i;
                 }
             }

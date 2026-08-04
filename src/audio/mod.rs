@@ -190,6 +190,14 @@ impl AudioClock {
         let empty = self.player.empty();
         let seeked = self.player.try_seek(Duration::from_secs_f64(t)).is_ok() && !empty;
         if !seeked {
+            // Only an EXHAUSTED queue gets a rebuilt source. A non-empty
+            // queue whose try_seek failed must be left untouched — appending
+            // a fresh source here would play a duplicate from 0 after the
+            // current one ends (audio/display permanently desynced).
+            if !empty {
+                eprintln!("warning: audio seek to {t:.2}s failed on an active queue {}", self.music_path.display());
+                return false;
+            }
             let reopen = std::fs::File::open(&self.music_path)
                 .ok()
                 .and_then(|file| rodio::Decoder::try_from(file).ok());
