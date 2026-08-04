@@ -135,7 +135,8 @@ impl ChartSession {
             let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().map(|tr| {
                 let line = &frame.lines[tr.line];
                 let rot = line.rotation as f64;
-                let x = tr.x as f64 * 675.0;
+                // tr.x 是相对线中心的单位(-1..1),与 fired.x 同语义。
+                let x = tr.x as f64;
                 let cx = (line.position[0] as f64 + rot.cos() * x) * 675.0;
                 let cy = (line.position[1] as f64 + rot.sin() * x * self.engine.playfield_aspect() as f64) * 450.0;
                 (tr.t0, [cx as f32, cy as f32])

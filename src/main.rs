@@ -1553,9 +1553,12 @@ impl State {
             let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().map(|tr| {
                 let line = &frame.lines[tr.line];
                 let rot = line.rotation as f64;
-                let x = tr.x as f64 * 675.0;
+                // tr.x 是相对线中心的单位(-1..1),与 fired.x 同语义:
+                // cx = (线位置 + 旋转后的相对偏移) × 675 画布 px;
+                // y 方向旋转投影乘 pf_aspect(与原 fired 循环一致)。
+                let x = tr.x as f64;
                 let cx = (line.position[0] as f64 + rot.cos() * x) * 675.0;
-                let cy = (line.position[1] as f64 + rot.sin() * x) * 450.0;
+                let cy = (line.position[1] as f64 + rot.sin() * x * self.renderer.playfield_aspect() as f64) * 450.0;
                 (tr.t0, [cx as f32, cy as f32])
             }).collect();
             self.renderer.set_frame_fx(fx);
