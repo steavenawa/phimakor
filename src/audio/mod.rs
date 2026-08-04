@@ -33,6 +33,9 @@ const MAX_PENDING_HITS: usize = 32;
 /// How long a hitsound can plausibly keep playing; entries older than this
 /// are assumed finished and dropped from the pending count.
 const HIT_TAIL: Duration = Duration::from_millis(200);
+/// Single-hitsound volume relative to the music (soft limiter base). Kept
+/// below 1 so hitsounds accent the beat instead of drowning out the track.
+const HIT_BASE_VOLUME: f32 = 0.6;
 
 pub struct AudioClock {
     // Kept alive: dropping the stream stops all playback.
@@ -226,11 +229,14 @@ impl AudioClock {
     /// Fire a hitsound: kind 1|2 -> click (hold uses click), 3 -> flick,
     /// 4 -> drag. Silent while paused; cheap enough to call per note per frame.
     ///
-    /// Polyphony-capped: if more than [`MAX_PENDING_HITS`] hitsounds were
-    /// added within the last [`HIT_TAIL`], the hit is dropped — an extreme
-    /// chart with a giant chord would otherwise enqueue hundreds of
-    /// overlapping sounds at once, and the mixer would spend its whole
-    /// callback budget summing them (stalling everything downstream).
+    /// Non-blocking: the sound is handed to the mixer over an unbounded
+    /// channel — this call never waits on the audio callback, so dense
+    /// charts can't stall playback. Soft limiter: each hit is amplified to
+    /// `HIT_BASE_VOLUME / sqrt(concurrent+1)`, so a single hit is audible
+    /// but a chord of overlapping hits stays bounded and never drowns out
+    /// the music. Polyphony-capped: beyond [`MAX_PENDING_HITS`] hits within
+    /// [`HIT_TAIL`], hits are dropped (the mixer would otherwise spend its
+    /// whole callback budget summing them, stalling everything downstream).
     pub fn hit(&self, kind: u8) {
         if !self.playing.get() {
             return;
@@ -253,9 +259,12 @@ impl AudioClock {
         if pending.len() >= MAX_PENDING_HITS {
             return;
         }
+        // Soft limiter: concurrent count → per-hit volume (1/sqrt).
+        let concurrent = pending.len() as f32 + 1.0;
+        let vol = HIT_BASE_VOLUME / concurrent.sqrt();
         pending.push_back(now);
         drop(pending);
-        self.stream.mixer().add(buf.clone());
+        self.stream.mixer().add(buf.clone().amplify(vol));
     }
 }
 
