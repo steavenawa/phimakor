@@ -51,6 +51,8 @@ pub struct PostPipe {
     pub chart_dir: Option<std::path::PathBuf>,
     /// Blit pipeline: simple passthrough to copy final result to surface.
     pub blit_pipeline: Option<wgpu::RenderPipeline>,
+    /// Cached blit bind groups keyed by (SrcTag, use_half_sampler).
+    blit_bgs: HashMap<(SrcTag, bool), wgpu::BindGroup>,
 
     /// Active effects for the current frame.
     pub active: Vec<ActiveEffect>,
@@ -71,6 +73,18 @@ pub struct PostPipe {
     pub tex_format: wgpu::TextureFormat,
 }
 
+/// 屏幕采样源标签:bind group 缓存的稳定 key。
+/// 不用纹理指针(栈地址会碰撞),用链路中的固定角色。
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum SrcTag {
+    /// 输入场景(scene 纹理或 surface 上游)。
+    Scene,
+    /// 全分辨率 ping-pong target。
+    Full(u8),
+    /// 半分辨率 ping-pong target。
+    Half(u8),
+}
+
 struct EffPipe {
     pipeline: wgpu::RenderPipeline,
     bgl: wgpu::BindGroupLayout,     // group 1 (uniforms)
@@ -78,6 +92,11 @@ struct EffPipe {
     uniform_size: u64,
     /// Cached uniform bind group (buffer is reused; content rewritten per frame).
     uniform_bg: Option<wgpu::BindGroup>,
+    /// Cached screen bind groups keyed by (SrcTag, use_half_sampler).
+    /// `SrcTag` is a stable role (Scene/Full0/Full1/Half0/Half1) — unlike a
+    /// texture pointer, it never collides when the same local variable
+    /// carries different textures within one frame.
+    screen_bgs: HashMap<(SrcTag, bool), wgpu::BindGroup>,
 }
 
 impl PostPipe {
@@ -179,6 +198,7 @@ impl PostPipe {
             sampler,
             half_sampler,
             blit_pipeline,
+            blit_bgs: HashMap::new(),
             pipelines: HashMap::new(),
             chart_dir: None,
             active: Vec::new(),
@@ -194,8 +214,12 @@ impl PostPipe {
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
-        // Old texture views are being dropped — nothing caches them anymore
-        // (bind groups are rebuilt per frame), so no stale references.
+        // Old texture views are dropped — cached bind groups referencing
+        // them must go too, otherwise the old targets can never be freed.
+        self.blit_bgs.clear();
+        for ep in self.pipelines.values_mut() {
+            ep.screen_bgs.clear();
+        }
         for (i, (t, v)) in self.targets.iter_mut().zip(self.target_views.iter_mut()).enumerate() {
             *t = Some(Self::make_target(device, self.width, self.height, &format!("post-{i}"), self.tex_format));
             *v = Some(t.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
@@ -294,7 +318,7 @@ impl PostPipe {
             mapped_at_creation: false,
         });
 
-        EffPipe { pipeline, bgl, uniform_buf, uniform_size, uniform_bg: None }
+        EffPipe { pipeline, bgl, uniform_buf, uniform_size, uniform_bg: None, screen_bgs: HashMap::new() }
     }
 
     /// Ensure the pipeline + resources exist for a given effect.
@@ -371,8 +395,7 @@ impl PostPipe {
             // 全部裁剪:输出 = 输入。做一次 src→target blit 保持
             // last_view() 语义(调用方随后 blit 到 surface)。
             let out = self.target_views[0].as_ref().unwrap().clone();
-            let sampler = self.sampler.clone();
-            self.blit(encoder, device, src, &out, &sampler, false);
+            self.blit(encoder, device, src, &out, SrcTag::Scene);
             self.last_output = 0;
             return;
         }
@@ -404,7 +427,7 @@ impl PostPipe {
         // `read_view` 是 owned clone(wgpu::TextureView 内部 Arc,clone 廉价),
         // 避免跨迭代的借用链。
         let mut read_view: wgpu::TextureView = src.clone();
-        let half_sampler = self.half_sampler.clone();
+        let mut read_tag = SrcTag::Scene;
         let half_res = self.half_res_enabled;
         let mut write_idx = 0usize;
         let mut i = 0usize;
@@ -413,8 +436,9 @@ impl PostPipe {
                 let (key, uv, _) = &descriptors[i];
                 let write_view = self.target_views[write_idx].as_ref().unwrap().clone();
                 write_idx = 1 - write_idx;
-                if self.run_effect(encoder, device, queue, key, uv, &read_view, &write_view) {
+                if self.run_effect(encoder, device, queue, key, uv, &read_view, &write_view, read_tag) {
                     read_view = write_view;
+                    read_tag = SrcTag::Full((1 - write_idx) as u8);
                 } else {
                     write_idx = 1 - write_idx; // roll back; keep read_view
                 }
@@ -426,14 +450,16 @@ impl PostPipe {
                 }
                 // Downscale: current full-res output → half-res ping-pong[0].
                 let h0 = self.half_views[0].as_ref().unwrap().clone();
-                self.blit(encoder, device, &read_view, &h0, &half_sampler, true);
+                self.blit(encoder, device, &read_view, &h0, read_tag);
                 let mut h_read: wgpu::TextureView = h0;
+                let mut h_read_tag = SrcTag::Half(0);
                 let mut h_write = 1usize;
                 for (key, uv, _) in descriptors.iter().take(j).skip(i) {
                     let wv = self.half_views[h_write].as_ref().unwrap().clone();
                     h_write = 1 - h_write;
-                    if self.run_effect(encoder, device, queue, key, uv, &h_read, &wv) {
+                    if self.run_effect(encoder, device, queue, key, uv, &h_read, &wv, h_read_tag) {
                         h_read = wv;
+                        h_read_tag = SrcTag::Half((1 - h_write) as u8);
                     } else {
                         h_write = 1 - h_write; // roll back; keep h_read
                     }
@@ -441,8 +467,9 @@ impl PostPipe {
                 // Upscale: last half-res output → full-res ping-pong slot.
                 let fw = self.target_views[write_idx].as_ref().unwrap().clone();
                 write_idx = 1 - write_idx;
-                self.blit(encoder, device, &h_read, &fw, &half_sampler, true);
+                self.blit(encoder, device, &h_read, &fw, h_read_tag);
                 read_view = fw;
+                read_tag = SrcTag::Full((1 - write_idx) as u8);
                 i = j;
             }
         }
@@ -466,6 +493,7 @@ impl PostPipe {
         uv: &[f32],
         read_view: &wgpu::TextureView,
         write_view: &wgpu::TextureView,
+        src_tag: SrcTag,
     ) -> bool {
         let Some(ep) = self.pipelines.get_mut(key) else { return false };
         // Write uniform buffer (256 bytes)
@@ -498,20 +526,28 @@ impl PostPipe {
                 ep.uniform_bg.as_ref().unwrap()
             }
         };
-        // Screen bind group: built fresh every call. Caching by the view's
-        // STACK ADDRESS is wrong — within one frame the same local variable
-        // (&h_read) is passed for different textures, so a cache hit would
-        // bind the PREVIOUS effect's texture while the pass writes the new
-        // one → wgpu RESOURCE+COLOR_TARGET conflict on the same view.
-        // Bind-group creation is cheap; effect counts are small.
-        let screen_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some(&format!("screen-bg-{key}")),
-            layout: &self.screen_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-            ],
-        });
+        // Screen bind group: cached by (SrcTag, half-sampler). SrcTag is a
+        // stable role (Scene/Full0/1/Half0/1), so the cache is safe — the
+        // same stack local may carry different textures, but the TAG changes
+        // with it. Half-res passes sample with the linear half_sampler to
+        // avoid downscale shimmer.
+        let use_half = matches!(src_tag, SrcTag::Half(_));
+        let sampler = if use_half { &self.half_sampler } else { &self.sampler };
+        let screen_bg = match ep.screen_bgs.get(&(src_tag, use_half)) {
+            Some(bg) => bg.clone(),
+            None => {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("screen-bg-{key}")),
+                    layout: &self.screen_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                    ],
+                });
+                ep.screen_bgs.insert((src_tag, use_half), bg.clone());
+                bg
+            }
+        };
 
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(&format!("effect-{key}")),
@@ -535,28 +571,33 @@ impl PostPipe {
 
     /// Copy `src` into `dst` with the passthrough blit pipeline. Used for the
     /// no-op shortcut and for down/upscaling around half-resolution effect
-    /// runs. Bind groups are cached per (view, half-res) pair.
+    /// runs. Bind groups are cached per (SrcTag, half-sampler) pair.
     fn blit(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         device: &wgpu::Device,
         src: &wgpu::TextureView,
         dst: &wgpu::TextureView,
-        sampler: &wgpu::Sampler,
-        _is_half: bool,
+        src_tag: SrcTag,
     ) {
         let Some(blit) = &self.blit_pipeline else { return };
-        // Bind group built fresh every call — same stack-address caveat as
-        // run_effect: &read_view / &h_read can alias the same stack slot
-        // with different textures within one frame.
-        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("blit-bg"),
-            layout: &self.screen_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-            ],
-        });
+        let use_half = matches!(src_tag, SrcTag::Half(_));
+        let sampler = if use_half { &self.half_sampler } else { &self.sampler };
+        let bg = match self.blit_bgs.get(&(src_tag, use_half)) {
+            Some(bg) => bg.clone(),
+            None => {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("blit-bg"),
+                    layout: &self.screen_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                    ],
+                });
+                self.blit_bgs.insert((src_tag, use_half), bg.clone());
+                bg
+            }
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("effect-blit"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
