@@ -30,10 +30,19 @@ pub struct PostPipe {
     /// Index of the target holding the last effect output (set by apply()).
     last_output: usize,
 
+    /// Half-resolution ping-pong targets for bandwidth-heavy effects
+    /// (blur/glitch-style: ~75% fewer pixels per pass).
+    half_targets: [Option<wgpu::Texture>; 2],
+    half_views: [Option<wgpu::TextureView>; 2],
+
     /// Bind group layout for screen texture (shared by all effects, needed by Renderer too).
     pub screen_bgl: wgpu::BindGroupLayout,
     /// Sampler shared by all effects.
     pub sampler: wgpu::Sampler,
+    /// Linear/linear sampler for down/upscaling to/from half-resolution
+    /// (the shared sampler has min=Nearest, which would shimmer when
+    /// downsample-filtering the source into a half-res pass).
+    half_sampler: wgpu::Sampler,
 
     /// Per-effect pipelines (lazily created).
     pipelines: HashMap<String, EffPipe>,
@@ -41,8 +50,8 @@ pub struct PostPipe {
     pub chart_dir: Option<std::path::PathBuf>,
     /// Blit pipeline: simple passthrough to copy final result to surface.
     pub blit_pipeline: Option<wgpu::RenderPipeline>,
-    /// Cached blit bind groups keyed by texture-view pointer.
-    pub(crate) blit_bgs: HashMap<usize, wgpu::BindGroup>,
+    /// Cached blit bind groups keyed by (texture-view pointer, half-res flag).
+    pub(crate) blit_bgs: HashMap<(usize, bool), wgpu::BindGroup>,
 
     /// Active effects for the current frame.
     pub active: Vec<ActiveEffect>,
@@ -77,6 +86,14 @@ impl PostPipe {
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        let half_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("post-half-sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         // Bind group layout for group 0: texture + sampler
@@ -152,8 +169,11 @@ impl PostPipe {
             targets: [None, None],
             target_views: [None, None],
             last_output: 0,
+            half_targets: [None, None],
+            half_views: [None, None],
             screen_bgl,
             sampler,
+            half_sampler,
             blit_pipeline,
             blit_bgs: HashMap::new(),
             pipelines: HashMap::new(),
@@ -179,6 +199,12 @@ impl PostPipe {
         }
         for (i, (t, v)) in self.targets.iter_mut().zip(self.target_views.iter_mut()).enumerate() {
             *t = Some(Self::make_target(device, self.width, self.height, &format!("post-{i}"), self.tex_format));
+            *v = Some(t.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
+        }
+        let hw = (self.width / 2).max(1);
+        let hh = (self.height / 2).max(1);
+        for (i, (t, v)) in self.half_targets.iter_mut().zip(self.half_views.iter_mut()).enumerate() {
+            *t = Some(Self::make_target(device, hw, hh, &format!("post-half-{i}"), self.tex_format));
             *v = Some(t.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
         }
     }
@@ -275,7 +301,7 @@ impl PostPipe {
     /// Ensure the pipeline + resources exist for a given effect.
     pub fn ensure_effect(&mut self, device: &wgpu::Device, def: &EffectDef) {
         if self.pipelines.contains_key(def.name) { return; }
-        let pipe = self.build_eff_pipe(device, &def.name, def.frag);
+        let pipe = self.build_eff_pipe(device, def.name, def.frag);
         self.pipelines.insert(def.name.to_string(), pipe);
     }
 
@@ -327,40 +353,9 @@ impl PostPipe {
         if active.is_empty() {
             // 全部裁剪:输出 = 输入。做一次 src→target blit 保持
             // last_view() 语义(调用方随后 blit 到 surface)。
-            let Some(blit) = &self.blit_pipeline else { self.last_output = 0; return };
-            let bg = {
-                let view_key = src as *const wgpu::TextureView as usize;
-                match self.blit_bgs.get(&view_key) {
-                    Some(bg) => bg.clone(),
-                    None => {
-                        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("blit-bg"),
-                            layout: &self.screen_bgl,
-                            entries: &[
-                                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
-                                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                            ],
-                        });
-                        self.blit_bgs.insert(view_key, bg.clone());
-                        bg
-                    }
-                }
-            };
-            let out = self.target_views[0].as_ref().unwrap();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("effect-noop-blit"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: out,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(blit);
-            pass.set_bind_group(0, &bg, &[]);
-            pass.draw(0..3, 0..1);
-            drop(pass);
+            let out = self.target_views[0].as_ref().unwrap().clone();
+            let sampler = self.sampler.clone();
+            self.blit(encoder, device, src, &out, &sampler);
             self.last_output = 0;
             return;
         }
@@ -385,84 +380,177 @@ impl PostPipe {
 
         // Phase 2: execute effects. `write_idx` toggles 0/1 between effects
         // (local only — no persistent state to get out of sync).
-        let mut read_view: &wgpu::TextureView = src;
+        //
+        // 半分辨率段:带宽型特效(glitch/chromatic/blur 类)在 W/2×H/2 target
+        // 上跑,省 ~75% 像素带宽;连续 half-res 特效只做一次降采样和一次
+        // 升采样(段内直接 ping-pong 半分辨率 target)。
+        // `read_view` 是 owned clone(wgpu::TextureView 内部 Arc,clone 廉价),
+        // 避免跨迭代的借用链。
+        let mut read_view: wgpu::TextureView = src.clone();
+        let half_sampler = self.half_sampler.clone();
         let mut write_idx = 0usize;
-        for (key, uv, _) in &descriptors {
-            let Some(ep) = self.pipelines.get_mut(key.as_str()) else { continue };
-            let write_view = self.target_views[write_idx].as_ref().unwrap();
-            write_idx = 1 - write_idx;
-            // Write uniform buffer (256 bytes)
-            let mut uniform_data = vec![0u8; 256];
-            for (i, &val) in uv.iter().enumerate() {
-                let offset = i * 4;
-                if offset + 4 <= uniform_data.len() {
-                    uniform_data[offset..offset+4].copy_from_slice(&val.to_le_bytes());
+        let mut i = 0usize;
+        while i < descriptors.len() {
+            if !effect_is_half_res(&descriptors[i].0) {
+                let (key, uv, _) = &descriptors[i];
+                let write_view = self.target_views[write_idx].as_ref().unwrap().clone();
+                write_idx = 1 - write_idx;
+                self.run_effect(encoder, device, queue, key, uv, &read_view, &write_view);
+                read_view = write_view;
+                i += 1;
+            } else {
+                let mut j = i + 1;
+                while j < descriptors.len() && effect_is_half_res(&descriptors[j].0) {
+                    j += 1;
                 }
+                // Downscale: current full-res output → half-res ping-pong[0].
+                let h0 = self.half_views[0].as_ref().unwrap().clone();
+                self.blit(encoder, device, &read_view, &h0, &half_sampler);
+                let mut h_read: wgpu::TextureView = h0;
+                let mut h_write = 1usize;
+                for (key, uv, _) in descriptors.iter().take(j).skip(i) {
+                    let wv = self.half_views[h_write].as_ref().unwrap().clone();
+                    h_write = 1 - h_write;
+                    self.run_effect(encoder, device, queue, key, uv, &h_read, &wv);
+                    h_read = wv;
+                }
+                // Upscale: last half-res output → full-res ping-pong slot.
+                let fw = self.target_views[write_idx].as_ref().unwrap().clone();
+                write_idx = 1 - write_idx;
+                self.blit(encoder, device, &h_read, &fw, &half_sampler);
+                read_view = fw;
+                i = j;
             }
-            queue.write_buffer(&ep.uniform_buf, 0, &uniform_data);
-            // Reuse the uniform bind group — the buffer is stable, only its
-            // contents change per frame.
-            let uniform_bg = match &ep.uniform_bg {
-                Some(bg) => bg,
-                None => {
-                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("ubg-{key}")),
-                        layout: &ep.bgl,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &ep.uniform_buf,
-                                offset: 0,
-                                size: wgpu::BufferSize::new(ep.uniform_size),
-                            }),
-                        }],
-                    });
-                    ep.uniform_bg = Some(bg);
-                    ep.uniform_bg.as_ref().unwrap()
-                }
-            };
-            // Cache the screen bind group per view; views only change on
-            // resize (ping-pong pair + scene/surface targets are stable).
-            let view_key = read_view as *const wgpu::TextureView as usize;
-            let screen_bg = match ep.screen_bgs.get(&view_key) {
-                Some(bg) => bg,
-                None => {
-                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("screen-bg-{key}")),
-                        layout: &self.screen_bgl,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                        ],
-                    });
-                    ep.screen_bgs.insert(view_key, bg);
-                    ep.screen_bgs.get(&view_key).unwrap()
-                }
-            };
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(&format!("effect-{key}")),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: write_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&ep.pipeline);
-            pass.set_bind_group(0, screen_bg, &[]);
-            pass.set_bind_group(1, uniform_bg, &[]);
-            pass.draw(0..3, 0..1);
-            read_view = write_view;
         }
         // After the loop, `write_idx` points at the slot that was NOT written
         // last (it toggled after the final write); the last output is the
         // other one.
         self.last_output = 1 - write_idx;
+    }
+
+    /// Run one effect pass: bind screen + uniform groups, draw the full-screen
+    /// triangle into `write_view`, sampling from `read_view`.
+    fn run_effect(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        key: &str,
+        uv: &[f32],
+        read_view: &wgpu::TextureView,
+        write_view: &wgpu::TextureView,
+    ) {
+        let Some(ep) = self.pipelines.get_mut(key) else { return };
+        // Write uniform buffer (256 bytes)
+        let mut uniform_data = vec![0u8; 256];
+        for (i, &val) in uv.iter().enumerate() {
+            let offset = i * 4;
+            if offset + 4 <= uniform_data.len() {
+                uniform_data[offset..offset+4].copy_from_slice(&val.to_le_bytes());
+            }
+        }
+        queue.write_buffer(&ep.uniform_buf, 0, &uniform_data);
+        // Reuse the uniform bind group — the buffer is stable, only its
+        // contents change per frame.
+        let uniform_bg = match &ep.uniform_bg {
+            Some(bg) => bg,
+            None => {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("ubg-{key}")),
+                    layout: &ep.bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &ep.uniform_buf,
+                            offset: 0,
+                            size: wgpu::BufferSize::new(ep.uniform_size),
+                        }),
+                    }],
+                });
+                ep.uniform_bg = Some(bg);
+                ep.uniform_bg.as_ref().unwrap()
+            }
+        };
+        // Cache the screen bind group per view; views only change on
+        // resize (ping-pong pair + scene/surface targets are stable).
+        let view_key = read_view as *const wgpu::TextureView as usize;
+        let screen_bg = match ep.screen_bgs.get(&view_key) {
+            Some(bg) => bg,
+            None => {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("screen-bg-{key}")),
+                    layout: &self.screen_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    ],
+                });
+                ep.screen_bgs.insert(view_key, bg);
+                ep.screen_bgs.get(&view_key).unwrap()
+            }
+        };
+
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some(&format!("effect-{key}")),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: write_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&ep.pipeline);
+        pass.set_bind_group(0, screen_bg, &[]);
+        pass.set_bind_group(1, uniform_bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    /// Copy `src` into `dst` with the passthrough blit pipeline. Used for the
+    /// no-op shortcut and for down/upscaling around half-resolution effect
+    /// runs. Bind groups are cached per (view, half-res) pair.
+    fn blit(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        src: &wgpu::TextureView,
+        dst: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) {
+        let Some(blit) = &self.blit_pipeline else { return };
+        let view_key = src as *const wgpu::TextureView as usize;
+        let is_half = std::ptr::eq(sampler, &self.half_sampler);
+        let bg = match self.blit_bgs.get(&(view_key, is_half)) {
+            Some(bg) => bg.clone(),
+            None => {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("blit-bg"),
+                    layout: &self.screen_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(src) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                    ],
+                });
+                self.blit_bgs.insert((view_key, is_half), bg.clone());
+                bg
+            }
+        };
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("effect-blit"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: dst,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(blit);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
     }
 
     /// After `apply()`, returns the texture view containing the final result.
@@ -491,6 +579,17 @@ fn is_effect_noop(ae: &ActiveEffect) -> bool {
         "vignette" => v.get(3).is_some_and(|f| *f == 0.0),     // color_a
         _ => false,
     }
+}
+
+/// 特效是否在 W/2×H/2 target 上执行。
+/// 采样型/带宽型特效(glitch/chromatic/noise/模糊类)对分辨率不敏感,
+/// 半分辨率省 ~75% 像素带宽;逐像素型(grayscale/pixel/vignette)与
+/// 几何畸变型(fisheye)保持全分辨率。自定义 shader 保守全分辨率。
+fn effect_is_half_res(key: &str) -> bool {
+    matches!(
+        key,
+        "glitch" | "chromatic" | "noise" | "radialBlur" | "circleBlur"
+    )
 }
 
 #[cfg(test)]

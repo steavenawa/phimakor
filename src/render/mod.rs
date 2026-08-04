@@ -259,10 +259,13 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 /// `@location(2)`: `color` (RGBA),
 /// `@location(3)`: `uv_rect` (`[u0, v0, du, dv]`).
 /// See the `VsIn` struct inside `SHADER` for the WGSL definition.
+/// Returns (alpha-blended pipeline, no-blend pipeline, texture BGL, sampler).
+/// The no-blend variant is for fully opaque quads (background image): it
+/// skips the blending unit entirely.
 pub(crate) fn create_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
-) -> (wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Sampler) {
+) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Sampler) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("phimakor-quad"),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(SHADER)),
@@ -294,34 +297,38 @@ pub(crate) fn create_pipeline(
         bind_group_layouts: &[Some(&tex_bgl)],
         immediate_size: 0,
     });
-    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("phimakor-quad"),
-        layout: Some(&pipeline_layout),
-        vertex: wgpu::VertexState {
-            module: &shader,
-            entry_point: Some("vs"),
-            compilation_options: Default::default(),
-            buffers: &[Some(INSTANCE_LAYOUT)],
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: &shader,
-            entry_point: Some("fs"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleStrip,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    });
+    let make = |blend: Option<wgpu::BlendState>| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("phimakor-quad"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[Some(INSTANCE_LAYOUT)],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleStrip,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        })
+    };
+    let pipeline = make(Some(wgpu::BlendState::ALPHA_BLENDING));
+    let opaque_pipeline = make(None);
 
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
         label: None,
@@ -330,7 +337,7 @@ pub(crate) fn create_pipeline(
         ..Default::default()
     });
 
-    (pipeline, tex_bgl, sampler)
+    (pipeline, opaque_pipeline, tex_bgl, sampler)
 }
 
 /// wgpu-based renderer driving the main window (or offscreen preview).
@@ -377,6 +384,8 @@ pub struct Renderer {
     size: [u32; 2],
 
     pipeline: wgpu::RenderPipeline,
+    /// No-blend variant for fully opaque quads (background image).
+    opaque_pipeline: wgpu::RenderPipeline,
     tex_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
 
@@ -593,7 +602,7 @@ impl Renderer {
             None => (None, None),
         };
 
-        let (pipeline, tex_bgl, sampler) = create_pipeline(&device, format);
+        let (pipeline, opaque_pipeline, tex_bgl, sampler) = create_pipeline(&device, format);
 
         let instance_bufs = [
             Self::make_instance_buf(&device, INITIAL_DRAW_CAPACITY),
@@ -669,6 +678,7 @@ impl Renderer {
             config,
             size: [width, height],
             pipeline,
+            opaque_pipeline,
             tex_bgl,
             sampler,
             instance_bufs,
@@ -1032,8 +1042,11 @@ impl Renderer {
 
         // Background: cover-fill with Gaussian-blurred illustration + 30 % black
         // overlay so judge lines / notes pop against any image.
-        if let Some((bg, size)) = &self.background {
-            let d = self.background_dim;
+        // [C] The background quad is fully opaque (no alpha channel, color.a=1)
+        // so it is drawn OUTSIDE cmds with the no-blend pipeline — a full-screen
+        // quad that skips the blending unit. The 30 % black overlay stays in
+        // cmds (it is genuinely translucent).
+        let bg_quad: Option<(Mat3, [f32; 4], &wgpu::BindGroup)> = self.background.as_ref().map(|(bg, size)| {
             let r = size[0] / size[1];
             let uv = if r > aspect {
                 let w = aspect / r;
@@ -1044,17 +1057,13 @@ impl Renderer {
             };
             // Cover the full RPE canvas (1350×900): it stretches to the
             // playfield box at any aspect.
-            // Cover-FILL the whole playfield box: the quad is scaled by 1/fit
-            // so that, after the fit-scaled letterbox, it spans 2kx×2ky (the
-            // full box) at any aspect. The UV crop handles the image aspect.
             let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 1350.0 / aspect));
-            cmds.push(DrawCmd {
-                uniform: DrawUniform { model: bg_m, color: [d, d, d, 1.0], uv_rect: uv },
-                tex: bg,
-            });
+            (bg_m, uv, bg)
+        });
+        if let Some((bg_m, _, _)) = &bg_quad {
             // 30 % black overlay
             cmds.push(DrawCmd {
-                uniform: DrawUniform { model: bg_m, color: [0., 0., 0., 0.3], uv_rect: [0., 0., 1., 1.] },
+                uniform: DrawUniform { model: *bg_m, color: [0., 0., 0., 0.3], uv_rect: [0., 0., 1., 1.] },
                 tex: &self.white,
             });
         }
@@ -1192,18 +1201,36 @@ impl Renderer {
                     let y = note.relative[1] * CANVAS_H * ev_y * ctrl_y;
                     let note_base = mat_mul(&note_m, &mat_translate(x, y));
 
+                    // [C] Canvas-space culling: the quad's bounding circle vs
+                    // the playfield box AABB [±CANVAS_W]×[±CANVAS_H]. The
+                    // letterbox maps that rectangle to the whole window, so
+                    // anything fully outside it is off-screen — skipping it
+                    // saves instance upload + rasterization. Conservative
+                    // for any line rotation (circle encloses the rotated
+                    // quad). Local (lx, ly) is pre-rotation canvas space.
+                    let (cxn, cyn) = (line.rotation.cos(), line.rotation.sin());
+                    let to_canvas = |lx: f32, ly: f32| -> (f32, f32) {
+                        (ctrl_px + cxn * lx - cyn * ly, ctrl_py + cyn * lx + cxn * ly)
+                    };
+                    let (cx0, cy0) = to_canvas(x, y);
+                    let outside = |qx: f32, qy: f32, r: f32| {
+                        qx + r < -CANVAS_W || qx - r > CANVAS_W || qy + r < -CANVAS_H || qy - r > CANVAS_H
+                    };
+
                     match (note.kind, sprite) {
                         (1 | 3 | 4, Some(t)) => {
                             let w = NOTE_SPRITE_W * note.scale * mh_factor * incline_factor;
                             let h = w * t.size[1] / t.size[0];
-                            cmds.push(DrawCmd {
-                                uniform: DrawUniform {
-                                    model: mat_mul(&note_base, &mat_scale(w, h)),
-                                    color: [1.0, 1.0, 1.0, alpha],
-                                    uv_rect: [0., 0., 1., 1.],
-                                },
-                                tex: &t.bind_group,
-                            });
+                            if !outside(cx0, cy0, (w * w + h * h).sqrt() * 0.5) {
+                                cmds.push(DrawCmd {
+                                    uniform: DrawUniform {
+                                        model: mat_mul(&note_base, &mat_scale(w, h)),
+                                        color: [1.0, 1.0, 1.0, alpha],
+                                        uv_rect: [0., 0., 1., 1.],
+                                    },
+                                    tex: &t.bind_group,
+                                });
+                            }
                         }
                         // Textured hold: atlas = TAIL (image top) + stretchable
                         // body + HEAD (image bottom). _mh atlas has a taller
@@ -1229,7 +1256,6 @@ impl Renderer {
                             if let Some(end_y) = note.hold_end_y {
                                 let y1 = end_y as f32 * CANVAS_H * ev_y * ctrl_y;
                                 let (head_y, tail_y) = (y, y1);
-                                let h = (tail_y - head_y).abs();
                                 // [FIX] 头尾偏移:body 从 head 边缘延伸到 tail 边缘,
                                 // 否则 body 与头尾中心重叠(中段和头尾重叠 bug)。
                                 let (h0, h1) = if tail_y >= head_y {
@@ -1239,37 +1265,73 @@ impl Renderer {
                                 };
                                 let bh = (h1 - h0).abs();
                                 if bh > 1e-5 {
-                                    cmds.push(DrawCmd {
-                                        uniform: DrawUniform {
-                                            model: mat_mul(&hd((h0 + h1) * 0.5), &mat_scale(1.0, bh / w)),
-                                            color: tint,
-                                            uv_rect: v_at(head_uv, 1. - head_uv - tail_uv),
-                                        },
-                                        tex: &t.bind_group,
-                                    });
+                                    // [C] Hold body Y-clip: when the line is
+                                    // (nearly) unrotated the body runs along
+                                    // canvas Y, so clip it to the visible
+                                    // range — a multi-second hold is a
+                                    // full-height quad otherwise, pure
+                                    // off-screen overdraw. UVs scale with
+                                    // the clipped fraction. Rotated lines
+                                    // fall back to the bounding-circle test
+                                    // (correct, just less aggressive).
+                                    if cxn >= 0.996 {
+                                        let (b0, b1) = (h0, h1);
+                                        let lo = b0.min(b1).max(-CANVAS_H);
+                                        let hi = b0.max(b1).min(CANVAS_H);
+                                        if hi - lo > 1e-5 {
+                                            let t_lo = (lo - b0) / (b1 - b0);
+                                            let t_hi = (hi - b0) / (b1 - b0);
+                                            let body_len = 1.0 - head_uv - tail_uv;
+                                            cmds.push(DrawCmd {
+                                                uniform: DrawUniform {
+                                                    model: mat_mul(&hd((lo + hi) * 0.5), &mat_scale(1.0, (hi - lo) / w)),
+                                                    color: tint,
+                                                    uv_rect: v_at(head_uv + body_len * t_lo, body_len * (t_hi - t_lo)),
+                                                },
+                                                tex: &t.bind_group,
+                                            });
+                                        }
+                                    } else {
+                                        let (bcx, bcy) = to_canvas(x, (h0 + h1) * 0.5);
+                                        if !outside(bcx, bcy, (w * w + bh * bh).sqrt() * 0.5) {
+                                            cmds.push(DrawCmd {
+                                                uniform: DrawUniform {
+                                                    model: mat_mul(&hd((h0 + h1) * 0.5), &mat_scale(1.0, bh / w)),
+                                                    color: tint,
+                                                    uv_rect: v_at(head_uv, 1. - head_uv - tail_uv),
+                                                },
+                                                tex: &t.bind_group,
+                                            });
+                                        }
+                                    }
                                 }
                                 for (cy, v0, len, quad_h) in [
                                     (head_y, 0.0, head_uv, head_h),
                                     (tail_y, 1.0 - tail_uv, tail_uv, tail_h),
                                 ] {
+                                    // [C] head/tail: bounding-circle cull.
+                                    if !outside(to_canvas(x, cy).0, to_canvas(x, cy).1, (w * w + quad_h * quad_h).sqrt() * 0.5) {
+                                        cmds.push(DrawCmd {
+                                            uniform: DrawUniform {
+                                                model: mat_mul(&hd(cy), &mat_scale(1.0, quad_h / w)),
+                                                color: tint,
+                                                uv_rect: v_at(v0, len),
+                                            },
+                                            tex: &t.bind_group,
+                                        });
+                                    }
+                                }
+                            } else {
+                                if !outside(cx0, cy0, (w * w + head_h * head_h).sqrt() * 0.5) {
                                     cmds.push(DrawCmd {
                                         uniform: DrawUniform {
-                                            model: mat_mul(&hd(cy), &mat_scale(1.0, quad_h / w)),
+                                            model: mat_mul(&hd(y), &mat_scale(1.0, head_h / w)),
                                             color: tint,
-                                            uv_rect: v_at(v0, len),
+                                            uv_rect: v_at(0., head_uv),
                                         },
                                         tex: &t.bind_group,
                                     });
                                 }
-                            } else {
-                                cmds.push(DrawCmd {
-                                    uniform: DrawUniform {
-                                        model: mat_mul(&hd(y), &mat_scale(1.0, head_h / w)),
-                                        color: tint,
-                                        uv_rect: v_at(0., head_uv),
-                                    },
-                                    tex: &t.bind_group,
-                                });
                             }
                         }
                         // Colored-quad fallback (no sprite loaded).
@@ -1280,10 +1342,11 @@ impl Renderer {
                                 if let Some(end_y) = note.hold_end_y {
                                 let y1 = end_y as f32 * CANVAS_H * ev_y * ctrl_y;
                                     let h = (y1 - y).abs();
-                                    if h > 1e-5 {
+                                    let wb = HOLD_BODY_W * note.scale * incline_factor;
+                                    if h > 1e-5 && !outside(to_canvas(x, (y + y1) * 0.5).0, to_canvas(x, (y + y1) * 0.5).1, (wb * wb + h * h).sqrt() * 0.5) {
                                         cmds.push(DrawCmd {
                                             uniform: DrawUniform {
-                                                model: mat_mul(&nb(), &mat_scale(HOLD_BODY_W * note.scale * incline_factor, h)),
+                                                model: mat_mul(&nb(), &mat_scale(wb, h)),
                                                 color: [rgb[0], rgb[1], rgb[2], alpha],
                                                 uv_rect: [0., 0., 1., 1.],
                                             },
@@ -1292,14 +1355,18 @@ impl Renderer {
                                     }
                                 }
                             }
-                            cmds.push(DrawCmd {
-                                uniform: DrawUniform {
-                                    model: mat_mul(&nb(), &mat_scale(NOTE_W * note.scale * incline_factor, NOTE_H * note.scale)),
-                                    color: [rgb[0], rgb[1], rgb[2], alpha],
-                                    uv_rect: [0., 0., 1., 1.],
-                                },
-                                tex: &self.white,
-                            });
+                            let wq = NOTE_W * note.scale * incline_factor;
+                            let hq = NOTE_H * note.scale;
+                            if !outside(cx0, cy0, (wq * wq + hq * hq).sqrt() * 0.5) {
+                                cmds.push(DrawCmd {
+                                    uniform: DrawUniform {
+                                        model: mat_mul(&nb(), &mat_scale(wq, hq)),
+                                        color: [rgb[0], rgb[1], rgb[2], alpha],
+                                        uv_rect: [0., 0., 1., 1.],
+                                    },
+                                    tex: &self.white,
+                                });
+                            }
                         }
                     }
                 }
@@ -1534,10 +1601,12 @@ impl Renderer {
 
         // Convert cmds to instances (applying the global rgb dim on the CPU),
         // growing both instance buffers together when capacity falls short.
-        if cmds.len() > self.instance_capacity {
+        // The opaque background quad (if any) occupies instance 0.
+        let total_instances = cmds.len() + usize::from(bg_quad.is_some());
+        if total_instances > self.instance_capacity {
             // Smooth growth: 1.5× current, minimum +512. Avoids the double-
             // capacity burst that causes visible frame spikes on D3D12.
-            self.instance_capacity = (cmds.len() as f64 * 1.5) as usize + 512;
+            self.instance_capacity = (total_instances as f64 * 1.5) as usize + 512;
             self.instance_bufs = [
                 Self::make_instance_buf(&self.device, self.instance_capacity),
                 Self::make_instance_buf(&self.device, self.instance_capacity),
@@ -1549,17 +1618,22 @@ impl Renderer {
         // (see Step 4 below).
 
         let _s1 = crate::trace_span!("draw_cmds_build");
-        let instances: Vec<Instance> = cmds
-            .iter()
-            .map(|cmd| {
-                let u = &cmd.uniform;
-                Instance {
-                    model: instance_model(&u.model),
-                    color: [u.color[0] * dim, u.color[1] * dim, u.color[2] * dim, u.color[3]],
-                    uv_rect: u.uv_rect,
-                }
-            })
-            .collect();
+        let mut instances: Vec<Instance> = Vec::with_capacity(total_instances);
+        if let Some((bg_m, uv, _)) = &bg_quad {
+            instances.push(Instance {
+                model: instance_model(bg_m),
+                color: [self.background_dim, self.background_dim, self.background_dim, 1.0],
+                uv_rect: *uv,
+            });
+        }
+        instances.extend(cmds.iter().map(|cmd| {
+            let u = &cmd.uniform;
+            Instance {
+                model: instance_model(&u.model),
+                color: [u.color[0] * dim, u.color[1] * dim, u.color[2] * dim, u.color[3]],
+                uv_rect: u.uv_rect,
+            }
+        }));
         drop(_s1);
 
         let _s2 = crate::trace_span!("draw_upload_submit");
@@ -1601,11 +1675,20 @@ impl Renderer {
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_vertex_buffer(0, self.instance_bufs[self.frame_idx].slice(..));
+            // [C] Background sits at instance 0 (fully opaque, no-blend pass);
+            // cmds follow at offset 1 with the alpha pipeline. The draw loop
+            // keeps cmd ordering (translucent layering stays correct).
+            if bg_quad.is_some() {
+                pass.set_pipeline(&self.opaque_pipeline);
+                pass.set_bind_group(0, bg_quad.as_ref().unwrap().2, &[]);
+                pass.draw(0..4, 0..1);
+            }
+            pass.set_pipeline(&self.pipeline);
             let mut start = 0usize;
             for i in 1..=cmds.len() {
                 if i == cmds.len() || !std::ptr::eq(cmds[i].tex, cmds[start].tex) {
                     pass.set_bind_group(0, cmds[start].tex, &[]);
-                    pass.draw(0..4, start as u32..i as u32);
+                    pass.draw(0..4, start as u32 + 1..i as u32 + 1);
                     start = i;
                 }
             }
@@ -1636,7 +1719,7 @@ impl Renderer {
             pass.set_pipeline(blit_pipe);
             // Cache the blit bind group per view (views are stable across frames)
             let view_key = final_view as *const wgpu::TextureView as usize;
-            let blit_bg = match self.post.blit_bgs.get(&view_key) {
+            let blit_bg = match self.post.blit_bgs.get(&(view_key, false)) {
                 Some(bg) => bg,
                 None => {
                     let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1647,8 +1730,8 @@ impl Renderer {
                             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
                         ],
                     });
-                    self.post.blit_bgs.insert(view_key, bg);
-                    self.post.blit_bgs.get(&view_key).unwrap()
+                    self.post.blit_bgs.insert((view_key, false), bg);
+                    self.post.blit_bgs.get(&(view_key, false)).unwrap()
                 }
             };
             pass.set_bind_group(0, blit_bg, &[]);
