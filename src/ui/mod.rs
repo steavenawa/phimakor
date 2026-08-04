@@ -119,6 +119,9 @@ pub struct IcedOverlay {
     cursor_trail: Vec<(f32, f32)>,
     /// 光标动画时间。
     cursor_time: f32,
+    /// 光标刚移动/动画未衰减完:即使 ui_dirty 未置位也强制 render_iced,
+    /// 否则暂停时(画面静止)光标会冻结在帧里。
+    pub cursor_dirty: bool,
     /// 面板进度动画中已重绘 iced(避免重复重绘)。
     last_anim_iced: bool,
     pub messages: Vec<OverlayMessage>,
@@ -169,7 +172,7 @@ impl IcedOverlay {
             w: w.max(1), h: h.max(1), panel_progress: 0.0, events_progress: 0.0,
             notes_progress: 0.0, mouse_pos: None, show_overlay: true, tl_visible: false,
             tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 5],
-            panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, tl_worker: Some(timeline_draw::TimelineWorker::new(w.max(1), h.max(1))), perf_hint: false, custom_cursor: false, cursor_move: 0.0, cursor_click: 0.0, cursor_trail: Vec::new(), cursor_time: 0.0, last_anim_iced: false, messages: Vec::new(), timeline_click: None,
+            panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, tl_worker: Some(timeline_draw::TimelineWorker::new(w.max(1), h.max(1))), perf_hint: false, custom_cursor: false, cursor_move: 0.0, cursor_click: 0.0, cursor_trail: Vec::new(), cursor_time: 0.0, cursor_dirty: false, last_anim_iced: false, messages: Vec::new(), timeline_click: None,
             layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, gui_scale: 1.0,
             timeline_dirty: false,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
@@ -221,6 +224,8 @@ impl IcedOverlay {
         self.mouse_pos = Some((x as f32, y as f32));
         // 光标移动:置 1(animate_all 衰减,实现"移动外扩→静止回落")。
         self.cursor_move = 1.0;
+        // 光标刚动过:暂停时也强制下一帧 render_iced(光标画在帧里)。
+        self.cursor_dirty = self.custom_cursor;
         // 光标轨迹(延迟跟随):推新位置,保留最近 30 个。
         self.cursor_trail.insert(0, (x as f32, y as f32));
         if self.cursor_trail.len() > 30 {
@@ -577,7 +582,10 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         );
         // Clear working pixmap and draw timeline → overlay texture
         self.pixmap.fill(tiny_skia::Color::TRANSPARENT);
-        self.upload_timeline_to(queue, info)
+        self.upload_timeline_to(queue, info);
+        // 光标动画(move/click 衰减)未结束前保持 dirty,下一帧继续渲染,
+        // 否则暂停时动画只衰减不绘制,光标冻结在旧帧里。
+        self.cursor_dirty = self.custom_cursor && (self.cursor_move > 0.01 || self.cursor_click > 0.01);
     }
 
     pub fn render_progress(&self) -> (f32, f32) { (self.events_progress, self.notes_progress) }

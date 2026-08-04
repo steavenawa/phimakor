@@ -286,7 +286,7 @@ impl App {
         overlay.set_panels(layout.panels.clone());
         overlay.perf_hint = settings.perf_hint;
         overlay.custom_cursor = settings.custom_cursor;
-        renderer.aggressive_cull = settings.aggressive_cull;
+        renderer.aggressive = settings.aggressive;
         if settings.custom_cursor {
             window.set_cursor_visible(false);
         }
@@ -983,7 +983,7 @@ impl State {
         }
         // 应用即时生效的设置。
         self.renderer.set_vsync(self.settings.vsync);
-        self.renderer.aggressive_cull = self.settings.aggressive_cull;
+        self.renderer.aggressive = self.settings.aggressive;
         self.gui_scale = self.settings.gui_scale;
         self.overlay.perf_hint = self.settings.perf_hint;
         // 自定义 GPU 光标:隐藏系统光标。
@@ -1476,7 +1476,10 @@ impl State {
             if let Some(ly) = self.overlay.take_layer_click(self.overlay.props_progress(), max_layers) {
                 self.selected_layer = ly; self.ui_dirty = true;
             }
-            if self.ui_dirty {
+            // 光标动画中(自定义光标开启时)也强制全量重绘:暂停时 ui_dirty
+            // 不再触发,否则光标冻结在帧里。
+            let need_iced = self.ui_dirty || self.overlay.cursor_dirty;
+            if need_iced {
                 self.overlay.render_iced(self.renderer.queue(), &info);
                 self.ui_dirty = false;
             } else {
