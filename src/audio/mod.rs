@@ -6,23 +6,33 @@
 //!
 //! [`AudioClock`] manages the rodio device and player directly on the audio thread.
 //! [`AudioHandle`] mirrors the same API to the main thread via atomics + command channel.
-//! [`spawn_audio_thread`] owns the clock plus a second `Chart` on a dedicated
-//! trigger thread, so hitsound timing is decoupled from the winit event loop
-//! (an occluded window stops `RedrawRequested` but never the hitsounds).
+//! [`spawn_audio_thread`] owns the clock plus a precomputed hitsound schedule
+//! (`(hit time, note kind)` pairs built by `Chart::fire_events_from_rpe`, see
+//! `crate::core::chart`) on a dedicated trigger thread, so hitsound timing is
+//! decoupled from the winit event loop (an occluded window stops
+//! `RedrawRequested` but never the hitsounds).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::core::chart::Chart;
-
 use rodio::buffer::SamplesBuffer;
 use rodio::Source;
+
+/// Maximum hitsounds mixed at once. Past this, new hits are dropped instead
+/// of queued — dense chords / scrubs on extreme charts would otherwise flood
+/// the mixer and stall the audio callback (crackle, frozen position, seeks
+/// blocking for seconds).
+const MAX_PENDING_HITS: usize = 32;
+/// How long a hitsound can plausibly keep playing; entries older than this
+/// are assumed finished and dropped from the pending count.
+const HIT_TAIL: Duration = Duration::from_millis(200);
 
 pub struct AudioClock {
     // Kept alive: dropping the stream stops all playback.
@@ -40,6 +50,9 @@ pub struct AudioClock {
     music_path: std::path::PathBuf,
     /// Heap bytes of the preloaded hitsound buffers.
     hit_bytes: usize,
+    /// Timestamps of recently added hitsounds, for the polyphony cap
+    /// (see [`MAX_PENDING_HITS`]). Only touched by the trigger thread.
+    pending_hits: RefCell<VecDeque<Instant>>,
 }
 
 /// Decode a whole ogg into an in-memory sample buffer. Returns the buffer
@@ -99,6 +112,7 @@ impl AudioClock {
             hit_flick: flick,
             music_path,
             hit_bytes,
+            pending_hits: RefCell::new(VecDeque::new()),
         })
     }
 
@@ -203,6 +217,12 @@ impl AudioClock {
 
     /// Fire a hitsound: kind 1|2 -> click (hold uses click), 3 -> flick,
     /// 4 -> drag. Silent while paused; cheap enough to call per note per frame.
+    ///
+    /// Polyphony-capped: if more than [`MAX_PENDING_HITS`] hitsounds were
+    /// added within the last [`HIT_TAIL`], the hit is dropped — an extreme
+    /// chart with a giant chord would otherwise enqueue hundreds of
+    /// overlapping sounds at once, and the mixer would spend its whole
+    /// callback budget summing them (stalling everything downstream).
     pub fn hit(&self, kind: u8) {
         if !self.playing.get() {
             return;
@@ -213,9 +233,21 @@ impl AudioClock {
             4 => &self.hit_drag,
             _ => return,
         };
-        if let Some(buf) = buf {
-            self.stream.mixer().add(buf.clone());
+        let Some(buf) = buf else { return };
+        let now = Instant::now();
+        let mut pending = self.pending_hits.borrow_mut();
+        while let Some(&t) = pending.front() {
+            if now.duration_since(t) < HIT_TAIL {
+                break;
+            }
+            pending.pop_front();
         }
+        if pending.len() >= MAX_PENDING_HITS {
+            return;
+        }
+        pending.push_back(now);
+        drop(pending);
+        self.stream.mixer().add(buf.clone());
     }
 }
 
@@ -235,6 +267,10 @@ pub struct AudioHandle {
     cmd: mpsc::Sender<AudioCmd>,
     /// Heap bytes of the preloaded hitsounds (set once by the audio thread).
     mem: Arc<AtomicU64>,
+    /// Set when the music queue drained (track finished); cleared by any
+    /// seek or resume. Lets the main thread tell "paused at the end" from
+    /// "paused mid-song" without heuristics about chart duration.
+    ended: Arc<AtomicBool>,
     // ponytail: never joined — process exit reaps the thread; `exiting` sends Quit
     #[allow(dead_code)]
     join: JoinHandle<()>,
@@ -256,6 +292,12 @@ impl AudioHandle {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// Whether the music queue has fully drained (track finished). Cleared
+    /// again by any seek or resume.
+    pub fn ended(&self) -> bool {
+        self.ended.load(Ordering::Relaxed)
+    }
+
     /// Send a pause/resume command to the audio thread.
     pub fn set_paused(&self, paused: bool) {
         let _ = self.cmd.send(AudioCmd::Pause(paused));
@@ -272,34 +314,66 @@ impl AudioHandle {
     }
 }
 
+/// Precomputed hitsound schedule with a monotonic cursor, standing in for
+/// the second full `Chart` the trigger thread used to build (parse, easing
+/// graph, line states — none of which hitsounds need).
+struct FireCursor {
+    /// (hit time on the chart clock, note kind), sorted by hit time.
+    events: Vec<(f64, u8)>,
+    /// Index of the first event with `time >` the last processed time
+    /// (or `> seek target` after a backward seek).
+    cursor: usize,
+}
+
+impl FireCursor {
+    /// Fire events whose hit time lies in `(last, t]` and advance the cursor.
+    /// One binary search per tick — no per-line scan, no beat math.
+    fn advance(&mut self, t: f64) -> &[(f64, u8)] {
+        let start = self.cursor;
+        let end = start + self.events[start..].partition_point(|&(et, _)| et <= t);
+        self.cursor = end;
+        &self.events[start..end]
+    }
+
+    /// Backward seek to `t`: everything at `<= t` is passed for good (same
+    /// strict-bound semantics as the old chart scan — a note exactly on the
+    /// seek target doesn't re-fire), so events after `t` fire again when
+    /// time crosses them. Forward seeks deliberately keep the cursor: notes
+    /// skipped by the jump fire immediately on the next tick.
+    fn seek_reset(&mut self, t: f64) {
+        self.cursor = self.events.partition_point(|&(et, _)| et <= t);
+    }
+}
+
 /// Start the audio trigger thread: it builds its own `AudioClock` (music +
-/// hitsounds) and its own `Chart` (Chart is !Send), then ticks ~2ms firing
-/// `clock.hit` for note crossings. Blocks until the thread reports the clock
-/// is up, so a missing/undecodable music file still fails here (caller falls
-/// back to the silent `Instant` clock).
-pub fn spawn_audio_thread(res_dir: &Path, chart_dir: &Path) -> anyhow::Result<AudioHandle> {
+/// hitsounds) and fires hitsounds from the precomputed schedule `events`
+/// (`(hit time, kind)` pairs on the chart clock, see
+/// `Chart::fire_events_from_rpe`), ticked by the clock's reported position
+/// minus `total_offset`. Blocks until the thread reports the clock is up, so
+/// a missing/undecodable music file still fails here (caller falls back to
+/// the silent `Instant` clock).
+pub fn spawn_audio_thread(
+    res_dir: &Path,
+    music_path: &Path,
+    total_offset: f64,
+    events: Vec<(f64, u8)>,
+) -> anyhow::Result<AudioHandle> {
     let res_dir = res_dir.to_path_buf();
-    let chart_dir = chart_dir.to_path_buf();
+    let music_path = music_path.to_path_buf();
     let time = Arc::new(AtomicU64::new(0f64.to_bits()));
     let paused = Arc::new(AtomicBool::new(false));
     let mem = Arc::new(AtomicU64::new(0));
+    let ended = Arc::new(AtomicBool::new(false));
     let (cmd_tx, cmd_rx) = mpsc::channel::<AudioCmd>();
     let (ready_tx, ready_rx) = mpsc::channel::<anyhow::Result<()>>();
-    let (time2, paused2, mem2) = (time.clone(), paused.clone(), mem.clone());
+    let (time2, paused2, mem2, ended2) = (time.clone(), paused.clone(), mem.clone(), ended.clone());
     let join = std::thread::Builder::new()
         .name("hitsound-trigger".into())
         .spawn(move || {
-            let built = (|| -> anyhow::Result<(AudioClock, Chart, f64)> {
-                let (info, chart2) = Chart::load(&chart_dir)?;
-                // prpr scene/game.rs: chart time lags audio by the total offset.
-                let total_offset = (chart2.offset() + info.offset) as f64;
-                let clock = AudioClock::start(&chart_dir.join(&info.music), Some(&res_dir))?;
-                Ok((clock, chart2, total_offset))
-            })();
-            let (clock, mut chart2, total_offset) = match built {
-                Ok(v) => {
+            let clock = match AudioClock::start(&music_path, Some(&res_dir)) {
+                Ok(clock) => {
                     let _ = ready_tx.send(Ok(()));
-                    v
+                    clock
                 }
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -307,17 +381,59 @@ pub fn spawn_audio_thread(res_dir: &Path, chart_dir: &Path) -> anyhow::Result<Au
                 }
             };
             mem2.store(clock.mem_bytes() as u64, Ordering::Relaxed);
+            let mut fired = FireCursor { events, cursor: 0 };
+            fired.seek_reset(0.0);
             loop {
-                while let Ok(cmd) = cmd_rx.try_recv() {
+                // Sleep until a command arrives or the poll period elapses;
+                // commands wake the thread immediately. 5ms while playing
+                // keeps the time atomic fresh for the renderer; 50ms while
+                // paused — position then only changes via Seek commands,
+                // which publish the atomic themselves.
+                //
+                // NOTE: the message returned by recv_timeout is consumed
+                // here — it must be processed, never discarded (a dropped
+                // command makes pause/seek appear dead).
+                let dur = if clock.playing.get() { Duration::from_millis(5) } else { Duration::from_millis(50) };
+                let first = match cmd_rx.recv_timeout(dur) {
+                    Ok(cmd) => Some(cmd),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => return,
+                };
+                // Coalesce commands: seeks are absolute positions, so when a
+                // burst arrives (a timeline drag fires one per mouse move)
+                // only the last one matters. rodio's try_seek blocks up to
+                // ~5ms waiting for the audio callback to acknowledge, so
+                // processing every seek would stall this thread — frozen
+                // time atomic, and Pause commands stuck behind the backlog
+                // (the "can't pause after scrubbing" bug).
+                let mut last_seek: Option<f64> = None;
+                for cmd in first.into_iter().chain(cmd_rx.try_iter()) {
                     match cmd {
                         AudioCmd::Pause(p) => {
                             clock.set_paused(p);
                             paused2.store(p, Ordering::Relaxed);
-                        }
-                        AudioCmd::Seek(t) => {
-                            clock.seek(t);
+                            if !p {
+                                ended2.store(false, Ordering::Relaxed);
+                            }
                         }
                         AudioCmd::Quit => return,
+                        AudioCmd::Seek(t) => last_seek = Some(t),
+                    }
+                }
+                if let Some(t) = last_seek {
+                    if clock.seek(t) {
+                        // Publish the new position immediately (not on the
+                        // next poll), so scrubbing while paused has no
+                        // poll-period lag.
+                        time2.store(t.to_bits(), Ordering::Relaxed);
+                        // Every seek repositions the fire cursor: notes
+                        // jumped over simply don't sound (a forward jump
+                        // over a dense section would otherwise flood the
+                        // mixer with the whole skipped window at once),
+                        // while a backward seek re-fires everything after
+                        // the target when time crosses it again (replay).
+                        fired.seek_reset((t - total_offset).max(0.0));
+                        ended2.store(false, Ordering::Relaxed);
                     }
                 }
                 let t = clock.time();
@@ -325,23 +441,155 @@ pub fn spawn_audio_thread(res_dir: &Path, chart_dir: &Path) -> anyhow::Result<Au
                 // Track ended: the queue drained but `playing` stays true
                 // (rodio has no end callback), so the main thread can't tell
                 // "paused at the end" from "still playing". Report it as
-                // paused — Space then sees `paused && at_end` and seeks 0,
-                // which resets combo/hits/score before the replay.
+                // paused + ended — Space then sees `ended && paused` and
+                // seeks 0, which resets combo/hits/score before the replay.
                 if clock.playing.get() && clock.player.empty() {
                     clock.playing.set(false);
                     paused2.store(true, Ordering::Relaxed);
+                    ended2.store(true, Ordering::Relaxed);
                 }
                 let chart_time = (t - total_offset).max(0.0);
-                // Lightweight fired-only scan (no animation/visibility work).
-                for fired in chart2.advance_fired(chart_time) {
-                    if !fired.fake && !fired.tick && !fired.hold_tail {
-                        clock.hit(fired.kind);
-                    }
+                for &(_, kind) in fired.advance(chart_time) {
+                    clock.hit(kind);
                 }
-                std::thread::sleep(Duration::from_millis(5));
             }
         })?;
     // Thread panicked before reporting -> sender dropped -> recv errors.
     ready_rx.recv()??;
-    Ok(AudioHandle { time, paused, cmd: cmd_tx, mem, join })
+    Ok(AudioHandle { time, paused, cmd: cmd_tx, mem, ended, join })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Write a small mono 16-bit PCM WAV (44100 Hz, seconds long).
+    fn write_tone_wav(path: &std::path::Path, seconds: f64, hz: f64) {
+        let rate = 44100u32;
+        let n = (seconds * rate as f64) as u32;
+        let mut data = Vec::with_capacity(44 + n as usize * 2);
+        data.extend_from_slice(b"RIFF");
+        data.extend_from_slice(&(36 + n * 2).to_le_bytes());
+        data.extend_from_slice(b"WAVEfmt ");
+        data.extend_from_slice(&16u32.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&rate.to_le_bytes());
+        data.extend_from_slice(&(rate * 2).to_le_bytes());
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&16u16.to_le_bytes());
+        data.extend_from_slice(b"data");
+        data.extend_from_slice(&(n * 2).to_le_bytes());
+        for i in 0..n {
+            let v = ((i as f64 / rate as f64 * hz * std::f64::consts::TAU).sin() * 12000.0) as i16;
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(&data).unwrap();
+    }
+
+    fn poll<T: Copy + PartialEq>(mut f: impl FnMut() -> T, want: T, timeout: Duration) -> T {
+        let start = Instant::now();
+        loop {
+            let v = f();
+            if v == want || start.elapsed() > timeout {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Real-device end-to-end smoke test of the whole trigger thread:
+    /// pause / resume / seek / seek-spam / track-end / replay. Runs inside
+    /// an owned thread with a watchdog so a rodio stall fails the test
+    /// instead of hanging it. Skipped when no audio device exists.
+    #[test]
+    fn trigger_thread_pause_seek_ended() {
+        let wav = std::env::temp_dir().join("phimakor_test_tone.wav");
+        write_tone_wav(&wav, 5.0, 440.0);
+        let (tx, rx) = mpsc::channel::<Result<(), String>>();
+        std::thread::spawn(move || {
+            let run = || -> Result<(), String> {
+                let handle = spawn_audio_thread(
+                    Path::new("res-does-not-exist"),
+                    &wav,
+                    0.0,
+                    vec![(0.25, 1), (0.5, 4), (0.75, 3), (1.0, 2)],
+                )
+                .map_err(|e| format!("spawn failed: {e:#}"))?;
+                // Playing: time advances.
+                let t0 = poll(|| handle.time(), 0.0, Duration::from_millis(0));
+                std::thread::sleep(Duration::from_millis(300));
+                let t1 = handle.time();
+                if t1 < t0 + 0.2 {
+                    return Err(format!("clock did not advance: {t0} -> {t1}"));
+                }
+                // Pause takes effect (atomic flips; time freezes).
+                handle.set_paused(true);
+                if !poll(|| handle.is_paused(), true, Duration::from_secs(2)) {
+                    return Err("pause never took effect".into());
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                let t2 = handle.time();
+                if (t2 - t1).abs() > 0.05 {
+                    return Err(format!("time moved while paused: {t1} -> {t2}"));
+                }
+                // Seek while paused lands.
+                handle.seek(1.0);
+                if !poll(|| handle.time() > 0.95, true, Duration::from_secs(2)) {
+                    return Err(format!("seek-while-paused did not land: {}", handle.time()));
+                }
+                // Resume advances from ~1.0.
+                handle.set_paused(false);
+                if poll(|| handle.is_paused(), false, Duration::from_secs(2)) {
+                    return Err("resume never took effect".into());
+                }
+                std::thread::sleep(Duration::from_millis(250));
+                if !(handle.time() > 1.05) {
+                    return Err(format!("did not advance after resume: {}", handle.time()));
+                }
+                // Rapid seek spam must not hang or wedge the thread.
+                for i in 0..40 {
+                    handle.seek((i % 20) as f64 * 0.05);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+                // Track end: ended + auto-pause, time frozen near 5.0s.
+                handle.seek(0.0);
+                handle.set_paused(false);
+                if !poll(|| handle.ended(), true, Duration::from_secs(8)) {
+                    return Err("track-end was never detected".into());
+                }
+                let end = handle.time();
+                if !(end >= 4.9 && end <= 5.4) {
+                    return Err(format!("end position off: {end}"));
+                }
+                // Replay: seek from the end restarts and clears ended.
+                handle.seek(0.5);
+                if !poll(|| !handle.ended(), true, Duration::from_secs(2)) {
+                    return Err("seek after end did not clear ended".into());
+                }
+                if !poll(|| handle.time() >= 0.45, true, Duration::from_secs(2)) {
+                    return Err(format!("post-end seek did not land: {}", handle.time()));
+                }
+                // Pause still toggles after all of the above.
+                handle.set_paused(true);
+                if !poll(|| handle.is_paused(), true, Duration::from_secs(2)) {
+                    return Err("pause broken after seek spam".into());
+                }
+                handle.quit();
+                Ok(())
+            };
+            let r = match run() {
+                Ok(()) => Ok(()),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("{e}"),
+            Err(_) => panic!("trigger thread stalled (30s watchdog)"),
+        }
+    }
 }

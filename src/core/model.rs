@@ -158,7 +158,9 @@ pub struct RPEExtendedEvents {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RPENote {
-    /// Note type (JSON `"type"`): 1 = Tap, 2 = Drag, 3 = Hold, 4 = Flick.
+    /// Note type (JSON `"type"`): 1 = Tap, 2 = Hold, 3 = Flick, 4 = Drag.
+    /// (Holds carry an `end_time`; they fire a click at start, plus tick/tail
+    /// events that are filtered out of hitsound playback.)
     #[serde(rename = "type")]
     pub kind: u8,
     /// 1 = above the judgement line, 0 = below it.

@@ -54,6 +54,8 @@ struct State {
     hits: u32,
     note_count: usize,
     seek_dim_until: Instant,
+    /// Set when dragging the seek bar auto-paused playback; restored on release.
+    drag_was_playing: bool,
     focused: bool,
     ctrl: bool,
 
@@ -196,6 +198,7 @@ impl App {
             seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016,
             device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
+            drag_was_playing: false,
             selected_line: 0, selected_event_idx: None, scroll_target: None,
             pending_seek: None, chart_time_last: 0.0, focused: true, ctrl: false,
             gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0, event_edit_target: 0,
@@ -268,7 +271,13 @@ impl App {
         let extra = std::fs::read(dir.join("extra.json")).ok()
             .and_then(|b| core::extra::parse_extra(&b).ok());
 
-        let audio = audio::spawn_audio_thread(res_dir.as_path(), dir).ok();
+        let audio = audio::spawn_audio_thread(
+            res_dir.as_path(),
+            &dir.join(&info.music),
+            (chart.offset() + info.offset) as f64,
+            core::chart::Chart::fire_events_from_rpe(doc.chart()),
+        )
+        .ok();
         let note_count = chart.max_combo();
         let layout = LayoutDef::load(&res_dir.join("panels.json"))
             .or_else(|_| LayoutDef::load(&PathBuf::from("res.dis/panels.json")))
@@ -288,6 +297,7 @@ impl App {
             seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016,
             device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
+            drag_was_playing: false,
             selected_line: 0, selected_event_idx: None, event_edit_target: 0,
             scroll_target: None, pending_seek: None, chart_time_last: 0.0,
             focused: true, ctrl: false, gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0,
@@ -461,7 +471,13 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
     let extra = std::fs::read(dir.join("extra.json")).ok()
         .and_then(|b| core::extra::parse_extra(&b).ok());
     // 音频就绪等待也放后台(音乐解码可能慢)。
-    let audio = audio::spawn_audio_thread(Path::new("res"), &dir).ok();
+    let audio = audio::spawn_audio_thread(
+        Path::new("res"),
+        &dir.join(&info.music),
+        doc.chart().meta.offset as f64 / 1000.0 + info.offset as f64,
+        core::chart::Chart::fire_events_from_rpe(doc.chart()),
+    )
+    .ok();
 
     Ok(LoadedChart { doc, name, textures, custom_textures, bg, bg_dim, extra, audio })
 }
@@ -1014,12 +1030,19 @@ impl State {
     fn seek(&mut self, t: f64) {
         let _s = trace_span!("seek");
         let t = t.clamp(0.0, self.chart.duration());
+        let prev = self.audio.as_ref().map(|a| a.time()).unwrap_or_else(|| self.started.elapsed().as_secs_f64());
         if let Some(a) = &self.audio { a.seek(t); }
         // Seek 回到播放头跟随模式(手动滚动时间轴后 seek 会重新吸附)。
         self.overlay.tl_follow = true;
         self.pending_seek = Some(t);
         let off = (self.chart.offset() + self.info.offset) as f64;
         let ct = (t - off).max(0.0);
+        // 前向跳转:把主图表的命中游标同步到目标,跳过的 note 不再补触发。
+        // 否则 state_at 会把 (旧, 新] 区间重新 fired 一遍,hits_before 的
+        // 计数会被二次累加(双击计数 bug)。
+        if t > prev {
+            self.chart.reposition(ct);
+        }
         self.hits = self.chart.hits_before(ct) as u32;
         self.combo = self.hits;
         self.seek_dim_until = Instant::now() + Duration::from_millis(400);
@@ -1031,6 +1054,7 @@ impl State {
     fn hard_seek(&mut self, t: f64) {
         let _s = trace_span!("hard_seek");
         let t = t.clamp(0.0, self.chart.duration());
+        let prev = self.audio.as_ref().map(|a| a.time()).unwrap_or_else(|| self.started.elapsed().as_secs_f64());
         if let Some(a) = &self.audio { a.seek(t); }
         self.overlay.tl_follow = true;
         self.pending_seek = None;
@@ -1038,6 +1062,9 @@ impl State {
         self.chart_time_last = t;
         let off = (self.chart.offset() + self.info.offset) as f64;
         let ct = (t - off).max(0.0);
+        if t > prev {
+            self.chart.reposition(ct);
+        }
         self.hits = self.chart.hits_before(ct) as u32;
         self.combo = self.hits;
         self.seek_dim_until = Instant::now() + Duration::from_millis(400);
@@ -1155,12 +1182,29 @@ impl State {
             }
         } else { audio_time };
 
+        // 时间轴拖拽:开始拖时若在播放则自动暂停,松手恢复。否则"播放中
+        // 拖动"会来回打架(拖到的位置被继续播放的音频顶回去),密集谱面
+        // 尤甚;暂停后 predict 归零,拖拽渲染的就是精确位置。
+        let dragging = self.show_overlay && self.overlay.seek_dragging;
+        if dragging && !self.drag_was_playing && self.audio.as_ref().is_some_and(|a| !a.is_paused()) {
+            self.drag_was_playing = true;
+            if let Some(a) = &self.audio { a.set_paused(true); }
+        }
+        if !dragging && self.drag_was_playing {
+            self.drag_was_playing = false;
+            if let Some(a) = &self.audio { a.set_paused(false); }
+        }
+
         // Frame-render prediction (notes hit the line when the frame is seen)
         // minus the audio device output latency (rodio's get_pos counts samples
         // handed to the device callback, which are heard ~latency ms later).
-        let predict = self.frame_latency.min(0.05);
+        // 暂停时两者都归零:预测/延迟补偿会让暂停中的 chart_time 偏离真实
+        // 位置,窗口内的 note 会在暂停时被误触发(白加 combo/播放 hitFX)。
+        let paused_now = self.audio.as_ref().is_some_and(|a| a.is_paused());
+        let predict = if paused_now { 0.0 } else { self.frame_latency.min(0.05) };
+        let latency = if paused_now { 0.0 } else { self.device_latency };
         let off = (self.chart.offset() + self.info.offset) as f64;
-        let chart_time = (audio_time + predict - self.device_latency - off).max(0.0);
+        let chart_time = (audio_time + predict - latency - off).max(0.0);
         self.chart_time_last = chart_time;
         let duration = self.chart.duration();
         let chart_beat = self.chart.time_to_beat(chart_time);
@@ -1902,31 +1946,38 @@ impl ApplicationHandler for App {
                         }
                         // Numeric input on the Eff panel (double-clicked field):
                         // consume digits / . / - / Enter / Escape / Backspace.
+                        // Space commits the inline edit and falls through to
+                        // the pause toggle below — it must never be swallowed
+                        // while an edit is open (else "Space can't pause").
                         if state.num_edit.is_some() && !state.ctrl {
-                            if event.state == ElementState::Pressed {
-                                let mut done = false;
-                                if let Some(edit) = &mut state.num_edit {
-                                    match code {
-                                        KeyCode::Enter | KeyCode::NumpadEnter => { done = true; }
-                                        KeyCode::Escape => { state.num_edit = None; state.ui_dirty = true; }
-                                        KeyCode::Backspace => { edit.buf.pop(); state.ui_dirty = true; }
-                                        _ => {
-                                            let ch = match &event.logical_key {
-                                                winit::keyboard::Key::Character(s) => s.chars().next(),
-                                                _ => None,
-                                            };
-                                            if let Some(c) = ch {
-                                                if c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' {
-                                                    edit.buf.push(c);
-                                                    state.ui_dirty = true;
+                            if code == KeyCode::Space && event.state == ElementState::Pressed {
+                                state.commit_num_edit();
+                            } else {
+                                if event.state == ElementState::Pressed {
+                                    let mut done = false;
+                                    if let Some(edit) = &mut state.num_edit {
+                                        match code {
+                                            KeyCode::Enter | KeyCode::NumpadEnter => { done = true; }
+                                            KeyCode::Escape => { state.num_edit = None; state.ui_dirty = true; }
+                                            KeyCode::Backspace => { edit.buf.pop(); state.ui_dirty = true; }
+                                            _ => {
+                                                let ch = match &event.logical_key {
+                                                    winit::keyboard::Key::Character(s) => s.chars().next(),
+                                                    _ => None,
+                                                };
+                                                if let Some(c) = ch {
+                                                    if c.is_ascii_digit() || c == '.' || c == '-' || c == 'e' {
+                                                        edit.buf.push(c);
+                                                        state.ui_dirty = true;
+                                                    }
                                                 }
                                             }
                                         }
                                     }
+                                    if done { state.commit_num_edit(); }
                                 }
-                                if done { state.commit_num_edit(); }
+                                return;
                             }
-                            return;
                         }
                         // pre-copy fields to avoid borrow conflicts
                         let has_event = state.selected_event_idx.is_some();
@@ -1939,14 +1990,12 @@ impl ApplicationHandler for App {
                             state.ui_dirty = true;
                         }
                         KeyCode::Space => {
-                            // 播放到末尾后音频队列排空(playing 仍是 true,
-                            // is_paused() 检测不到),空格 resume 会重播但
-                            // combo/hits/score 不清。用时间回绕检测:
-                            // 末尾 or 时间越过末尾 → 一律 hard_seek(0) 清统计
-                            // (硬跳,不走平滑动画,避免音频被中间 seek 卡住)。
-                            let at_end = state.chart_time_last >= state.chart.duration() - 0.1;
+                            // 轨道真正播完(音频线程检测到队列排空,置
+                            // ended)后,空格 = 从头重播并清统计;其余情况
+                            // 一律普通暂停/继续——末尾附近想暂停不会再被
+                            // 误判成"重播"而硬跳回开头。
                             let paused = state.audio.as_ref().is_some_and(|a| a.is_paused());
-                            if at_end {
+                            if state.audio.as_ref().is_some_and(|a| a.ended()) {
                                 state.hard_seek(0.0);
                             }
                             if let Some(a) = &state.audio {

@@ -760,6 +760,25 @@ pub(crate) fn load_info(dir: &std::path::Path) -> Result<ChartInfo> {
 }
 
 impl Chart {
+    /// Fast-forward the fired-note cursors to `time` without reporting the
+    /// notes that were jumped over. The editor calls this after a **forward**
+    /// seek: notes in the skipped window must neither fire again (double
+    /// count on top of `hits_before`) nor spawn hit FX / hitsounds (a dense
+    /// jump would flood the audio mixer). `time` must be >= the previous
+    /// call; backward seeks keep the replay-on-rewind semantics, which
+    /// `state_at` already handles via its seek-back detection.
+    pub fn reposition(&mut self, time: f64) {
+        self.last_state_time = time;
+        for line in self.lines.iter_mut() {
+            let start = line.fired_cursor;
+            line.fired_cursor = start
+                + line.order[start..].partition_point(|&ni| {
+                    let n = &line.notes[ni];
+                    n.time.max(n.end_time) <= time
+                });
+        }
+    }
+
     /// Reads `info.json` in `dir` (falling back to an RPE-export `info.txt`
     /// when absent), then the chart file it names. Supports RPE, PEC, and PGR (官谱) formats.
     pub fn load(dir: &std::path::Path) -> Result<(ChartInfo, Chart)> {
@@ -776,6 +795,33 @@ impl Chart {
     pub fn from_rpe_chart(rpe: &RPEChart, use_rpe_170_speed: bool) -> Result<Chart> {
         let json = serde_json::to_string(rpe).context("rpe-re-serialize")?;
         Self::from_rpe(&json, use_rpe_170_speed)
+    }
+
+    /// Compressed hitsound schedule: `(hit time in seconds on the chart
+    /// clock, note kind)` for every non-fake note, sorted by time.
+    ///
+    /// The audio trigger thread needs nothing else — no line/event state, no
+    /// easing curves, no visibility logic — so this replaces the second full
+    /// `Chart` it used to build (which re-read and re-parsed the chart files
+    /// from disk and kept a full animation-state graph alive on that thread).
+    /// Only beat→second conversion happens here (same `BpmList` math as
+    /// [`parse_notes`]); kinds pass through unchanged (1 tap, 2 hold,
+    /// 3 flick, 4 drag — all fire a hitsound at their hit time).
+    pub fn fire_events_from_rpe(rpe: &RPEChart) -> Vec<(f64, u8)> {
+        let mut bpm = BpmList::new(rpe.bpm_list.iter().map(|it| (it.start_time.beats(), it.bpm)).collect());
+        let mut events = Vec::new();
+        for line in &rpe.judge_line_list {
+            if let Some(notes) = &line.notes {
+                for note in notes {
+                    if note.is_fake != 0 {
+                        continue;
+                    }
+                    events.push((bpm.time(&note.start_time), note.kind));
+                }
+            }
+        }
+        events.sort_by(|a, b| a.0.total_cmp(&b.0));
+        events
     }
 
     fn from_rpe(source: &str, use_rpe_170_speed: bool) -> Result<Chart> {
@@ -1916,5 +1962,80 @@ previewStart: 12
     fn bad_note_type_is_err() {
         let src = MINIMAL.replace(r#""type": 1"#, r#""type": 7"#);
         assert!(Chart::from_rpe(&src, false).is_err());
+    }
+
+    #[test]
+    fn reposition_skips_forward_jump_window_but_backward_replays() {
+        // 120bpm: taps at beats 2, 4, 6, 10 → 1.0s, 2.0s, 3.0s, 5.0s.
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [2, 0, 1], "endTime": [2, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [4, 0, 1], "endTime": [4, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [6, 0, 1], "endTime": [6, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [10, 0, 1], "endTime": [10, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ]
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(src, false).unwrap();
+        // Play to the first note: fires tap@1.0s.
+        let fired = chart.advance_fired(1.0);
+        assert_eq!(fired.iter().filter(|f| !f.tick && !f.hold_tail).count(), 1);
+        // Forward jump to 3.0s: notes at 2.0/3.0 are jumped over — nothing
+        // fires, neither now nor on subsequent calls past them.
+        chart.reposition(3.0);
+        assert!(chart.advance_fired(3.0).is_empty());
+        assert!(chart.advance_fired(4.0).is_empty());
+        // Normal firing resumes after the jump window.
+        assert_eq!(chart.advance_fired(5.0).iter().filter(|f| !f.tick && !f.hold_tail).count(), 1);
+        // Backward seek still replays the notes it passes over again.
+        chart.advance_fired(1.5); // seek-back: cursors reset, reports nothing
+        let fired = chart.advance_fired(2.0);
+        assert_eq!(fired.iter().filter(|f| !f.tick && !f.hold_tail).count(), 1);
+    }
+
+    #[test]
+    fn fire_events_matches_chart_scan() {
+        // 120bpm beats 0..4 (0.5s/beat), 240bpm after (0.25s/beat).
+        // Notes: tap @1 (0.5s), hold @3 (1.5s), flick @4 (2.0s), drag @5
+        // (2.25s), fake tap @2 (1.0s — must be absent).
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [
+                { "bpm": 120.0, "startTime": [0, 0, 1] },
+                { "bpm": 240.0, "startTime": [4, 0, 1] }
+            ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [1, 0, 1], "endTime": [1, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 2, "above": 1, "startTime": [3, 0, 1], "endTime": [5, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 3, "above": 1, "startTime": [4, 0, 1], "endTime": [4, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 4, "above": 1, "startTime": [5, 0, 1], "endTime": [5, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [2, 0, 1], "endTime": [2, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 1, "visibleTime": 999999.0 }
+                    ]
+                }
+            ]
+        }"#;
+        let rpe: RPEChart = serde_json::from_str(src).unwrap();
+        let events = Chart::fire_events_from_rpe(&rpe);
+        // fake @1.0s dropped.
+        let expect: Vec<(f64, u8)> = vec![(0.5, 1), (1.5, 2), (2.0, 3), (2.25, 4)];
+        assert_eq!(events, expect);
+        // Sanity: same times as the full chart build reports.
+        let mut chart = Chart::from_rpe_chart(&rpe, false).unwrap();
+        let mut hits = Vec::new();
+        for t in [0.5, 1.5, 2.0, 2.25] {
+            hits.extend(chart.advance_fired(t).iter().filter(|f| !f.fake && !f.tick && !f.hold_tail).map(|f| f.kind));
+        }
+        assert_eq!(hits, vec![1, 2, 3, 4]);
     }
 }
