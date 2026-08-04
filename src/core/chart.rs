@@ -1034,6 +1034,9 @@ impl Chart {
     pub fn advance_fired(&mut self, time: f64) -> &[FiredNote] {
         let last = self.last_state_time;
         self.last_state_time = time;
+        // 帧时钟:渲染端 hit-fx 的 `now`(= frame.time)依赖它,倒退时
+        // age = now - t0 才对齐。务必每帧更新,否则粒子全被 `now < t0` 跳过。
+        self.frame.time = time;
         self.frame.fired.clear();
         if time < last {
             // seek backward — report nothing this call
