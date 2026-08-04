@@ -346,19 +346,14 @@ impl PostPipe {
         self.blit_bgs.clear();
 
         // 优化(PMCORE-53/54):裁剪无效 pass。
-        // 1) 零强度特效(主参数 = 0 时输出与输入相同)直接跳过;
-        // 2) 连续完全相同的实例只保留一个。
+        // 零强度特效(主参数 = 0 时输出与输入相同)直接跳过。
+        // 注意:不裁剪"重复特效"——两个参数相同的特效是用户刻意叠加的
+        // (double glitch / double noise),去重会让第二个静默不渲染。
         let mut active: Vec<&ActiveEffect> = Vec::with_capacity(self.active.len());
-        let mut prev_key: Option<(usize, Option<&str>, &[f32])> = None;
         for ae in &self.active {
             if is_effect_noop(ae) {
                 continue;
             }
-            let key = (ae.shader_idx, ae.custom_name.as_deref(), ae.uniform_values.as_slice());
-            if prev_key == Some(key) {
-                continue; // 连续重复实例去重
-            }
-            prev_key = Some(key);
             active.push(ae);
         }
         if active.is_empty() {
