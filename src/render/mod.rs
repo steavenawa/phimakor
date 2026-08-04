@@ -1645,8 +1645,7 @@ impl Renderer {
         }
 
         // Field-split call: `cmds` already borrows `self.textures`/`self.white`.
-        // 粒子按谱面时间(frame.time)驱动:暂停/seek 时与画面同步。
-        Self::push_hit_fx(&mut self.hit_fx, &self.textures, &self.white, &mut cmds, &letterbox, ev_x, ev_y, frame.time);
+        Self::push_hit_fx(&mut self.hit_fx, &self.textures, &self.white, &mut cmds, &letterbox, ev_x, ev_y);
 
         // Text overlay (Phaser UI), on top of everything; queue is per-frame.
         text::push_text(

@@ -29,8 +29,6 @@ pub struct PreviewEngine {
     frame_idx: u64,
     width: u32,
     height: u32,
-    /// Last rendered frame's chart time (sec) — hit FX spawn anchors on it.
-    last_time: f64,
 }
 
 impl PreviewEngine {
@@ -47,7 +45,6 @@ impl PreviewEngine {
             padded_bpr,
             pixels: vec![0; (width * height * 4) as usize],
             frame_idx: 0,
-            last_time: 0.0,
             width,
             height,
         })
@@ -124,7 +121,6 @@ impl PreviewEngine {
     pub fn render_frame(&mut self, frame: &FrameState, window_aspect: f32, dim: f32) -> &[u8] {
         let cur = (self.frame_idx % 3) as usize;
         let prev = ((self.frame_idx + 1) % 3) as usize;
-        self.last_time = frame.time;
 
         // 1) Render + copy current frame into slot `cur`.
         let view = self.targets[cur].create_view(&wgpu::TextureViewDescriptor::default());
@@ -256,10 +252,9 @@ impl PreviewEngine {
     /// Read-only access to the last rendered RGBA frame.
     pub fn pixels(&self) -> &[u8] { &self.pixels }
 
-    /// Spawn a hit-effect burst at the given canvas position. Anchored to
-    /// the last rendered frame's chart time (chart-clock driven FX).
+    /// Spawn a hit-effect burst at the given canvas position.
     pub fn spawn_hit_fx(&mut self, pos_canvas: [f32; 2]) {
-        self.renderer.spawn_hit_fx(pos_canvas, self.last_time);
+        self.renderer.spawn_hit_fx(pos_canvas);
     }
 
     /// Queue a text overlay for the next frame.
