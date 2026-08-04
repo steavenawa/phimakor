@@ -16,6 +16,30 @@ cargo run --release <谱面目录>
 不传参数时会列出当前目录下可用的谱面。  
 note资源包放在 `res/`，字体 `res/Exo2.ttf` 可选。
 
+### 资源来源
+
+`res/` 下的资源有版权考量，不入库。参考社区资源包，解压到 `res/` 下（应包含以下文件）：
+
+```
+click.ogg
+click.png
+click_mh.png
+drag.ogg
+drag.png
+drag_mh.png
+ending.mp3
+Exo2.ttf
+flick.ogg
+flick.png
+flick_mh.png
+hit_fx.png
+hold.png
+hold_mh.png
+info.yml
+```
+
+缺文件时程序会告警并降级（音符贴图缺失 → 画不出音符；hitsound 缺失 → 静默）。
+
 ## 快捷键
 
 | 键 | 功能 |
