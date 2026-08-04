@@ -179,9 +179,6 @@ struct LineData {
     /// monotonically; reset on backward seek. Unused for `show_below` lines
     /// (their notes never vanish by time).
     cursor: usize,
-    /// Cursor into `order` for fired detection: notes before it have
-    /// `max(time, end_time) <= last_state_time` and can never fire again.
-    fired_cursor: usize,
     texture: Option<String>,
     z_order: i32,
     parent: Option<usize>,
@@ -651,7 +648,6 @@ fn parse_judge_line(
         notes,
         order,
         cursor: 0,
-        fired_cursor: 0,
         texture: if rpe.texture == "line.png" { None } else { Some(rpe.texture.clone()) },
         z_order: rpe.z_order,
         parent,
@@ -729,11 +725,16 @@ pub struct Chart {
     /// Time of the previous `state_at` call, for fired-note detection.
     last_state_time: f64,
     frame: FrameState,
-    /// Scratch reused across frames: visible notes / fired events collected
-    /// in time-sorted `order` scan order, index-tagged so they can be
-    /// restored to draw order before publishing.
+    /// 统一触发事件表(构建时生成一次,排序):每个非 fake note 的头/尾/
+    /// 半拍 tick 一个事件。fx 查询、fired 报告都查这张表,消除此前
+    /// fx_in_window(每帧窗口扫描)与 advance_fired(游标状态机)两套
+    /// 独立扫描 + 两套判定标准。kind: 1/2/3/4 = note 头,5 = hold tick,
+    /// 6 = hold 尾。
+    triggers: Vec<TriggerEvent>,
+    /// Scratch reused across frames: visible notes collected in time-sorted
+    /// `order` scan order, index-tagged so they can be restored to draw
+    /// order before publishing.
     visible_scratch: Vec<(usize, NoteState)>,
-    fired_scratch: Vec<(usize, FiredNote)>,
 }
 
 /// Reads `info.json` in `dir` (falling back to an RPE web-export `info.yml`,
@@ -770,6 +771,21 @@ pub struct FxTrigger {
     pub x: f32,
 }
 
+/// 统一触发事件表条目(构建时生成):`t` = 谱面时钟秒。
+/// `kind`:1/2/3/4 = note 头(tap/hold/flick/drag),5 = hold 半拍 tick,
+/// 6 = hold 尾。fake note 不产生事件。
+#[derive(Clone, Copy, Debug)]
+pub struct TriggerEvent {
+    pub t: f64,
+    pub line: usize,
+    pub x: f32,
+    pub kind: u8,
+}
+
+/// hold tick 与 hold 尾在事件表里的内部 kind 标记。
+pub const TRIGGER_TICK: u8 = 5;
+pub const TRIGGER_TAIL: u8 = 6;
+
 impl Chart {
     /// Fast-forward the fired-note cursors to `time` without reporting the
     /// notes that were jumped over. The editor calls this after a **forward**
@@ -780,14 +796,6 @@ impl Chart {
     /// `state_at` already handles via its seek-back detection.
     pub fn reposition(&mut self, time: f64) {
         self.last_state_time = time;
-        for line in self.lines.iter_mut() {
-            let start = line.fired_cursor;
-            line.fired_cursor = start
-                + line.order[start..].partition_point(|&ni| {
-                    let n = &line.notes[ni];
-                    n.time.max(n.end_time) <= time
-                });
-        }
     }
 
     /// Reads `info.json` in `dir` (falling back to an RPE-export `info.txt`
@@ -978,6 +986,33 @@ impl Chart {
                 attach_ui: None,
             })
             .collect();
+        // 统一触发事件表:头/尾/半拍 tick(非 fake),按时间排序。
+        // 半拍 tick 反向解算(秒→拍→半拍→秒),与旧 fx_in_window 同语义;
+        // tick 严格早于 hold 尾(恰落在 end_time 的半拍不产生 tick)。
+        let mut trig_bpm = BpmList::new(r.elements().iter().map(|&(b, _, v)| (b, v)).collect());
+        let mut triggers: Vec<TriggerEvent> = Vec::new();
+        for (line_idx, line) in lines.iter().enumerate() {
+            for n in &line.notes {
+                if n.fake {
+                    continue;
+                }
+                triggers.push(TriggerEvent { t: n.time, line: line_idx, x: n.x, kind: n.kind });
+                if n.kind == 2 && n.end_time > n.time {
+                    let b_lo = trig_bpm.beat(n.time);
+                    let b_end = trig_bpm.beat(n.end_time);
+                    let mut tb = (b_lo * 2.0).floor() / 2.0 + 0.5;
+                    while tb < b_end {
+                        let tt = trig_bpm.time_beats(tb);
+                        if tt < n.end_time {
+                            triggers.push(TriggerEvent { t: tt, line: line_idx, x: n.x, kind: TRIGGER_TICK });
+                        }
+                        tb += 0.5;
+                    }
+                    triggers.push(TriggerEvent { t: n.end_time, line: line_idx, x: n.x, kind: TRIGGER_TAIL });
+                }
+            }
+        }
+        triggers.sort_by(|a, b| a.t.total_cmp(&b.t));
         Ok(Chart {
             offset,
             duration: max_time,
@@ -986,110 +1021,42 @@ impl Chart {
             last_state_time: 0.,
             frame: FrameState { time: 0., lines: frame_lines, fired: Vec::new() },
             visible_scratch: Vec::new(),
-            fired_scratch: Vec::new(),
+            triggers,
         })
     }
 
-    /// Fired-note detection only: advances the `fired_cursor` state and
-    /// returns notes whose hit/sustain/release events crossed since the
-    /// previous call. Skips all animation/visibility evaluation, so it is
-    /// cheap enough for the audio thread's per-tick polling (hitsounds).
-    /// Backward seeks (`time < previous call`) reset the cursors and report
-    /// nothing this call.
+    /// Fired-note detection: returns trigger events (heads / hold ticks /
+    /// hold tails) crossed since the previous call, backed by the unified
+    /// [`TriggerEvent`] table (no per-frame scanning, no cursor state).
+    /// Backward seeks (`time < previous call`) report nothing this call;
+    /// the next call replays events after the seek target (same semantics
+    /// as the old cursor-based implementation).
     pub fn advance_fired(&mut self, time: f64) -> &[FiredNote] {
-        let Chart {
-            lines,
-            bpm_list,
-            last_state_time,
-            frame,
-            fired_scratch,
-            ..
-        } = self;
-        frame.time = time;
-        frame.fired.clear();
-        let last = *last_state_time;
+        let last = self.last_state_time;
+        self.last_state_time = time;
+        self.frame.fired.clear();
         if time < last {
-            // backward seek — cursors restart from the top
-            for line in lines.iter_mut() {
-                line.fired_cursor = 0;
-            }
-        } else {
-            for (line_idx, line) in lines.iter_mut().enumerate() {
-                // notes with max(time, end_time) <= last can never fire again
-                let start = line.fired_cursor;
-                line.fired_cursor = start
-                    + line.order[start..].partition_point(|&ni| {
-                        let n = &line.notes[ni];
-                        n.time.max(n.end_time) <= last
-                    });
-                for &ni in &line.order[line.fired_cursor..] {
-                    let note = &line.notes[ni];
-                    // order is sorted by max(time, end_time), so a note's
-                    // start can be before a later-ordered note's start (holds
-                    // with long end_time). Only the three checks below need a
-                    // note whose start has passed — skip future starts cheaply
-                    // instead of running the (hold-expensive) branches.
-                    if note.time > time { continue; }
-                    // hit events fire even for notes culled out of the frame
-                    if last < note.time && note.time <= time {
-                        fired_scratch.push((
-                            ni,
-                            FiredNote {
-                                line: line_idx,
-                                kind: note.kind,
-                                x: note.x,
-                                fake: note.fake,
-                                tick: false,
-                                hold_tail: false,
-                            },
-                        ));
-                    }
-                    // hold sustain: one event per half beat crossed while
-                    // the hold is active (strictly after its hit beat)
-                    if note.kind == 2 && note.time < time && last < note.end_time {
-                        let b_lo = bpm_list.beat(last.max(note.time));
-                        // exclusive cap: a beat landing exactly on end_time is
-                        // the hold's release (t < end_time strict), not a tick
-                        let cap = if time >= note.end_time { note.end_time - EPS } else { time };
-                        let b_hi = bpm_list.beat(cap);
-                        let crossed = ((b_hi * 2.).floor() - (b_lo * 2.).floor()).max(0.) as usize;
-                        for _ in 0..crossed {
-                            fired_scratch.push((
-                                ni,
-                                FiredNote {
-                                    line: line_idx,
-                                    kind: 2,
-                                    x: note.x,
-                                    fake: note.fake,
-                                    tick: true,
-                                    hold_tail: false,
-                                },
-                            ));
-                        }
-                    }
-                    // hold release: fired once when end_time is crossed
-                    if note.kind == 2 && last < note.end_time && note.end_time <= time {
-                        fired_scratch.push((
-                            ni,
-                            FiredNote {
-                                line: line_idx,
-                                kind: 2,
-                                x: note.x,
-                                fake: note.fake,
-                                tick: false,
-                                hold_tail: true,
-                            },
-                        ));
-                    }
-                }
-                // restore draw order (stable: per-note head/ticks/tail stays)
-                fired_scratch.sort_by_key(|(ni, _)| *ni);
-                frame.fired.extend(fired_scratch.drain(..).map(|(_, f)| f));
-            }
+            // seek backward — report nothing this call
+            return &self.frame.fired;
         }
-        // else: seek backward — report nothing this call
-        *last_state_time = time;
-        &frame.fired
+        let start = self.triggers.partition_point(|e| e.t <= last);
+        let end = self.triggers.partition_point(|e| e.t <= time);
+        self.frame.fired.extend(self.triggers[start..end].iter().map(|e| {
+            let (tick, hold_tail, kind) = match e.kind {
+                TRIGGER_TICK => (true, false, 2),
+                TRIGGER_TAIL => (false, true, 2),
+                k => (false, false, k),
+            };
+            FiredNote {
+                line: e.line,
+                kind,
+                x: e.x,
+                fake: false,
+                tick,
+                hold_tail,
+            }
+        }));
+        &self.frame.fired
     }
 
     /// Evaluates all animations at `time` (seconds on the chart clock) and
@@ -1361,46 +1328,21 @@ impl Chart {
     ///
     /// 不裁剪:窗口内全部触发点都返回(密集段落靠粒子渲染自身承担成本)。
     pub fn fx_in_window(&self, t_lo: f64, t_hi: f64) -> Vec<FxTrigger> {
-        let mut out: Vec<FxTrigger> = Vec::new();
-        // 局部 BpmList(反向解算 tick 用;beat/time_beats 需要 &mut cursor)。
-        let mut bpm = BpmList::new(self.bpm_list.elements().iter().map(|&(b, _, v)| (b, v)).collect());
-        for (line_idx, line) in self.lines.iter().enumerate() {
-            let start = line.order.partition_point(|&ni| {
-                let n = &line.notes[ni];
-                n.time.max(n.end_time) < t_lo
-            });
-            for &ni in &line.order[start..] {
-                let n = &line.notes[ni];
-                if n.fake {
-                    continue;
-                }
-                // 头:在窗口内
-                if n.time >= t_lo && n.time <= t_hi {
-                    out.push(FxTrigger { t0: n.time, line: line_idx, x: n.x });
-                }
-                // hold 尾:在窗口内
-                if n.kind == 2 && n.end_time >= t_lo && n.end_time <= t_hi {
-                    out.push(FxTrigger { t0: n.end_time, line: line_idx, x: n.x });
-                }
-                // hold 半拍 tick:窗口内 [max(t_lo, note.time), min(t_hi, end_time)]
-                if n.kind == 2 && n.end_time > n.time {
-                    let b_lo = bpm.beat(n.time.max(t_lo));
-                    let b_hi = bpm.beat(n.end_time.min(t_hi));
-                    // 从头的下一个半拍开始(反向解算:秒→拍)
-                    let mut tb = (b_lo * 2.0).floor() / 2.0 + 0.5;
-                    while tb < b_hi {
-                        let tt = bpm.time_beats(tb);
-                        if tt >= t_lo && tt <= t_hi {
-                            out.push(FxTrigger { t0: tt, line: line_idx, x: n.x });
-                        }
-                        tb += 0.5;
-                    }
-                }
-            }
-        }
-        // 按时间升序(渲染顺序规整)。
-        out.sort_by(|a, b| a.t0.total_cmp(&b.t0));
-        out
+        // 统一事件表闭区间查询 [t_lo, t_hi](头/尾/tick 全含,非 fake),
+        // 不裁剪上限。
+        let start = self.triggers.partition_point(|e| e.t < t_lo);
+        let end = self.triggers.partition_point(|e| e.t <= t_hi);
+        self.triggers[start..end].iter()
+            .map(|e| FxTrigger { t0: e.t, line: e.line, x: e.x })
+            .collect()
+    }
+
+    /// 统一触发事件表区间查询 `(t_lo, t_hi]`(开左闭右,与
+    /// advance_fired 的游标语义一致)。
+    pub fn triggers_in(&self, t_lo: f64, t_hi: f64) -> &[TriggerEvent] {
+        let start = self.triggers.partition_point(|e| e.t <= t_lo);
+        let end = self.triggers.partition_point(|e| e.t <= t_hi);
+        &self.triggers[start..end]
     }
 
     /// 求线在 `time` 时刻的位姿 (position, rotation 弧度),含 parent 继承

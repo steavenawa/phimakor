@@ -136,7 +136,7 @@ impl ChartSession {
         }));
         // Convert trigger points to canvas positions via t0 line transforms.
         {
-            let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().zip(poses.into_iter()).map(|(tr, (pos, rot))| {
+            let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().zip(poses).map(|(tr, (pos, rot))| {
                 let rot = rot as f64;
                 // tr.x 是相对线中心的单位(-1..1),与 fired.x 同语义。
                 let x = tr.x as f64;
