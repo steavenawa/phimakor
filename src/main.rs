@@ -1692,8 +1692,17 @@ impl ApplicationHandler for App {
             // import + open.
             if let WindowEvent::DroppedFile(path) = &event {
                 let path = path.clone();
-                let lower = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                let open_path = if lower == "zip" {
+                // 按内容(文件头魔数/格式检测)判断,不依赖后缀:
+                // 1) zip 包: PK\x03\x04 魔数 → 解包导入;
+                // 2) 目录: 含 info 文件 → 谱面目录;
+                // 3) info.* 文件 → 其父目录;
+                // 4) chart 文件(RPE/PEC/PGR/PSS,内容检测) → 父目录。
+                let head = std::fs::File::open(&path).ok().and_then(|mut f| {
+                    let mut b = [0u8; 4];
+                    std::io::Read::read_exact(&mut f, &mut b).ok().map(|_| b)
+                });
+                let is_zip = head == Some(*b"PK\x03\x04");
+                let open_path = if is_zip {
                     // Probe the archive for chart content, then extract.
                     match import_chart_zip(&path) {
                         Ok(dir) => {
@@ -1726,6 +1735,18 @@ impl ApplicationHandler for App {
                 } else if path.is_file() && (path.file_name().is_some_and(|n| n == "info.json" || n == "info.txt")) {
                     // info.json itself → its parent is the chart dir.
                     path.parent().map(|p| p.to_path_buf()).unwrap_or(path)
+                } else if path.is_file() {
+                    // Chart file itself (any supported format, content-detected)
+                    // → its parent is the chart dir.
+                    match std::fs::read(&path) {
+                        Ok(bytes) if core::chart_format::detect_format(&bytes) != "unknown" => {
+                            path.parent().map(|p| p.to_path_buf()).unwrap_or(path)
+                        }
+                        _ => {
+                            eprintln!("drop: not a chart folder, zip, info or chart file: {path:?}");
+                            return;
+                        }
+                    }
                 } else {
                     eprintln!("drop: not a chart folder or zip: {path:?}");
                     return;
