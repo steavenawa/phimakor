@@ -553,8 +553,13 @@ impl State {
         match self.eff_edit_field {
             0 => {
                 // Cycle through the built-in shaders; a custom shader jumps
-                // to the first built-in.
-                let names: Vec<&str> = crate::render::shaders::EFFECTS.iter().map(|d| d.name).collect();
+                // to the first built-in. Internal composite stages
+                // (circleBlurH/V 等) are not user-selectable.
+                let stage_names: std::collections::HashSet<&str> =
+                    crate::render::shaders::EFFECTS.iter().flat_map(|d| d.stages.iter().copied()).collect();
+                let names: Vec<&str> = crate::render::shaders::EFFECTS.iter()
+                    .filter(|d| !stage_names.contains(d.name))
+                    .map(|d| d.name).collect();
                 let next = match names.iter().position(|n| **n == e.shader) {
                     Some(p) => (p as isize + delta.signum() as isize).rem_euclid(names.len() as isize) as usize,
                     None => 0,

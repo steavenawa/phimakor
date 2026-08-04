@@ -11,7 +11,7 @@
 
 use crate::core::extra::{EvalEffect, ExtraRoot};
 use crate::render::post::ActiveEffect;
-use crate::render::shaders::EFFECTS;
+use crate::render::shaders::{EffectDef, EFFECTS};
 
 /// 从 extra.json 的活跃特效构建渲染链(按优先级排序,已由
 /// [`crate::core::extra::evaluate_effects`] 排序)。
@@ -22,26 +22,73 @@ pub fn build_effect_chain(
     screen: (f32, f32),
 ) -> Vec<ActiveEffect> {
     let evals = crate::core::extra::evaluate_effects(extra, chart_beat);
-    evals.iter().map(|e| resolve_one(e, chart_time, screen)).collect()
+    evals.iter().flat_map(|e| resolve_one(e, chart_time, screen)).collect()
 }
 
-/// 单个特效 → ActiveEffect(uniform 解析 + 内置 uniform 注入)。
-fn resolve_one(e: &EvalEffect, chart_time: f64, screen: (f32, f32)) -> ActiveEffect {
+/// 单个特效 → 1..N 个 ActiveEffect。
+/// 复合特效(EffectDef::stages 非空,如 circleBlur = H+V 分离 max)展开成
+/// 多个单 pass 条目;零强度特效在展开前整体跳过(避免 stage 白跑)。
+fn resolve_one(e: &EvalEffect, chart_time: f64, screen: (f32, f32)) -> Vec<ActiveEffect> {
     let (sw, sh) = screen;
     let si = EFFECTS.iter().position(|d| d.name == e.shader_name).unwrap_or(usize::MAX);
-    let (uniform_values, uniform_count) = if si == usize::MAX {
+    if si == usize::MAX {
         // 自定义 shader:用 extra.json 原始 uniform。
-        (e.uniforms.clone(), e.uniforms.len())
-    } else {
-        resolve_builtin(e, si, chart_time, sw, sh)
-    };
-    ActiveEffect {
-        shader_idx: si,
-        custom_name: if si == usize::MAX { Some(e.shader_name.clone()) } else { None },
-        priority: e.priority,
-        uniform_values,
-        uniform_count,
+        return vec![ActiveEffect {
+            shader_idx: usize::MAX,
+            custom_name: Some(e.shader_name.clone()),
+            priority: e.priority,
+            uniform_values: e.uniforms.clone(),
+            uniform_count: e.uniforms.len(),
+        }];
     }
+    let def = &EFFECTS[si];
+    if effect_noop(e, def) {
+        return vec![];
+    }
+    if def.stages.is_empty() {
+        let (uv, uc) = resolve_builtin(e, si, chart_time, sw, sh);
+        return vec![ActiveEffect {
+            shader_idx: si,
+            custom_name: None,
+            priority: e.priority,
+            uniform_values: uv,
+            uniform_count: uc,
+        }];
+    }
+    def.stages.iter().filter_map(|sname| {
+        let ssi = EFFECTS.iter().position(|d| d.name == *sname)?;
+        let (uv, uc) = resolve_builtin(e, ssi, chart_time, sw, sh);
+        Some(ActiveEffect {
+            shader_idx: ssi,
+            custom_name: None,
+            priority: e.priority,
+            uniform_values: uv,
+            uniform_count: uc,
+        })
+    }).collect()
+}
+
+/// 零强度特效判定(展开前,对原始特效):主参数 = 0 → 输出与输入相同。
+fn effect_noop(e: &EvalEffect, def: &EffectDef) -> bool {
+    let norm = |s: &str| s.to_lowercase().replace('_', "").replace('-', "");
+    // 各内置特效的主强度参数(按名字归一匹配)。
+    let main_param: Option<&str> = match def.name {
+        "grayscale" => Some("factor"),
+        "chromatic" => Some("power"),
+        "glitch" => Some("power"),
+        "fisheye" => Some("power"),
+        "noise" => Some("power"),
+        "radialBlur" => Some("power"),
+        "pixel" => Some("size"),
+        "circleBlur" | "circleBlurH" | "circleBlurV" => Some("size"),
+        "vignette" => Some("color_a"),
+        _ => None,
+    };
+    let Some(param) = main_param else { return false };
+    let np = norm(param);
+    e.uniforms_names.iter().zip(e.uniforms.iter())
+        .find(|(n, _)| norm(n) == np)
+        .is_some_and(|(_, v)| *v == 0.0)
 }
 
 /// 内置 shader:默认值打底,按名合并,注入 screen_size/time。
@@ -145,5 +192,34 @@ mod tests {
         let chain = build_effect_chain(&extra, 5.0, 0.0, (0.0, 0.0));
         assert_eq!(chain.len(), 2);
         assert!(chain[0].priority <= chain[1].priority, "sorted by priority");
+    }
+
+    #[test]
+    fn composite_circle_blur_expands_to_two_passes() {
+        // circleBlur → circleBlurH + circleBlurV 两个单 pass。
+        let extra = ExtraRoot { bpm: vec![], effects: vec![
+            effect("circleBlur", vec![("size", 12.0)]),
+        ]};
+        let chain = build_effect_chain(&extra, 5.0, 0.0, (1920.0, 1080.0));
+        assert_eq!(chain.len(), 2);
+        let names: Vec<&str> = chain.iter().map(|fx| {
+            let si = fx.shader_idx;
+            if si == usize::MAX { "custom" } else { crate::render::shaders::EFFECTS[si].name }
+        }).collect();
+        assert_eq!(names, vec!["circleBlurH", "circleBlurV"]);
+        // size 均匀传递到两个 stage。
+        for fx in &chain {
+            assert!((fx.uniform_values[0] - 12.0).abs() < 1e-6, "size propagated: {:?}", fx.uniform_values);
+        }
+    }
+
+    #[test]
+    fn composite_zero_size_skipped_before_expansion() {
+        // size = 0 → 整个 circleBlur 不展开(零强度)。
+        let extra = ExtraRoot { bpm: vec![], effects: vec![
+            effect("circleBlur", vec![("size", 0.0)]),
+        ]};
+        let chain = build_effect_chain(&extra, 5.0, 0.0, (0.0, 0.0));
+        assert!(chain.is_empty());
     }
 }

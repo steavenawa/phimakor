@@ -131,7 +131,11 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 }
 ";
 
-pub const CIRCLE_BLUR_FRAG: &str = r"
+/// 一维水平 max 模糊:取 `[-size, size]` 范围内最亮像素(rgb 亮度最大)。
+/// 与 `CIRCLE_BLUR_V_FRAG` 组成分离式方形 max 模糊(circleBlur 复合特效)。
+/// 方形区域 max 精确可分离:水平 pass + 垂直 pass = 方形邻域 max,
+/// 采样数 2×size vs 原暴力 size²×π/4(16 倍提速)。
+pub const CIRCLE_BLUR_H_FRAG: &str = r"
 @group(0) @binding(0) var screen_tex: texture_2d<f32>;
 @group(0) @binding(1) var screen_sampler: sampler;
 struct Params { size: f32, screen_size: vec2f, }
@@ -141,11 +145,26 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
     var c = textureSample(screen_tex, screen_sampler, uv);
     let ps = 1.0 / p.screen_size;
     for (var x = -p.size; x < p.size; x = x + 1.0) {
-        for (var y = -p.size; y < p.size; y = y + 1.0) {
-            if (x * x + y * y > p.size * p.size) { continue; }
-            let nc = textureSample(screen_tex, screen_sampler, uv + ps * vec2f(x, y));
-            if (dot(nc.rgb, nc.rgb) > dot(c.rgb, c.rgb)) { c = nc; }
-        }
+        let nc = textureSample(screen_tex, screen_sampler, uv + ps * vec2f(x, 0.0));
+        if (dot(nc.rgb, nc.rgb) > dot(c.rgb, c.rgb)) { c = nc; }
+    }
+    return c;
+}
+";
+
+/// 一维垂直 max 模糊(`CIRCLE_BLUR_H_FRAG` 的垂直版,组成 circleBlur)。
+pub const CIRCLE_BLUR_V_FRAG: &str = r"
+@group(0) @binding(0) var screen_tex: texture_2d<f32>;
+@group(0) @binding(1) var screen_sampler: sampler;
+struct Params { size: f32, screen_size: vec2f, }
+@group(1) @binding(0) var<uniform> p: Params;
+@fragment
+fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+    var c = textureSample(screen_tex, screen_sampler, uv);
+    let ps = 1.0 / p.screen_size;
+    for (var y = -p.size; y < p.size; y = y + 1.0) {
+        let nc = textureSample(screen_tex, screen_sampler, uv + ps * vec2f(0.0, y));
+        if (dot(nc.rgb, nc.rgb) > dot(c.rgb, c.rgb)) { c = nc; }
     }
     return c;
 }
@@ -221,6 +240,10 @@ fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
 pub struct EffectDef {
     pub name: &'static str,
     pub frag: &'static str,
+    /// 复合特效的多阶段 shader 名(空 = 单 pass)。非空时 `frag` 是占位,
+    /// 实际按 stages 逐个编译执行(如 circleBlur = [circleBlurH, circleBlurV]
+    /// 分离式 max 模糊)。uniform 由各阶段自己的 defaults 解析。
+    pub stages: &'static [&'static str],
     /// Default uniform values: (label, default_f32)
     pub defaults: &'static [(&'static str, f32)],
 }
@@ -236,25 +259,30 @@ pub const PASSTHROUGH_FRAG: &str = r"
 ";
 
 pub const EFFECTS: &[EffectDef] = &[
-    EffectDef { name: "grayscale",  frag: GRAYSCALE_FRAG,   defaults: &[("factor", 1.0)] },
+    EffectDef { stages: &[], name: "grayscale",  frag: GRAYSCALE_FRAG,   defaults: &[("factor", 1.0)] },
     // chromatic: power(f32) + sample_count(f32) + screen_size(vec2f=2xf32) = 4xf32
-    EffectDef { name: "chromatic",  frag: CHROMATIC_FRAG,   defaults: &[("power", 0.01), ("sample_count", 3.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
+    EffectDef { stages: &[], name: "chromatic",  frag: CHROMATIC_FRAG,   defaults: &[("power", 0.01), ("sample_count", 3.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
     // glitch: power, time, rate, speed, block_count, color_rate = 6xf32
-    EffectDef { name: "glitch",     frag: GLITCH_FRAG,      defaults: &[("power", 0.03), ("time", 0.0), ("rate", 0.6), ("speed", 5.0), ("block_count", 30.5), ("color_rate", 0.01)] },
+    EffectDef { stages: &[], name: "glitch",     frag: GLITCH_FRAG,      defaults: &[("power", 0.03), ("time", 0.0), ("rate", 0.6), ("speed", 5.0), ("block_count", 30.5), ("color_rate", 0.01)] },
     // vignette: color(vec4f=4) + extend(f32) + radius(f32) = 6xf32
-    EffectDef { name: "vignette",   frag: VIGNETTE_FRAG,    defaults: &[("color_r", 0.0), ("color_g", 0.0), ("color_b", 0.0), ("color_a", 1.0), ("extend", 0.25), ("radius", 15.0)] },
+    EffectDef { stages: &[], name: "vignette",   frag: VIGNETTE_FRAG,    defaults: &[("color_r", 0.0), ("color_g", 0.0), ("color_b", 0.0), ("color_a", 1.0), ("extend", 0.25), ("radius", 15.0)] },
     // fisheye: power, aspect = 2xf32
-    EffectDef { name: "fisheye",    frag: FISHEYE_FRAG,     defaults: &[("power", -0.1), ("aspect", 1.0)] },
+    EffectDef { stages: &[], name: "fisheye",    frag: FISHEYE_FRAG,     defaults: &[("power", -0.1), ("aspect", 1.0)] },
     // shockwave: progress(f32), pad(4B), center(vec2f=8), width, distortion, expand, pad(4B), screen_size(vec2f=8) = 10xf32
-    EffectDef { name: "shockwave",  frag: SHOCKWAVE_FRAG,   defaults: &[("progress", 0.2), ("_pad", 0.0), ("center_x", 0.5), ("center_y", 0.5), ("width", 0.1), ("distortion", 0.8), ("expand", 10.0), ("_pad2", 0.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
-    // circleBlur: size(f32), pad(4B), screen_size(vec2f=8) = 4xf32
-    EffectDef { name: "circleBlur", frag: CIRCLE_BLUR_FRAG, defaults: &[("size", 10.0), ("_pad", 0.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
+    EffectDef { stages: &[], name: "shockwave",  frag: SHOCKWAVE_FRAG,   defaults: &[("progress", 0.2), ("_pad", 0.0), ("center_x", 0.5), ("center_y", 0.5), ("width", 0.1), ("distortion", 0.8), ("expand", 10.0), ("_pad2", 0.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
+    // circleBlur: 复合特效 = 分离式方形 max 模糊(水平+垂直两 pass,
+    // 采样 2×size vs 原暴力 size²×π/4,16 倍提速)。frag 占位用 H。
+    EffectDef { stages: &["circleBlurH", "circleBlurV"], name: "circleBlur", frag: CIRCLE_BLUR_H_FRAG, defaults: &[("size", 10.0), ("_pad", 0.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
+    // circleBlurH: 水平 1D max(方形 max 的水平 pass)。
+    EffectDef { stages: &[], name: "circleBlurH", frag: CIRCLE_BLUR_H_FRAG, defaults: &[("size", 10.0), ("_pad", 0.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
+    // circleBlurV: 垂直 1D max(方形 max 的垂直 pass)。
+    EffectDef { stages: &[], name: "circleBlurV", frag: CIRCLE_BLUR_V_FRAG, defaults: &[("size", 10.0), ("_pad", 0.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
     // radialBlur: power, sample_count, center(vec2f=2) = 4xf32
-    EffectDef { name: "radialBlur", frag: RADIAL_BLUR_FRAG, defaults: &[("power", 0.01), ("sample_count", 6.0), ("center_x", 0.5), ("center_y", 0.5)] },
+    EffectDef { stages: &[], name: "radialBlur", frag: RADIAL_BLUR_FRAG, defaults: &[("power", 0.01), ("sample_count", 6.0), ("center_x", 0.5), ("center_y", 0.5)] },
     // pixel: size(f32), pad(4B), screen_size(vec2f=8) = 4xf32
-    EffectDef { name: "pixel",      frag: PIXELATE_FRAG,    defaults: &[("size", 10.0), ("_pad", 0.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
+    EffectDef { stages: &[], name: "pixel",      frag: PIXELATE_FRAG,    defaults: &[("size", 10.0), ("_pad", 0.0), ("screen_size_x", 0.0), ("screen_size_y", 0.0)] },
     // noise: seed, power = 2xf32
-    EffectDef { name: "noise",      frag: NOISE_FRAG,       defaults: &[("seed", 81.0), ("power", 0.03)] },
+    EffectDef { stages: &[], name: "noise",      frag: NOISE_FRAG,       defaults: &[("seed", 81.0), ("power", 0.03)] },
     // rainbow: time = 1xf32
-    EffectDef { name: "rainbow",    frag: RAINBOW_FRAG,     defaults: &[("time", 0.0)] },
+    EffectDef { stages: &[], name: "rainbow",    frag: RAINBOW_FRAG,     defaults: &[("time", 0.0)] },
 ];
