@@ -19,11 +19,14 @@ pub struct SettingsData {
     pub perf_hint: bool,
     /// 自定义 GPU 光标(隐藏系统光标,worker 画动态光标)。默认关。
     pub custom_cursor: bool,
+    /// 过激优化:hold 身体按视口裁剪(线段求交+勾股长度),长 hold 省
+    /// 大量 off-screen overdraw;视觉上等价但有风险,默认关。
+    pub aggressive_cull: bool,
 }
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, custom_cursor: false }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, custom_cursor: false, aggressive_cull: false }
     }
 }
 
@@ -71,6 +74,7 @@ pub fn build_settings_form(x: f32, y: f32, w: f32, s: f32, settings: &SettingsDa
         ("backend".into(), RTControl::Combo { items: vec!["Auto".into(), "DX12".into(), "Vulkan".into(), "GL".into()], selected: backend_idx, open: false }),
         ("perf hint".into(), RTControl::Toggle { on: settings.perf_hint, anim: if settings.perf_hint { 1.0 } else { 0.0 }, dir: if settings.perf_hint { 1.0 } else { -1.0 } }),
         ("custom cursor".into(), RTControl::Toggle { on: settings.custom_cursor, anim: if settings.custom_cursor { 1.0 } else { 0.0 }, dir: if settings.custom_cursor { 1.0 } else { -1.0 } }),
+        ("aggressive cull".into(), RTControl::Toggle { on: settings.aggressive_cull, anim: if settings.aggressive_cull { 1.0 } else { 0.0 }, dir: if settings.aggressive_cull { 1.0 } else { -1.0 } }),
     ]);
     form.row_h = 24.0 * s;
     form.gap = 4.0 * s;
@@ -123,6 +127,12 @@ pub fn apply_settings_form(form: &RealtimeForm, settings: &mut SettingsData) -> 
             ("custom cursor", RTControl::Toggle { on, .. }) => {
                 if *on != settings.custom_cursor {
                     settings.custom_cursor = *on;
+                    changed = true;
+                }
+            }
+            ("aggressive cull", RTControl::Toggle { on, .. }) => {
+                if *on != settings.aggressive_cull {
+                    settings.aggressive_cull = *on;
                     changed = true;
                 }
             }

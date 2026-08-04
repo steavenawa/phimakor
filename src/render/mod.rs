@@ -459,6 +459,9 @@ pub struct Renderer {
     /// Screen rect of the pause button (window px), for hit-testing.
     pause_rect: PauseHitRect,
     pub vsync: bool,
+    /// 过激优化:hold body 视口裁剪(线段求交+勾股长度)。视觉上等价但
+    /// 有回归风险,默认关,设置里开。
+    pub aggressive_cull: bool,
     /// Present modes the surface/adapter supports (for vsync-off Mailbox
     /// fallback); empty for surfaceless renderers.
     present_modes: Vec<wgpu::PresentMode>,
@@ -748,6 +751,7 @@ impl Renderer {
             fx_seed: 0x9E3779B97F4A7C15,
             text: text::TextState::new(),
             vsync: true,
+            aggressive_cull: false,
             present_modes,
             ui_inst_buf,
         })
@@ -1310,57 +1314,59 @@ impl Renderer {
                                 };
                                 let bh = (h1 - h0).abs();
                                 if bh > 1e-5 {
-                                    // [C] Hold body clip: the body runs along the
-                                    // line direction, so clip the segment
-                                    // (head edge → tail edge, INCLUDING line
-                                    // rotation) against the canvas box with
-                                    // Liang-Barsky, then re-derive the visible
-                                    // length with Pythagoras (斜对角线长度 =
-                                    // sqrt(dx²+dy²)). UVs map by the fraction
-                                    // along the body direction, so the head-end
-                                    // gradient stays anchored to the head under
-                                    // speed events / any rotation.
-                                    let (ax, ay) = to_canvas(x, h0);
-                                    let (bx, by) = to_canvas(x, h1);
-                                    let (dx, dy) = (bx - ax, by - ay);
-                                    let len = (dx * dx + dy * dy).sqrt();
-                                    // [C] Clip the CENTRE line against a box
-                                    // inflated by the body's half-width: when
-                                    // the line sits outside the viewport the
-                                    // body's edge can still be visible even
-                                    // though its centre line is not. The
-                                    // over-drawn fringe is culled by the GPU.
-                                    let hw = w * 0.5;
-                                    if let Some((t0, t1)) = clip_segment(
-                                        (ax, ay), (bx, by),
-                                        -CANVAS_W - hw, CANVAS_W + hw,
-                                        -CANVAS_H - hw, CANVAS_H + hw,
-                                    ) {
-                                        if t1 - t0 > 1e-6 {
-                                            let (x0, y0) = (ax + dx * t0, ay + dy * t0);
-                                            let (x1, y1) = (ax + dx * t1, ay + dy * t1);
-                                            let vis_len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
-                                            // Visible segment midpoint, rotated
-                                            // back into line-local space (the
-                                            // quad's local Y axis then aligns
-                                            // with the body direction again).
-                                            let rel_x = (x0 + x1) * 0.5 - ctrl_px;
-                                            let rel_y = (y0 + y1) * 0.5 - ctrl_py;
-                                            let lcx = cxn * rel_x + cyn * rel_y;
-                                            let lcy = -cyn * rel_x + cxn * rel_y;
-                                            let body_len = 1.0 - head_uv - tail_uv;
-                                            cmds.push(DrawCmd {
-                                                uniform: DrawUniform {
-                                                    model: mat_mul(&note_m, &mat_mul(
-                                                        &mat_translate(lcx, lcy),
-                                                        &mat_scale(w, vis_len),
-                                                    )),
-                                                    color: tint,
-                                                    uv_rect: v_at(head_uv + body_len * t0, body_len * (t1 - t0)),
-                                                },
-                                                tex: &t.bind_group,
-                                            });
+                                    if self.aggressive_cull {
+                                        // [C] 过激优化(设置里开):hold body 沿
+                                        // 线方向裁剪。线段(head边缘→tail边缘,
+                                        // 含线旋转)与画布矩形求交(Liang-Barsky),
+                                        // 可见长度用勾股定理 sqrt(dx²+dy²);
+                                        // 矩形按半宽膨胀,线在视口外时 body 宽边
+                                        // 仍可见。UV 按沿 body 方向的投影比例映射,
+                                        // head 端渐变在速度事件下仍锚定 head。
+                                        let (ax, ay) = to_canvas(x, h0);
+                                        let (bx, by) = to_canvas(x, h1);
+                                        let (dx, dy) = (bx - ax, by - ay);
+                                        let len = (dx * dx + dy * dy).sqrt();
+                                        let hw = w * 0.5;
+                                        if let Some((t0, t1)) = clip_segment(
+                                            (ax, ay), (bx, by),
+                                            -CANVAS_W - hw, CANVAS_W + hw,
+                                            -CANVAS_H - hw, CANVAS_H + hw,
+                                        ) {
+                                            if t1 - t0 > 1e-6 {
+                                                let (x0, y0) = (ax + dx * t0, ay + dy * t0);
+                                                let (x1, y1) = (ax + dx * t1, ay + dy * t1);
+                                                let vis_len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+                                                // Visible segment midpoint, rotated
+                                                // back into line-local space (the
+                                                // quad's local Y axis then aligns
+                                                // with the body direction again).
+                                                let rel_x = (x0 + x1) * 0.5 - ctrl_px;
+                                                let rel_y = (y0 + y1) * 0.5 - ctrl_py;
+                                                let lcx = cxn * rel_x + cyn * rel_y;
+                                                let lcy = -cyn * rel_x + cxn * rel_y;
+                                                let body_len = 1.0 - head_uv - tail_uv;
+                                                cmds.push(DrawCmd {
+                                                    uniform: DrawUniform {
+                                                        model: mat_mul(&note_m, &mat_mul(
+                                                            &mat_translate(lcx, lcy),
+                                                            &mat_scale(w, vis_len),
+                                                        )),
+                                                        color: tint,
+                                                        uv_rect: v_at(head_uv + body_len * t0, body_len * (t1 - t0)),
+                                                    },
+                                                    tex: &t.bind_group,
+                                                });
+                                            }
                                         }
+                                    } else {
+                                        cmds.push(DrawCmd {
+                                            uniform: DrawUniform {
+                                                model: mat_mul(&hd((h0 + h1) * 0.5), &mat_scale(1.0, bh / w)),
+                                                color: tint,
+                                                uv_rect: v_at(head_uv, 1. - head_uv - tail_uv),
+                                            },
+                                            tex: &t.bind_group,
+                                        });
                                     }
                                 }
                                 for (cy, v0, len, quad_h) in [

@@ -286,6 +286,7 @@ impl App {
         overlay.set_panels(layout.panels.clone());
         overlay.perf_hint = settings.perf_hint;
         overlay.custom_cursor = settings.custom_cursor;
+        renderer.aggressive_cull = settings.aggressive_cull;
         if settings.custom_cursor {
             window.set_cursor_visible(false);
         }
@@ -982,6 +983,7 @@ impl State {
         }
         // 应用即时生效的设置。
         self.renderer.set_vsync(self.settings.vsync);
+        self.renderer.aggressive_cull = self.settings.aggressive_cull;
         self.gui_scale = self.settings.gui_scale;
         self.overlay.perf_hint = self.settings.perf_hint;
         // 自定义 GPU 光标:隐藏系统光标。
