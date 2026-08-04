@@ -162,6 +162,16 @@ enum Inverse {
         index: usize,
         ev: RPEEvent,
     },
+    /// Op: event at (line, layer, kind, index) replaced. Undo restores
+    /// `old`; redo restores `new`.
+    ReplaceEvent {
+        line: usize,
+        layer: usize,
+        kind: EventKind,
+        index: usize,
+        old: RPEEvent,
+        new: RPEEvent,
+    },
     /// Op: `line` split at `at_beats`, producing `new_index`. Undo merges
     /// `new_index` back into `line`; redo re-splits.
     SplitLine {
@@ -549,6 +559,36 @@ impl ChartDocument {
             ev: ev.clone(),
         });
         Ok(ev)
+    }
+
+    /// Replaces the event at `index` in the specified (line, layer, kind)
+    /// event list with `ev`, returning the old event. A single undoable op
+    /// (unlike remove+add, which pollutes the undo stack with two entries).
+    pub fn replace_event(
+        &mut self,
+        line: usize,
+        layer: usize,
+        kind: EventKind,
+        index: usize,
+        ev: RPEEvent<f32>,
+    ) -> Result<RPEEvent<f32>, EditError> {
+        let list = self.events_mut_strict(line, layer, kind)?;
+        if index >= list.len() {
+            return Err(EditError::BadOp(format!(
+                "{kind:?} event index {index} out of range in line {line} layer {layer} ({} events)",
+                list.len()
+            )));
+        }
+        let old = std::mem::replace(&mut list[index], ev.clone());
+        self.record(Inverse::ReplaceEvent {
+            line,
+            layer,
+            kind,
+            index,
+            old: old.clone(),
+            new: ev,
+        });
+        Ok(old)
     }
 
     // --- line structure ops (拆/绑线) ---
@@ -1054,6 +1094,19 @@ impl ChartDocument {
                 let list = self.event_list_mut(*line, *layer, *kind)?;
                 list.insert((*index).min(list.len()), ev.clone());
             }
+            Inverse::ReplaceEvent {
+                line,
+                layer,
+                kind,
+                index,
+                old,
+                ..
+            } => {
+                let list = self.events_mut_strict(*line, *layer, *kind)?;
+                if let Some(slot) = list.get_mut(*index) {
+                    *slot = old.clone();
+                }
+            }
             Inverse::SplitLine {
                 line, new_index, ..
             } => self.merge_lines_back(*line, *new_index)?,
@@ -1186,6 +1239,19 @@ impl ChartDocument {
                     )));
                 }
                 list.remove((*index).min(list.len() - 1));
+            }
+            Inverse::ReplaceEvent {
+                line,
+                layer,
+                kind,
+                index,
+                new,
+                ..
+            } => {
+                let list = self.events_mut_strict(*line, *layer, *kind)?;
+                if let Some(slot) = list.get_mut(*index) {
+                    *slot = new.clone();
+                }
             }
             Inverse::SplitLine { line, at_beats, .. } => {
                 self.split_raw(*line, *at_beats)?;
@@ -1462,6 +1528,29 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+
+        // replace_event: 单 op 替换 + undo 恢复 old / redo 恢复 new。
+        doc.add_event(0, 0, EventKind::MoveX, ev(0., 1., 10., 20.))
+            .unwrap();
+        let old_ev = doc.replace_event(0, 0, EventKind::MoveX, 0, ev(0., 1., 99., 88.)).unwrap();
+        assert_eq!(old_ev.start, 10.);
+        assert_eq!(
+            doc.chart().judge_line_list[0].event_layers[0]
+                .as_ref().unwrap().move_x_events.as_ref().unwrap()[0].start,
+            99.
+        );
+        assert!(doc.undo()); // 一步撤销整个替换
+        assert_eq!(
+            doc.chart().judge_line_list[0].event_layers[0]
+                .as_ref().unwrap().move_x_events.as_ref().unwrap()[0].start,
+            10.
+        );
+        assert!(doc.redo()); // 一步重做
+        assert_eq!(
+            doc.chart().judge_line_list[0].event_layers[0]
+                .as_ref().unwrap().move_x_events.as_ref().unwrap()[0].start,
+            99.
         );
 
         drop(doc);

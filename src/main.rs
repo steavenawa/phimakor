@@ -76,6 +76,11 @@ struct State {
     selected_line: usize,
     selected_layer: usize,
     selected_event_idx: Option<usize>,
+    /// Note 拖拽:开始时的 (note 索引, 原 note) 快照;松手时一次
+    /// replace_note 提交(PMCORE-19:拖拽期间不再每帧 remove+add 刷 undo)。
+    drag_origin: Option<(usize, core::model::RPENote)>,
+    /// Note 拖拽:当前预览位置 (note 索引, beat, x),拖拽中面板显示用。
+    drag_preview: Option<(usize, f64, f32)>,
     event_edit_target: u8, // 0=start_beats, 1=end_beats, 2=start_val, 3=end_val, 4=easing
     cache_valid: bool,
     cached_events: Arc<Vec<ui::EventEntry>>,
@@ -199,7 +204,7 @@ impl App {
             device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
             drag_was_playing: false,
-            selected_line: 0, selected_event_idx: None, scroll_target: None,
+            selected_line: 0, selected_event_idx: None, drag_origin: None, drag_preview: None, scroll_target: None,
             pending_seek: None, chart_time_last: 0.0, focused: true, ctrl: false,
             gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0, event_edit_target: 0,
             vertical_split: 14, layout: LayoutDef { panels: vec![] },
@@ -299,7 +304,7 @@ impl App {
             device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
             drag_was_playing: false,
-            selected_line: 0, selected_event_idx: None, event_edit_target: 0,
+            selected_line: 0, selected_event_idx: None, drag_origin: None, drag_preview: None, event_edit_target: 0,
             scroll_target: None, pending_seek: None, chart_time_last: 0.0,
             focused: true, ctrl: false, gui_scale: settings.gui_scale, snap: 0.25, selected_layer: 0,
             vertical_split: 14, layout, ui_dirty: true, show_menu: false, splash_mode: false,
@@ -1081,12 +1086,26 @@ impl State {
             "Alpha" => EventKind::Alpha, "MoveX" => EventKind::MoveX, "MoveY" => EventKind::MoveY,
             "Rotate" => EventKind::Rotate, "Speed" => EventKind::Speed, _ => return,
         };
-        if let Ok(mut ev) = self.doc.remove_event(self.selected_line, self.selected_layer, kind, entry.index) {
-            f(&mut ev);
-            if self.doc.add_event(self.selected_line, self.selected_layer, kind, ev).is_ok() {
-                self.rebuild_chart();
-                self.ui_dirty = true;
-            }
+        // 读旧事件 → f 修改 → replace_event 单 op 写回(PMCORE-19:
+        // remove+add 会往 undo 栈塞两个 op,一次按键占两步撤销)。
+        let old = self.doc.chart().judge_line_list.get(self.selected_line)
+            .and_then(|l| l.event_layers.get(self.selected_layer))
+            .and_then(|l| l.as_ref())
+            .and_then(|layer| {
+                let slot = match kind {
+                    EventKind::Alpha => &layer.alpha_events,
+                    EventKind::MoveX => &layer.move_x_events,
+                    EventKind::MoveY => &layer.move_y_events,
+                    EventKind::Rotate => &layer.rotate_events,
+                    EventKind::Speed => &layer.speed_events,
+                };
+                slot.as_ref().and_then(|l| l.get(entry.index)).cloned()
+            });
+        let Some(mut ev) = old else { return };
+        f(&mut ev);
+        if self.doc.replace_event(self.selected_line, self.selected_layer, kind, entry.index, ev).is_ok() {
+            self.rebuild_chart();
+            self.ui_dirty = true;
         }
     }
 
@@ -1099,16 +1118,34 @@ impl State {
         // lock (and a setting to toggle it) here.
         // if !self.focused { return; }
         
-        // Process note drag (before splash/chart frame to avoid chart borrow conflict)
+        // Note drag: 拖拽期间只更新预览(不碰 doc/undo 栈),松手时一次
+        // replace_note 提交。旧实现每帧 remove+add,一次拖拽刷几十个
+        // undo op(PMCORE-19)。
         if let Some((ni, beat, nx)) = self.overlay.drag_updated.take() {
-            if let Ok(old) = self.doc.remove_note(self.selected_line, ni) {
-                let mut nn = old;
+            // 拖拽开始:快照原 note(松手 replace 用)。
+            if self.drag_origin.is_none() {
+                self.drag_origin = self.doc.chart().judge_line_list.get(self.selected_line)
+                    .and_then(|l| l.notes.as_ref())
+                    .and_then(|n| n.get(ni))
+                    .cloned()
+                    .map(|n| (ni, n));
+            }
+            self.drag_preview = Some((ni, beat, nx));
+            // 面板预览:强制刷新 notes 缓存,绘制时覆盖拖拽位置。
+            self.cache_valid = false;
+        }
+        if self.overlay.drag_note.is_none() {
+            if let (Some((ni, mut nn)), Some((_, beat, nx))) = (self.drag_origin.take(), self.drag_preview.take()) {
                 nn.start_time = core::bpm::Triple::from_beats(beat.max(0.0));
                 nn.end_time = core::bpm::Triple::from_beats((beat + if nn.kind == 2 { 1.0 } else { 0.0 }).max(0.0));
                 nn.position_x = nx.clamp(-675.0, 675.0);
-                let _ = self.doc.add_note(self.selected_line, nn);
+                let _ = self.doc.replace_note(self.selected_line, ni, nn);
                 self.rebuild_chart();
                 self.ui_dirty = true;
+            } else {
+                // 拖拽结束但没移动(或异常):清残留。
+                self.drag_origin = None;
+                self.drag_preview = None;
             }
         }
         // Loading screen: 后台加载期间只画加载屏,不渲染谱面。
@@ -1262,6 +1299,15 @@ impl State {
                 all
             } else { extract_line_notes(&self.doc, self.selected_line) });
             self.cache_valid = true;
+        }
+        // Note 拖拽预览:覆盖被拖 note 的显示位置(不改 doc,松手才提交)。
+        if let Some((ni, beat, nx)) = self.drag_preview {
+            let notes = Arc::make_mut(&mut self.cached_notes);
+            if let Some(e) = notes.iter_mut().find(|e| e.index == ni) {
+                e.start_beats = beat.max(0.0);
+                if e.kind == 2 { e.end_beats = (beat + 1.0).max(0.0); }
+                e.x = nx.clamp(-675.0, 675.0);
+            }
         }
         let line_events = &self.cached_events;
         let line_notes = &self.cached_notes;
