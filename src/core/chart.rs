@@ -1398,6 +1398,61 @@ impl Chart {
         out
     }
 
+    /// 求线在 `time` 时刻的位姿 (position, rotation 弧度),含 parent 继承
+    /// (与 state_at 的 fetch_rot/fetch_pos 等价)。hit-fx 用:特效位置在
+    /// **触发瞬间 t0** 的线变换下计算,不绑定当前帧线状态——线之后移动/
+    /// 旋转时,已爆散的粒子留在原地。
+    ///
+    /// 幂等:只对事件轨道 set_time(无游标副作用),不会扰动 notes 可见性
+    /// 游标或 fired 状态,可安全插在任何 state_at 调用之间。
+    pub fn line_pose_at(&mut self, line_idx: usize, time: f64) -> ([f32; 2], f32) {
+        let mut rot_resolved = vec![0.0f32; self.lines.len()];
+        for i in 0..self.lines.len() {
+            let line = &mut self.lines[i];
+            line.move_x.set_time(time);
+            line.move_y.set_time(time);
+            line.rotation.set_time(time);
+        }
+        for i in 0..self.lines.len() {
+            let mut rot = self.lines[i].rotation.now().to_radians();
+            let mut cur = self.lines[i].parent;
+            let mut visited: Vec<usize> = Vec::new();
+            while let Some(pidx) = cur {
+                if pidx >= self.lines.len() || visited.contains(&pidx) || pidx == i {
+                    break;
+                }
+                visited.push(pidx);
+                if !self.lines[pidx].rot_with_parent {
+                    break;
+                }
+                rot += self.lines[pidx].rotation.now().to_radians();
+                cur = self.lines[pidx].parent;
+            }
+            rot_resolved[i] = rot;
+        }
+        // Position: root-first composition (same as state_at).
+        let mut acc = [self.lines[line_idx].move_x.now(), self.lines[line_idx].move_y.now()];
+        let mut cur = self.lines[line_idx].parent;
+        let mut stack: Vec<usize> = Vec::new();
+        let mut visited: Vec<usize> = Vec::new();
+        while let Some(pidx) = cur {
+            if pidx >= self.lines.len() || visited.contains(&pidx) || pidx == line_idx {
+                break;
+            }
+            visited.push(pidx);
+            stack.push(pidx);
+            cur = self.lines[pidx].parent;
+        }
+        for &pidx in stack.iter().rev() {
+            let pr = rot_resolved[pidx];
+            let (cos, sin) = (pr.cos(), pr.sin());
+            let (lx, ly) = (acc[0], acc[1]);
+            acc[0] = self.lines[pidx].move_x.now() + cos * lx - sin * ly;
+            acc[1] = self.lines[pidx].move_y.now() + sin * lx + cos * ly;
+        }
+        (acc, rot_resolved[line_idx])
+    }
+
     /// Total chart duration in seconds.
     pub fn duration(&self) -> f64 {
         self.duration
@@ -2139,5 +2194,52 @@ previewStart: 12
         expect_all.extend(expect_full);
         assert_eq!(fx.iter().map(|f| f.t0).collect::<Vec<_>>(), expect_all);
         assert!(fx.iter().all(|f| f.t0 != 1.5));
+    }
+
+    #[test]
+    fn line_pose_at_matches_state_at_and_tracks_time() {
+        // 线:0 拍在 (0,0),4 拍移到 (100,100)(120bpm → 0..2s);旋转同区间 0°→90°。
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [
+                        {
+                            "moveXEvents": [ { "start": 0.0, "end": 100.0, "startTime": [0, 0, 1], "endTime": [4, 0, 1], "easingType": 0 } ],
+                            "moveYEvents": [ { "start": 0.0, "end": 100.0, "startTime": [0, 0, 1], "endTime": [4, 0, 1], "easingType": 0 } ],
+                            "rotateEvents": [ { "start": 0.0, "end": 90.0, "startTime": [0, 0, 1], "endTime": [4, 0, 1], "easingType": 0 } ]
+                        },
+                        null
+                    ],
+                    "isCover": 0,
+                    "notes": []
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(&src, false).unwrap();
+        // line_pose_at 与 state_at 在同一时刻的位姿一致(±1e-3)。
+        for t in [0.0, 1.0, 2.0, 4.0] {
+            let (fpos, frot) = {
+                let frame = chart.state_at(t);
+                (frame.lines[0].position, frame.lines[0].rotation)
+            };
+            let (pos, rot) = chart.line_pose_at(0, t);
+            assert!((pos[0] - fpos[0]).abs() < 1e-3, "t={t} px");
+            assert!((pos[1] - fpos[1]).abs() < 1e-3, "t={t} py");
+            assert!((rot - frot).abs() < 1e-3, "t={t} rot");
+        }
+        // 时间不同位姿不同:移动线在 1s 与 3s 位置不应相同(moveX 值域 -1..1)。
+        let (p1, _) = chart.line_pose_at(0, 1.0);
+        let (p3, _) = chart.line_pose_at(0, 3.0);
+        assert!((p1[0] - p3[0]).abs() > 0.01, "线位姿应随时间移动: {p1:?} vs {p3:?}");
+        // 幂等:line_pose_at 不扰动 state_at 的结果。
+        let frame_a = chart.state_at(2.0);
+        let l_a = frame_a.lines[0].position;
+        let _ = chart.line_pose_at(0, 0.0);
+        let frame_b = chart.state_at(2.0);
+        let l_b = frame_b.lines[0].position;
+        assert_eq!(l_a, l_b);
     }
 }

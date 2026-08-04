@@ -124,21 +124,24 @@ impl ChartSession {
         // Hit FX: pure time function — query the trigger window BEFORE
         // state_at (which mutably borrows chart; the frame borrows it too).
         let triggers = chart.fx_in_window(chart_time - 0.5, chart_time);
+        // 预计算触发瞬间 t0 的线位姿:hit-fx 不绑定当前帧线状态。
+        let poses: Vec<([f32; 2], f32)> = triggers.iter()
+            .map(|tr| chart.line_pose_at(tr.line, tr.t0))
+            .collect();
         let frame = chart.state_at(chart_time);
         self.last_fired.clear();
         self.last_fired.extend(frame.fired.iter().map(|f| core::chart::FiredNote {
             line: f.line, kind: f.kind, x: f.x,
             fake: f.fake, tick: f.tick, hold_tail: f.hold_tail,
         }));
-        // Convert trigger points to canvas positions via line transforms.
+        // Convert trigger points to canvas positions via t0 line transforms.
         {
-            let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().map(|tr| {
-                let line = &frame.lines[tr.line];
-                let rot = line.rotation as f64;
+            let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().zip(poses.into_iter()).map(|(tr, (pos, rot))| {
+                let rot = rot as f64;
                 // tr.x 是相对线中心的单位(-1..1),与 fired.x 同语义。
                 let x = tr.x as f64;
-                let cx = (line.position[0] as f64 + rot.cos() * x) * 675.0;
-                let cy = (line.position[1] as f64 + rot.sin() * x * self.engine.playfield_aspect() as f64) * 450.0;
+                let cx = (pos[0] as f64 + rot.cos() * x) * 675.0;
+                let cy = (pos[1] as f64 + rot.sin() * x * self.engine.playfield_aspect() as f64) * 450.0;
                 (tr.t0, [cx as f32, cy as f32])
             }).collect();
             self.engine.set_frame_fx(fx);

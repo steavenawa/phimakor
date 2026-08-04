@@ -1273,6 +1273,11 @@ impl State {
         }
         // fx 触发点查询必须在 state_at 之前(chart 可变借用冲突)。
         let fx_triggers = self.chart.fx_in_window(chart_time - 0.5, chart_time);
+        // 预计算每个触发点在 **t0 时刻** 的线位姿:hit-fx 不绑定当前帧线状态,
+        // 线之后移动/旋转时已爆散的粒子留在触发瞬间的位置。
+        let fx_poses: Vec<([f32; 2], f32)> = fx_triggers.iter()
+            .map(|tr| self.chart.line_pose_at(tr.line, tr.t0))
+            .collect();
         let frame = self.chart.state_at(chart_time);
 
         for fired in &frame.fired {
@@ -1556,17 +1561,17 @@ impl State {
         });
         self.renderer.set_progress(audio_time as f32 / duration as f32);
         // 命中特效:纯时间函数——查询当前谱面时间窗口内的触发点,
-        // 前进/倒退/跳转都按 chart_time 渲染对应帧。
+        // 前进/倒退/跳转都按 chart_time 渲染对应帧。位置用触发瞬间 t0
+        // 的线位姿(已预计算),不绑定当前帧线状态。
         {
-            let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().map(|tr| {
-                let line = &frame.lines[tr.line];
-                let rot = line.rotation as f64;
+            let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().zip(fx_poses).map(|(tr, (pos, rot))| {
+                let rot = rot as f64;
                 // tr.x 是相对线中心的单位(-1..1),与 fired.x 同语义:
                 // cx = (线位置 + 旋转后的相对偏移) × 675 画布 px;
                 // y 方向旋转投影乘 pf_aspect(与原 fired 循环一致)。
                 let x = tr.x as f64;
-                let cx = (line.position[0] as f64 + rot.cos() * x) * 675.0;
-                let cy = (line.position[1] as f64 + rot.sin() * x * self.renderer.playfield_aspect() as f64) * 450.0;
+                let cx = (pos[0] as f64 + rot.cos() * x) * 675.0;
+                let cy = (pos[1] as f64 + rot.sin() * x * self.renderer.playfield_aspect() as f64) * 450.0;
                 (tr.t0, [cx as f32, cy as f32])
             }).collect();
             self.renderer.set_frame_fx(fx);
