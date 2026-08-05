@@ -1262,6 +1262,9 @@ impl State {
         // to see where the CPU budget goes while playing.
         static PERF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let perf = *PERF.get_or_init(|| std::env::var("PHIMAKOR_PERF").is_ok());
+        // 尖峰捕获阈值(ms):PHIMAKOR_PERF=1 + PHIMAKOR_SPIKE=30 时,
+        // 整帧超过 30ms 立即打印分项(默认 25ms)。
+        static SPIKE_MS: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
         let t_eval = std::time::Instant::now();
         // BPM 面板(tool 4):每帧重建表单(在 frame 借用之前,避开借用冲突)。
         if self.show_overlay && self.show_properties && self.overlay.selected_tool == 4 {
@@ -1581,7 +1584,7 @@ impl State {
                 let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
                 self.renderer.draw_to_view(&view, frame, aspect, dim, ui_bg, ui_iced);
                 self.renderer.queue().present(st);
-                self.frame_latency = self.frame_latency * 0.9 + Instant::now().elapsed().as_secs_f64() * 0.1;
+                self.frame_latency = self.frame_latency * 0.9 + t_eval.elapsed().as_secs_f64() * 0.1;
             }
             _ => {}
         }
@@ -1598,6 +1601,23 @@ impl State {
             let mut acc = PERF_ACC.lock().unwrap();
             for i in 0..4 { acc.0[i] += ms[i]; }
             acc.1 += 1;
+            // 尖峰捕获:整帧超过阈值(默认 25ms,PHIMAKOR_SPIKE 覆盖)时
+            // 立即打印该帧分项 + 上下文——平均会被 60 帧平滑抹掉,尖峰
+            // 只在这里可见。
+            let total = ms[0] + ms[1] + ms[2] + ms[3];
+            let spike_ms = SPIKE_MS.get_or_init(|| {
+                std::env::var("PHIMAKOR_SPIKE").ok()
+                    .and_then(|v| v.parse::<f64>().ok()).unwrap_or(25.0)
+            });
+            if total > *spike_ms {
+                eprintln!(
+                    "SPIKE {:.1}ms: eval {:.2} | panel {:.2} | post {:.2} | draw {:.2} | fps {:.0} | playing={} overlay={} ui_dirty={} tl={}",
+                    total, ms[0], ms[1], ms[2], ms[3], self.fps,
+                    self.audio.as_ref().is_some_and(|a| !a.is_paused()),
+                    self.show_overlay, self.ui_dirty,
+                    self.show_events || self.show_notes,
+                );
+            }
             if acc.1 >= 60 {
                 let avg = |i: usize| acc.0[i] / acc.1 as f64;
                 eprintln!("perf: eval {:.2}ms | panel {:.2}ms | post {:.2}ms | draw {:.2}ms | fps {:.0}",
