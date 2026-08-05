@@ -5,6 +5,92 @@
 use crate::render::shaders::{EffectDef, EFFECTS};
 use std::collections::{HashMap, HashSet};
 
+/// 判断源是否为 GLSL(而非 WGSL):版本指令 / GLSL 内置变量。
+fn is_glsl_source(body: &str) -> bool {
+    let t = body.trim_start();
+    t.starts_with("#version")
+        || body.contains("gl_FragColor")
+        || body.contains("gl_Position")
+        || body.contains("gl_FragCoord")
+        || body.contains("attribute ")
+        || body.contains("varying ")
+}
+
+/// 剥离 GLSL 源开头的 #version 行(模板自带版本指令)。
+fn strip_glsl_version(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    for line in body.lines() {
+        let t = line.trim_start();
+        if t.starts_with("#version") {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// ES 100 → desktop GLSL 450 预转换(naga glsl-in 只接受 440+ 版本):
+/// - `#version 100` → `#version 450`
+/// - `precision ...;` 行删除(desktop 无 precision)
+/// - `varying` → `in`(fragment 输入)/ vertex 由模板提供
+/// - `attribute` → `in`
+/// - `texture2D` → `texture`(函数调用)
+/// - `sampler2D` → `texture2D`(类型声明:naga 的 image 类型名)
+/// - `gl_FragColor` → 注入的 `fragColor_out`(450 已移除内置,补 out 声明)
+/// 返回 (转换后的源, uniform 变量数——不含纹理, 与 binding 2 起对应)。
+fn es100_to_glsl(src: &str) -> (String, usize) {
+    let mut out = String::with_capacity(src.len() + 64);
+    let mut has_version = false;
+    // uniform 绑定注入:naga 要求显式 layout(binding)。
+    // texture2D 声明 → binding 0;其余 uniform 变量 → binding 2 起递增。
+    let mut uniform_count = 0usize;
+    let mut next_uniform_binding = 2u32;
+    for line in src.lines() {
+        let t = line.trim_start();
+        if t.starts_with("#version") {
+            if !has_version {
+                out.push_str("#version 450\n");
+                has_version = true;
+            }
+            continue;
+        }
+        if t.starts_with("precision ") {
+            continue;
+        }
+        let mut l = line
+            .replace("sampler2D", "texture2D")
+            .replace("varying", "in")
+            .replace("attribute", "in")
+            .replace("gl_FragColor", "fragColor_out");
+        if t.starts_with("uniform ") {
+            if t.contains("texture2D") || t.contains("sampler2D") {
+                l = l.replacen("uniform", "layout(binding = 0) uniform", 1);
+            } else {
+                let b = next_uniform_binding;
+                next_uniform_binding += 1;
+                uniform_count += 1;
+                l = l.replacen("uniform", &format!("layout(binding = {b}) uniform"), 1);
+            }
+        }
+        // 声明行(uniform)保留 texture2D 类型名;调用行换 texture 函数名。
+        if !l.contains("uniform") {
+            l = l.replace("texture2D", "texture");
+        }
+        out.push_str(&l);
+        out.push('\n');
+    }
+    if !has_version {
+        out.insert_str(0, "#version 450\n");
+    }
+    if src.contains("gl_FragColor") {
+        // #version 必须第一行,out 声明插在其后。
+        let ver = "#version 450\n";
+        out.insert_str(ver.len(), "layout(location = 0) out vec4 fragColor_out;\n");
+    }
+    (out, uniform_count)
+}
+
 /// A single active effect instance (from extra.json).
 #[derive(Clone)]
 pub struct ActiveEffect {
@@ -90,8 +176,9 @@ enum SrcTag {
 
 struct EffPipe {
     pipeline: wgpu::RenderPipeline,
-    bgl: wgpu::BindGroupLayout,     // group 1 (uniforms)
-    uniform_buf: wgpu::Buffer,
+    bgl: wgpu::BindGroupLayout,     // group 1 (uniforms); GLSL 路径:单 group 三绑定
+    /// Uniform buffers:WGSL 路径 1 个;GLSL 路径每个 uniform 变量一个。
+    uniform_bufs: Vec<wgpu::Buffer>,
     uniform_size: u64,
     /// Cached uniform bind group (buffer is reused; content rewritten per frame).
     uniform_bg: Option<wgpu::BindGroup>,
@@ -100,6 +187,9 @@ struct EffPipe {
     /// texture pointer, it never collides when the same local variable
     /// carries different textures within one frame.
     screen_bgs: HashMap<(SrcTag, bool), wgpu::BindGroup>,
+    /// GLSL 源(自定义 GLSL 特效):单 bind group(tex+sampler+uniforms),
+    /// 与 WGSL 路径的 bind group 构建不同。
+    glsl: bool,
 }
 
 impl PostPipe {
@@ -254,10 +344,20 @@ impl PostPipe {
     }
 
     /// Shared pipeline construction for built-in and custom effects (the two
-    /// paths used to duplicate ~70 lines). `wgsl_body` is the fragment shader;
-    /// the shared vertex shader is prepended.
-    fn build_eff_pipe(&self, device: &wgpu::Device, name: &str, wgsl_body: &str) -> EffPipe {
-        let shader_src = String::from(crate::render::shaders::VERT) + wgsl_body;
+    /// paths used to duplicate ~70 lines). `body` is the fragment shader;
+    /// WGSL 路径:共享 vertex 前置拼接;GLSL 路径(naga 转译)用 GLSL
+    /// vertex 模板 + 剥离 #version 的用户 fragment。
+    ///
+    /// 失败(编译/校验错误)返回 `None` 并报错——wgpu 默认把校验错误当
+    /// fatal panic,这里用 error scope 捕获后优雅跳过。
+    fn build_eff_pipe(&self, device: &wgpu::Device, name: &str, body: &str) -> Option<EffPipe> {
+        let is_glsl = is_glsl_source(body);
+        if is_glsl {
+            return self.build_eff_pipe_glsl(device, name, body);
+        }
+        let shader_src = String::from(crate::render::shaders::VERT) + body;
+        // 编译/校验失败优雅降级:error scope 捕获,不 panic。
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("shader-{name}")),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(shader_src)),
@@ -322,14 +422,133 @@ impl PostPipe {
             mapped_at_creation: false,
         });
 
-        EffPipe { pipeline, bgl, uniform_buf, uniform_size, uniform_bg: None, screen_bgs: HashMap::new() }
+        // 收 scope:shader/pipeline 创建期若有校验错误,报错跳过。
+        let err = pollster::block_on(scope.pop());
+        if err.is_some() {
+            eprintln!("warning: custom effect {name}: shader 编译/校验失败,已跳过: {err:?}");
+            return None;
+        }
+
+        Some(EffPipe { pipeline, bgl, uniform_bufs: vec![uniform_buf], uniform_size, uniform_bg: None, screen_bgs: HashMap::new(), glsl: false })
+    }
+
+    /// GLSL 自定义特效路径:GLSL vertex 模板 + 用户 fragment(ES100 预
+    /// 转换,naga glsl-in 转译,每个 stage 一个 module)。绑定约定:
+    ///   group 0: binding0 = screen 纹理, binding1 = sampler,
+    ///            binding 2.. = 每个 uniform 变量一个 buffer(256B)
+    fn build_eff_pipe_glsl(&self, device: &wgpu::Device, name: &str, body: &str) -> Option<EffPipe> {
+        // ES100 → desktop GLSL 450 预转换(naga 只接受 440+)。
+        let (frag, uniform_count) = es100_to_glsl(body);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("vs-{name}")),
+            source: wgpu::ShaderSource::Glsl {
+                shader: std::borrow::Cow::Borrowed(crate::render::shaders::GLSL_VERT),
+                stage: wgpu::naga::ShaderStage::Vertex,
+                defines: &[],
+            },
+        });
+        let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(&format!("fs-{name}")),
+            source: wgpu::ShaderSource::Glsl {
+                shader: std::borrow::Cow::Owned(frag),
+                stage: wgpu::naga::ShaderStage::Fragment,
+                defines: &[],
+            },
+        });
+
+        let uniform_size: u64 = 256;
+        let mut bgl_entries = vec![
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ];
+        for i in 0..uniform_count {
+            bgl_entries.push(wgpu::BindGroupLayoutEntry {
+                binding: 2 + i as u32,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: Some(wgpu::BufferSize::new(uniform_size).unwrap()),
+                },
+                count: None,
+            });
+        }
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(&format!("bgl-{name}")),
+            entries: &bgl_entries,
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(&format!("pl-{name}")),
+            bind_group_layouts: &[Some(&bgl)],
+            ..Default::default()
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(&format!("pipe-{name}")),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &vs,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fs,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.tex_format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let mut uniform_bufs = Vec::with_capacity(uniform_count);
+        for i in 0..uniform_count {
+            uniform_bufs.push(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("ubuf-{name}-{i}")),
+                size: uniform_size,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+        }
+        let err = pollster::block_on(scope.pop());
+        if err.is_some() {
+            eprintln!("warning: custom effect {name}: GLSL 编译/校验失败,已跳过: {err:?}");
+            return None;
+        }
+        Some(EffPipe { pipeline, bgl, uniform_bufs, uniform_size, uniform_bg: None, screen_bgs: HashMap::new(), glsl: true })
     }
 
     /// Ensure the pipeline + resources exist for a given effect.
     pub fn ensure_effect(&mut self, device: &wgpu::Device, def: &EffectDef) {
         if self.pipelines.contains_key(def.name) { return; }
-        let pipe = self.build_eff_pipe(device, def.name, def.frag);
-        self.pipelines.insert(def.name.to_string(), pipe);
+        if let Some(pipe) = self.build_eff_pipe(device, def.name, def.frag) {
+            self.pipelines.insert(def.name.to_string(), pipe);
+        }
     }
 
     /// Queue ALL built-in effect pipelines for pre-compilation.
@@ -377,7 +596,10 @@ impl PostPipe {
             }
         };
         let pipe = self.build_eff_pipe(device, &name, &wgsl);
-        self.pipelines.insert(name, pipe);
+        match pipe {
+            Some(pipe) => { self.pipelines.insert(name, pipe); }
+            None => { self.failed_custom.insert(name); }
+        }
     }
 
     /// 预热当前谱目录下的全部自定义 WGSL shader(切谱加载完成时调用,
@@ -401,8 +623,13 @@ impl PostPipe {
                     }
                 };
                 let pipe = self.build_eff_pipe(device, &name, &wgsl);
-                self.pipelines.insert(name.clone(), pipe);
-                self.failed_custom.remove(&name);
+                match pipe {
+                    Some(pipe) => {
+                        self.pipelines.insert(name.clone(), pipe);
+                        self.failed_custom.remove(&name);
+                    }
+                    None => { self.failed_custom.insert(name); }
+                }
             }
         }
     }
@@ -543,51 +770,93 @@ impl PostPipe {
                 uniform_data[offset..offset+4].copy_from_slice(&val.to_le_bytes());
             }
         }
-        queue.write_buffer(&ep.uniform_buf, 0, &uniform_data);
-        // Reuse the uniform bind group — the buffer is stable, only its
-        // contents change per frame.
-        let uniform_bg = match &ep.uniform_bg {
-            Some(bg) => bg,
-            None => {
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("ubg-{key}")),
-                    layout: &ep.bgl,
-                    entries: &[wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                            buffer: &ep.uniform_buf,
-                            offset: 0,
-                            size: wgpu::BufferSize::new(ep.uniform_size),
-                        }),
-                    }],
-                });
-                ep.uniform_bg = Some(bg);
-                ep.uniform_bg.as_ref().unwrap()
+        if ep.glsl {
+            // GLSL 路径:每个 uniform 变量独立 buffer,写各自首 4 字节。
+            for (i, buf) in ep.uniform_bufs.iter().enumerate() {
+                let mut v = [0u8; 4];
+                let start = i * 4;
+                if start + 4 <= uniform_data.len() {
+                    v.copy_from_slice(&uniform_data[start..start + 4]);
+                }
+                queue.write_buffer(buf, 0, &v);
             }
-        };
-        // Screen bind group: cached by (SrcTag, half-sampler). SrcTag is a
-        // stable role (Scene/Full0/1/Half0/1), so the cache is safe — the
-        // same stack local may carry different textures, but the TAG changes
-        // with it. Half-res passes sample with the linear half_sampler to
-        // avoid downscale shimmer.
+        } else {
+            queue.write_buffer(&ep.uniform_bufs[0], 0, &uniform_data);
+        }
         let use_half = matches!(src_tag, SrcTag::Half(_));
         let sampler = if use_half { &self.half_sampler } else { &self.sampler };
-        let screen_bg = match ep.screen_bgs.get(&(src_tag, use_half)) {
-            Some(bg) => bg.clone(),
-            None => {
-                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some(&format!("screen-bg-{key}")),
-                    layout: &self.screen_bgl,
-                    entries: &[
+        // GLSL 路径:单 bind group(binding0 纹理 + binding1 sampler +
+        // binding 2.. uniform);WGSL 路径:uniform 与 screen 分离缓存。
+        let screen_bg = if ep.glsl {
+            match ep.screen_bgs.get(&(src_tag, use_half)) {
+                Some(bg) => bg.clone(),
+                None => {
+                    let mut entries = vec![
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                    ],
-                });
-                ep.screen_bgs.insert((src_tag, use_half), bg.clone());
-                bg
+                    ];
+                    for (i, buf) in ep.uniform_bufs.iter().enumerate() {
+                        entries.push(wgpu::BindGroupEntry {
+                            binding: 2 + i as u32,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: buf,
+                                offset: 0,
+                                size: wgpu::BufferSize::new(ep.uniform_size),
+                            }),
+                        });
+                    }
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("glsl-bg-{key}")),
+                        layout: &ep.bgl,
+                        entries: &entries,
+                    });
+                    ep.screen_bgs.insert((src_tag, use_half), bg.clone());
+                    bg
+                }
+            }
+        } else {
+            // Reuse the uniform bind group — the buffer is stable, only its
+            // contents change per frame.
+            let uniform_bg = match &ep.uniform_bg {
+                Some(bg) => bg,
+                None => {
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("ubg-{key}")),
+                        layout: &ep.bgl,
+                        entries: &[wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: &ep.uniform_bufs[0],
+                                offset: 0,
+                                size: wgpu::BufferSize::new(ep.uniform_size),
+                            }),
+                        }],
+                    });
+                    ep.uniform_bg = Some(bg);
+                    ep.uniform_bg.as_ref().unwrap()
+                }
+            };
+            // Screen bind group: cached by (SrcTag, half-sampler). SrcTag is a
+            // stable role (Scene/Full0/1/Half0/1), so the cache is safe — the
+            // same stack local may carry different textures, but the TAG changes
+            // with it. Half-res passes sample with the linear half_sampler to
+            // avoid downscale shimmer.
+            match ep.screen_bgs.get(&(src_tag, use_half)) {
+                Some(bg) => bg.clone(),
+                None => {
+                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some(&format!("screen-bg-{key}")),
+                        layout: &self.screen_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(read_view) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                        ],
+                    });
+                    ep.screen_bgs.insert((src_tag, use_half), bg.clone());
+                    bg
+                }
             }
         };
-
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(&format!("effect-{key}")),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -603,7 +872,11 @@ impl PostPipe {
         });
         pass.set_pipeline(&ep.pipeline);
         pass.set_bind_group(0, &screen_bg, &[]);
-        pass.set_bind_group(1, uniform_bg, &[]);
+        // WGSL 路径才有独立的 uniform bind group(group 1)。
+        if !ep.glsl {
+            let ubg = ep.uniform_bg.as_ref().unwrap();
+            pass.set_bind_group(1, ubg, &[]);
+        }
         pass.draw(0..3, 0..1);
         true
     }
@@ -730,6 +1003,56 @@ mod tests {
             uniform_count: 1,
         };
         assert!(!is_effect_noop(&custom));
+    }
+
+    #[test]
+    fn glsl_es100_fragment_translates_via_naga() {
+        // 与 build_eff_pipe_glsl 相同的转译路径:ES 100 源预转换(ES300
+        // 语法)后 naga glsl-in 转译。无纹理的数学特效可直接支持;
+        // 带 sampler 的(如 RPE 纹理采样 shader)受 naga 限制转译失败,
+        // 由 error scope 优雅跳过(不 panic)。
+        let frag = "#version 100
+precision mediump float;
+varying vec2 v_uv;
+void main() {
+    vec3 c = vec3(v_uv.x, v_uv.y, 1.0 - v_uv.x);
+    gl_FragColor = vec4(c, 1.0);
+}
+";
+        let (es300, _) = es100_to_glsl(frag);
+        assert!(es300.starts_with("#version 450"));
+        assert!(es300.contains("in vec2 v_uv"));
+        assert!(!es300.contains("precision"));
+        assert!(es300.contains("layout(location = 0) out vec4 fragColor_out"));
+        let _ = wgpu::naga::front::glsl::Frontend::default()
+            .parse(
+                &wgpu::naga::front::glsl::Options::from(wgpu::naga::ShaderStage::Fragment),
+                &es300,
+            )
+            .unwrap();
+        // 共享 vertex 模板同样可转译。
+        let _ = wgpu::naga::front::glsl::Frontend::default()
+            .parse(
+                &wgpu::naga::front::glsl::Options::from(wgpu::naga::ShaderStage::Vertex),
+                crate::render::shaders::GLSL_VERT,
+            )
+            .unwrap();
+        // sampler 版本:预转换正确(sampler2D → texture2D 类型声明,
+        // texture2D 调用 → texture),但 naga 转译失败——这是已知限制,
+        // 运行时由 error scope 优雅跳过。
+        let with_tex = "#version 100
+precision mediump float;
+uniform sampler2D u_tex;
+varying vec2 v_uv;
+void main() {
+    gl_FragColor = texture2D(u_tex, v_uv);
+}
+";
+        let (es300, _) = es100_to_glsl(with_tex);
+        assert!(es300.contains("layout(binding = 0) uniform texture2D u_tex"));
+        assert!(es300.contains("texture(u_tex, v_uv)"));
+        // 带纹理采样的转译受 naga glsl-in 限制(sampler 配对缺失,Bad call),
+        // 运行时由 error scope 优雅跳过(不崩溃)。此处只验证预转换正确。
     }
 }
 

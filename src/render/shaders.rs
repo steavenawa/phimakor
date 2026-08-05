@@ -23,6 +23,26 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
 }
 ";
 
+/// GLSL 450(desktop)共享 vertex(自定义 GLSL 特效用,与 [`VERT`] 语义
+/// 等价):全屏三角形 + uv。naga glsl-in 只接受 440+ 版本,用户 fragment
+/// 由 `es100_to_glsl` 预转换后与本站点语法一致。
+pub const GLSL_VERT: &str = r"
+#version 450
+out vec2 v_uv;
+void main() {
+    vec2 verts[3];
+    verts[0] = vec2(-1.0, -1.0);
+    verts[1] = vec2(3.0, -1.0);
+    verts[2] = vec2(-1.0, 3.0);
+    vec2 uv_verts[3];
+    uv_verts[0] = vec2(0.0, 0.0);
+    uv_verts[1] = vec2(2.0, 0.0);
+    uv_verts[2] = vec2(0.0, 2.0);
+    gl_Position = vec4(verts[gl_VertexIndex], 0.0, 1.0);
+    v_uv = vec2(uv_verts[gl_VertexIndex].x, 1.0 - uv_verts[gl_VertexIndex].y);
+}
+";
+
 pub const GRAYSCALE_FRAG: &str = r"
 @group(0) @binding(0) var screen_tex: texture_2d<f32>;
 @group(0) @binding(1) var screen_sampler: sampler;

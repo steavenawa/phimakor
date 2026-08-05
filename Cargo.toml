@@ -18,7 +18,7 @@ serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 serde_yaml = "0.9"
 winit = "*"
-wgpu = "30"
+wgpu = { version = "30", features = ["glsl"] }
 wgpu-core = "30"
 pollster = "*"
 rodio = "*"
