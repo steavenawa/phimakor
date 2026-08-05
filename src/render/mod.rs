@@ -1505,8 +1505,8 @@ impl Renderer {
             if !hud.difficulty.is_empty() {
                 el("level", hud.difficulty.as_str(), TextAnchor::BottomRight);
             }
-            // 帧时间叠层(右上角,编辑器视口隐藏时也显示):
-            // 避开 pause 按钮(右上有按钮,往下挪)。
+            // 帧时间叠层(窗口右上角,编辑器视口隐藏时也显示;
+            // viewport 边缘锚定,与 timeline 层的 fps 同位置语义)。
             if hud.frame_ms > 0.0 {
                 let txt = format!("frame {:.1}ms / {:.0}fps", hud.frame_ms, hud.fps);
                 let col = if hud.frame_ms > 50.0 { [1.0, 0.35, 0.35, 1.0] }
@@ -1514,7 +1514,7 @@ impl Renderer {
                     else { [0.63, 0.9, 0.78, 1.0] };
                 text::draw_text_queued(
                     &mut self.text, &self.device, &self.queue, &self.tex_bgl, &self.sampler,
-                    aspect, &txt, TextAnchor::TopRight, [0.0, 56.0], 0.0, 1.0, col,
+                    aspect, &txt, TextAnchor::TopRightEdge, [0.0, 0.0], 0.0, 1.0, col,
                 );
             }
 

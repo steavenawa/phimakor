@@ -24,6 +24,8 @@ pub enum TextAnchor {
     BottomRight,
     /// Right edge 655, top 8 px, 36 px (score).
     TopRight,
+    /// Hug the VIEWPORT top-right (window px space, not canvas), 36 px.
+    TopRightEdge,
     /// Hug the VIEWPORT bottom-left (window px space, not canvas), 30 px.
     BottomLeftEdge,
     /// Hug the VIEWPORT bottom-right (window px space, not canvas), 30 px.
@@ -59,6 +61,7 @@ impl TextAnchor {
             Self::BottomRight => (30.0, HAlign::Right(655.0), bottom + 6.0),
             Self::TopRight => (36.0, HAlign::Right(655.0), top - 8.0 - 36.0),
             // Viewport edges: y resolved in push_text from the window size.
+            Self::TopRightEdge => (36.0, HAlign::Right(655.0), top - 8.0 - 36.0),
             Self::BottomLeftEdge => (30.0, HAlign::Left(-655.0), bottom),
             Self::BottomRightEdge => (30.0, HAlign::Right(655.0), bottom),
             // Directly below TopCenter on screen (+y = up): 6 px gap, 26 px.
@@ -68,7 +71,7 @@ impl TextAnchor {
     }
 
     fn is_viewport_edge(self) -> bool {
-        matches!(self, Self::BottomLeftEdge | Self::BottomRightEdge)
+        matches!(self, Self::BottomLeftEdge | Self::BottomRightEdge | Self::TopRightEdge)
     }
 }
 
@@ -557,7 +560,11 @@ pub(crate) fn push_text<'a>(
                 TextAnchor::BottomLeftEdge => -1.0 + (MARGIN + sx * 0.5) * 2.0 / window[0],
                 _ => 1.0 - (MARGIN + sx * 0.5) * 2.0 / window[0],
             };
-            let cy = -1.0 + (MARGIN + sy * 0.5) * 2.0 / window[1];
+            // TopRightEdge 贴窗口顶部,其余边缘锚定贴底部。
+            let cy = match pt.anchor {
+                TextAnchor::TopRightEdge => 1.0 - (MARGIN + sy * 0.5) * 2.0 / window[1],
+                _ => -1.0 + (MARGIN + sy * 0.5) * 2.0 / window[1],
+            };
             mat_mul(&mat_translate(cx, cy), &mat_scale(sx, sy))
         } else {
             mat_mul(
