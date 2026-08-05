@@ -853,6 +853,13 @@ impl Renderer {
         let _ = self.post.tick_warmup(&self.device, 4096);
     }
 
+    /// 预热当前谱目录的全部自定义 WGSL shader(切谱加载完成后调用)。
+    /// 自定义特效首次激活时的同步编译(磁盘 I/O + pipeline 编译 tens of
+    /// ms)是运行时尖峰源——编译挪到切谱瞬间一次性完成。
+    pub fn warmup_custom_effects(&mut self) {
+        self.post.warmup_custom(&self.device);
+    }
+
     /// Enable or disable V-sync (reconfigures the surface present mode).
     ///
     /// With V-sync off, prefer `Mailbox` when the surface supports it — it

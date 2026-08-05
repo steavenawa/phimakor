@@ -3,7 +3,7 @@
 //! After all effects, the final result is composited into the scene.
 
 use crate::render::shaders::{EffectDef, EFFECTS};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A single active effect instance (from extra.json).
 #[derive(Clone)]
@@ -64,6 +64,9 @@ pub struct PostPipe {
     /// 预热队列:启动/切谱时预编译内置特效 pipeline,消除"特效首次出现
     /// 时编译卡顿"(ensure_effect 是惰性的,第一次用某个特效会卡一帧)。
     warmup_pending: Vec<String>,
+    /// 自定义 shader 加载失败的缓存:失败不重试(否则每帧读磁盘 + 刷屏)。
+    /// `warmup_custom` 重新扫描时会覆盖(文件修复后可恢复)。
+    failed_custom: HashSet<String>,
 
     /// Viewport width in pixels.
     pub width: u32,
@@ -204,6 +207,7 @@ impl PostPipe {
             active: Vec::new(),
             half_res_enabled: true,
             warmup_pending: Vec::new(),
+            failed_custom: HashSet::new(),
             width: 0, height: 0, tex_format: tex_fmt,
         };
         pipe.resize(device, width, height);
@@ -353,19 +357,51 @@ impl PostPipe {
 
     /// Load and compile a custom WGSL shader from the chart directory.
     /// Failures are reported (stderr) instead of silently dropping the effect.
+    /// Failed names are cached: retried only by a later `warmup_custom` scan
+    /// (otherwise every frame re-reads the disk and re-prints the warning).
     fn ensure_custom_effect(&mut self, device: &wgpu::Device, name: String) {
-        if self.pipelines.contains_key(&name) { return; }
+        if self.pipelines.contains_key(&name) || self.failed_custom.contains(&name) {
+            return;
+        }
         let Some(ref chart_dir) = self.chart_dir else { return };
         let path = chart_dir.join(&name);
         let wgsl = match std::fs::read_to_string(&path) {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("warning: custom effect {name}: cannot read {}: {e}", path.display());
+                self.failed_custom.insert(name);
                 return;
             }
         };
         let pipe = self.build_eff_pipe(device, &name, &wgsl);
         self.pipelines.insert(name, pipe);
+    }
+
+    /// 预热当前谱目录下的全部自定义 WGSL shader(切谱加载完成时调用,
+    /// 一次性编译——运行中首次使用某个自定义特效不再阻塞卡帧)。
+    pub fn warmup_custom(&mut self, device: &wgpu::Device) {
+        let Some(ref chart_dir) = self.chart_dir else { return };
+        let Ok(entries) = std::fs::read_dir(chart_dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().is_some_and(|e| e == "wgsl") {
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                if self.pipelines.contains_key(&name) {
+                    continue;
+                }
+                let wgsl = match std::fs::read_to_string(&p) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        eprintln!("warning: custom effect {name}: cannot read {}: {e}", p.display());
+                        self.failed_custom.insert(name);
+                        continue;
+                    }
+                };
+                let pipe = self.build_eff_pipe(device, &name, &wgsl);
+                self.pipelines.insert(name.clone(), pipe);
+                self.failed_custom.remove(&name);
+            }
+        }
     }
 
     /// Run all active effects. Reads from `src`, applies each in order.

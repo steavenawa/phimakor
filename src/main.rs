@@ -785,6 +785,9 @@ impl State {
         self.renderer.set_line_length(info.line_length);
         let chart = core::chart::Chart::from_rpe_chart(doc.chart(), info.use_rpe_170_speed == Some(true))?;
         self.renderer.post.chart_dir = Some(self.chart_dir.clone());
+        // 自定义特效预热:谱目录 *.wgsl 全部预编译——运行中首次激活某个
+        // 自定义特效会同步读盘+编译(tens of ms),挪到切谱瞬间一次完成。
+        self.renderer.warmup_custom_effects();
         for (k, img) in &textures {
             self.renderer.load_texture_rgba(k, &img.rgba, img.w, img.h);
         }
