@@ -1554,6 +1554,7 @@ impl State {
         let t_post = std::time::Instant::now();
 
         // Phigros-style HUD: hidden while editor panels cover the screen.
+        // 帧时间叠层常驻 HUD(视口隐藏时仍显示)。
         self.renderer.set_hud(render::HudData {
             chart_name: self.info.name.clone(),
             difficulty: self.info.level.clone(),
@@ -1561,6 +1562,8 @@ impl State {
             combo: self.combo,
             paused: self.audio.as_ref().is_some_and(|a| a.is_paused()),
             visible: !self.show_overlay,
+            frame_ms: (self.frame_latency * 1000.0) as f32,
+            fps: self.fps as f32,
         });
         self.renderer.set_progress(audio_time as f32 / duration as f32);
         // 命中特效:纯时间函数——查询当前谱面时间窗口内的触发点,

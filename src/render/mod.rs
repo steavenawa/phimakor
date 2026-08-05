@@ -398,6 +398,10 @@ pub struct HudData {
     pub paused: bool,
     /// Whether the HUD is visible at all (false = editor panels hide it).
     pub visible: bool,
+    /// 帧时间叠层(ms):编辑器视口隐藏时 HUD 仍显示,帧时间不能跟着
+    /// 编辑器 timeline 层消失——画在 HUD 右上角。
+    pub frame_ms: f32,
+    pub fps: f32,
 }
 
 pub struct Renderer {
@@ -1493,6 +1497,18 @@ impl Renderer {
             // Difficulty (bottom-right)
             if !hud.difficulty.is_empty() {
                 el("level", hud.difficulty.as_str(), TextAnchor::BottomRight);
+            }
+            // 帧时间叠层(右上角,编辑器视口隐藏时也显示):
+            // 避开 pause 按钮(右上有按钮,往下挪)。
+            if hud.frame_ms > 0.0 {
+                let txt = format!("frame {:.1}ms / {:.0}fps", hud.frame_ms, hud.fps);
+                let col = if hud.frame_ms > 50.0 { [1.0, 0.35, 0.35, 1.0] }
+                    else if hud.frame_ms > 25.0 { [1.0, 0.82, 0.35, 1.0] }
+                    else { [0.63, 0.9, 0.78, 1.0] };
+                text::draw_text_queued(
+                    &mut self.text, &self.device, &self.queue, &self.tex_bgl, &self.sampler,
+                    aspect, &txt, TextAnchor::TopRight, [0.0, 56.0], 0.0, 1.0, col,
+                );
             }
 
             // Pause button (top-right of the playfield box): circular
