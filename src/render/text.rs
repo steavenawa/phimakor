@@ -554,8 +554,10 @@ pub(crate) fn push_text<'a>(
         let sx = pt.entry.size[0] * pt.scale;
         let sy = pt.entry.size[1] * pt.scale;
         let model = if pt.viewport_edge {
-            let sx = sx * 2.0 / window[0];
-            let sy = sy * 2.0 / window[1];
+            // 边距定位用 px(修前语义),quad 尺寸用 NDC(px→NDC 换算,
+            // 否则像素数被当全屏宽倍数)。
+            let sx_ndc = sx * 2.0 / window[0];
+            let sy_ndc = sy * 2.0 / window[1];
             let cx = match pt.anchor {
                 TextAnchor::BottomLeftEdge => -1.0 + (MARGIN + sx * 0.5) * 2.0 / window[0],
                 _ => 1.0 - (MARGIN + sx * 0.5) * 2.0 / window[0],
@@ -565,11 +567,7 @@ pub(crate) fn push_text<'a>(
                 TextAnchor::TopRightEdge => 1.0 - (MARGIN + sy * 0.5) * 2.0 / window[1],
                 _ => -1.0 + (MARGIN + sy * 0.5) * 2.0 / window[1],
             };
-            // 尺寸换算:px → NDC(否则 sx 被当成 NDC 单位 = 全屏宽倍数,
-            // 文本巨大到超出窗口)。
-            let sx = sx * 2.0 / window[0];
-            let sy = sy * 2.0 / window[1];
-            mat_mul(&mat_translate(cx, cy), &mat_scale(sx, sy))
+            mat_mul(&mat_translate(cx, cy), &mat_scale(sx_ndc, sy_ndc))
         } else {
             mat_mul(
                 letterbox,
