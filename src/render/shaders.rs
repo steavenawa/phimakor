@@ -28,7 +28,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
 /// 由 `es100_to_glsl` 预转换后与本站点语法一致。
 pub const GLSL_VERT: &str = r"
 #version 450
-out vec2 v_uv;
+layout(location = 0) out vec2 v_uv;
 void main() {
     vec2 verts[3];
     verts[0] = vec2(-1.0, -1.0);

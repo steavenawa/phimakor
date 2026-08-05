@@ -18,7 +18,7 @@ serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 serde_yaml = "0.9"
 winit = "*"
-wgpu = { version = "30", features = ["glsl"] }
+wgpu = { version = "30", features = ["glsl", "spirv"] }
 wgpu-core = "30"
 pollster = "*"
 rodio = "*"
@@ -39,6 +39,8 @@ dhat = { version = "*", optional = true }
 tracy-client = { version = "*", optional = true }
 pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }
 texpresso = "2.0.2"
+glslang = "0.8.1"
+regex = "1.13.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Com", "Win32_UI_Shell"] }

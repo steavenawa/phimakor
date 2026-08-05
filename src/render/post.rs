@@ -16,36 +16,53 @@ fn is_glsl_source(body: &str) -> bool {
         || body.contains("varying ")
 }
 
-/// 剥离 GLSL 源开头的 #version 行(模板自带版本指令)。
-fn strip_glsl_version(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    for line in body.lines() {
-        let t = line.trim_start();
-        if t.starts_with("#version") {
-            continue;
-        }
-        out.push_str(line);
-        out.push('\n');
+/// std140 对齐/大小(GLSL uniform block 布局):(align, size)。
+fn std140_layout(ty: &str) -> (u32, u32) {
+    match ty.trim() {
+        "float" | "int" | "uint" | "bool" => (4, 4),
+        "vec2" | "ivec2" | "uvec2" | "bvec2" => (8, 8),
+        "vec3" | "ivec3" | "uvec3" | "bvec3" => (16, 16),
+        "vec4" | "ivec4" | "uvec4" | "bvec4" => (16, 16),
+        "mat2" => (16, 32),
+        "mat3" => (16, 48),
+        "mat4" => (16, 64),
+        _ => (4, 4),
     }
-    out
 }
 
-/// ES 100 → desktop GLSL 450 预转换(naga glsl-in 只接受 440+ 版本):
+/// GLSL → glslang 预转换(ES100 → GLSL 450 + separate sampler + 绑定注入):
 /// - `#version 100` → `#version 450`
 /// - `precision ...;` 行删除(desktop 无 precision)
-/// - `varying` → `in`(fragment 输入)/ vertex 由模板提供
-/// - `attribute` → `in`
-/// - `texture2D` → `texture`(函数调用)
-/// - `sampler2D` → `texture2D`(类型声明:naga 的 image 类型名)
+/// - `varying` → `in`、`attribute` → `in`(注入 location)
+/// - `uniform sampler2D NAME;` → 分离声明
+///   `layout(binding=0) uniform texture2D NAME;` + `layout(binding=1)
+///   uniform sampler NAME_smp;`(glslang 生成分离 SPIR-V,wgpu 要求分离)
+/// - 调用 `texture2D(NAME, ...)` → `texture(sampler2D(NAME, NAME_smp), ...)`
+/// - 其余 uniform 变量合并进 `layout(binding=2) uniform Params { ... };`
+///   (Vulkan 禁止 block 外非 opaque uniform),按 std140 计算 offsets
 /// - `gl_FragColor` → 注入的 `fragColor_out`(450 已移除内置,补 out 声明)
-/// 返回 (转换后的源, uniform 变量数——不含纹理, 与 binding 2 起对应)。
-fn es100_to_glsl(src: &str) -> (String, usize) {
-    let mut out = String::with_capacity(src.len() + 64);
+/// 返回 (转换后的源, uniform buffer 数(0 或 1), 变量 std140 (offset, size))。
+fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(u32, u32)>) {
+    let re_tex_call = regex::Regex::new(r"texture2D\(\s*([A-Za-z_]\w*)\s*,").unwrap();
+    let re_sampler = regex::Regex::new(
+        r"uniform\s+(sampler2D|sampler3D|samplerCube|sampler2DArray|samplerCubeArray)\s+(\w+)\s*;",
+    )
+    .unwrap();
+    let re_uniform_var =
+        regex::Regex::new(r"uniform\s+(float|int|uint|bool|vec[234]|ivec[234]|uvec[234]|bvec[234]|mat[234])\s+(\w+)\s*;").unwrap();
+    // 第一遍:收集非 sampler uniform 变量(声明顺序 = uniform_values 顺序)。
+    let mut vars: Vec<(String, String)> = Vec::new();
+    for line in src.lines() {
+        let t = line.trim_start();
+        if let Some(caps) = re_uniform_var.captures(t) {
+            vars.push((caps[2].to_string(), caps[1].to_string()));
+        }
+    }
+    // 第二遍:生成。
+    let mut out = String::with_capacity(src.len() + 256);
     let mut has_version = false;
-    // uniform 绑定注入:naga 要求显式 layout(binding)。
-    // texture2D 声明 → binding 0;其余 uniform 变量 → binding 2 起递增。
-    let mut uniform_count = 0usize;
-    let mut next_uniform_binding = 2u32;
+    let mut next_in_location = 0u32;
+    let mut var_idx = 0usize;
     for line in src.lines() {
         let t = line.trim_start();
         if t.starts_with("#version") {
@@ -58,24 +75,35 @@ fn es100_to_glsl(src: &str) -> (String, usize) {
         if t.starts_with("precision ") {
             continue;
         }
+        if re_uniform_var.is_match(t) {
+            // uniform 变量由 block 统一声明,原行删除。
+            var_idx += 1;
+            continue;
+        }
         let mut l = line
-            .replace("sampler2D", "texture2D")
             .replace("varying", "in")
             .replace("attribute", "in")
             .replace("gl_FragColor", "fragColor_out");
         if t.starts_with("uniform ") {
-            if t.contains("texture2D") || t.contains("sampler2D") {
-                l = l.replacen("uniform", "layout(binding = 0) uniform", 1);
-            } else {
-                let b = next_uniform_binding;
-                next_uniform_binding += 1;
-                uniform_count += 1;
-                l = l.replacen("uniform", &format!("layout(binding = {b}) uniform"), 1);
+            if let Some(caps) = re_sampler.captures(t) {
+                let (ty, tex_name) = (caps[1].to_string(), caps[2].to_string());
+                // sampler2D → texture2D(separate image 类型,GLSL 400+)。
+                let tex_ty = ty.replacen("sampler", "texture", 1);
+                out.push_str(&format!("layout(binding = 0) uniform {tex_ty} {tex_name};\n"));
+                out.push_str(&format!("layout(binding = 1) uniform sampler {tex_name}_smp;\n"));
+                continue;
             }
-        }
-        // 声明行(uniform)保留 texture2D 类型名;调用行换 texture 函数名。
-        if !l.contains("uniform") {
-            l = l.replace("texture2D", "texture");
+            continue; // 其他 uniform 变量:原行删除(block 统一声明)
+        } else if l.trim_start().starts_with("in ") && !l.contains("layout(") {
+            // SPIR-V 要求输入/输出带 location。判断用替换后的 l
+            // (varying → in 之后)。
+            l = l.replacen("in", &format!("layout(location = {next_in_location}) in"), 1);
+            next_in_location += 1;
+        } else {
+            // 调用行:texture2D(NAME, ...) → texture(sampler2D(NAME, NAME_smp), ...)
+            l = re_tex_call
+                .replace_all(&l, "texture(sampler2D($1, ${1}_smp),")
+                .into_owned();
         }
         out.push_str(&l);
         out.push('\n');
@@ -84,11 +112,28 @@ fn es100_to_glsl(src: &str) -> (String, usize) {
         out.insert_str(0, "#version 450\n");
     }
     if src.contains("gl_FragColor") {
-        // #version 必须第一行,out 声明插在其后。
         let ver = "#version 450\n";
         out.insert_str(ver.len(), "layout(location = 0) out vec4 fragColor_out;\n");
     }
-    (out, uniform_count)
+    // uniform block(std140):Vulkan 禁止 block 外非 opaque uniform。
+    let mut layout: Vec<(u32, u32)> = Vec::with_capacity(vars.len());
+    let mut block = String::new();
+    let mut cursor = 0u32;
+    for (name, ty) in &vars {
+        let (align, size) = std140_layout(ty);
+        cursor = (cursor + align - 1) & !(align - 1);
+        layout.push((cursor, size));
+        block.push_str(&format!("    {ty} {name};\n"));
+        cursor += size;
+    }
+    let uniform_count = usize::from(!vars.is_empty());
+    if !vars.is_empty() {
+        // 插到 #version 之后(变量须在使用前声明——main 之前的声明区)。
+        let block_src = format!("layout(binding = 2) uniform Params {{\n{block}}};\n");
+        let ver = "#version 450\n";
+        out.insert_str(ver.len(), &block_src);
+    }
+    (out, uniform_count, layout)
 }
 
 /// A single active effect instance (from extra.json).
@@ -190,6 +235,8 @@ struct EffPipe {
     /// GLSL 源(自定义 GLSL 特效):单 bind group(tex+sampler+uniforms),
     /// 与 WGSL 路径的 bind group 构建不同。
     glsl: bool,
+    /// GLSL 路径:uniform block 内各变量的 std140 (offset, size)。
+    uniform_layout: Vec<(u32, u32)>,
 }
 
 impl PostPipe {
@@ -429,32 +476,53 @@ impl PostPipe {
             return None;
         }
 
-        Some(EffPipe { pipeline, bgl, uniform_bufs: vec![uniform_buf], uniform_size, uniform_bg: None, screen_bgs: HashMap::new(), glsl: false })
+        Some(EffPipe { pipeline, bgl, uniform_bufs: vec![uniform_buf], uniform_size, uniform_bg: None, screen_bgs: HashMap::new(), glsl: false, uniform_layout: Vec::new() })
     }
 
-    /// GLSL 自定义特效路径:GLSL vertex 模板 + 用户 fragment(ES100 预
-    /// 转换,naga glsl-in 转译,每个 stage 一个 module)。绑定约定:
+    /// GLSL 自定义特效路径:glslang 编译 GLSL → SPIR-V(完整 GLSL 支持,
+    /// 含 sampler 采样;naga glsl-in 的 texture 内建残缺不可用)。绑定:
     ///   group 0: binding0 = screen 纹理, binding1 = sampler,
     ///            binding 2.. = 每个 uniform 变量一个 buffer(256B)
     fn build_eff_pipe_glsl(&self, device: &wgpu::Device, name: &str, body: &str) -> Option<EffPipe> {
-        // ES100 → desktop GLSL 450 预转换(naga 只接受 440+)。
-        let (frag, uniform_count) = es100_to_glsl(body);
+        let (frag, uniform_count, uniform_layout) = glsl_for_glslang(body);
+        // glslang 纯 CPU 编译(完整 GLSL 支持,含 sampler 采样)。
+        let compiler = glslang::Compiler::acquire()?;
+        let compile = |src: String, stage: glslang::ShaderStage| -> Option<Vec<u32>> {
+            let source = glslang::ShaderSource::from(src);
+            let input = glslang::ShaderInput::new(
+                &source,
+                stage,
+                &glslang::CompilerOptions::default(),
+                None::<&[(&str, Option<&str>)]>,
+                None,
+            )
+            .ok()?;
+            let shader = compiler.create_shader(input).ok()?;
+            shader.compile().ok()
+        };
+        let vs_spv = compile(crate::render::shaders::GLSL_VERT.to_string(), glslang::ShaderStage::Vertex)
+            .unwrap_or_else(|| {
+                eprintln!("warning: custom effect {name}: GLSL vertex 编译失败,已跳过");
+                return Vec::new();
+            });
+        if vs_spv.is_empty() {
+            return None;
+        }
+        let fs_spv = match compile(frag, glslang::ShaderStage::Fragment) {
+            Some(v) => v,
+            None => {
+                eprintln!("warning: custom effect {name}: GLSL 编译失败,已跳过");
+                return None;
+            }
+        };
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("vs-{name}")),
-            source: wgpu::ShaderSource::Glsl {
-                shader: std::borrow::Cow::Borrowed(crate::render::shaders::GLSL_VERT),
-                stage: wgpu::naga::ShaderStage::Vertex,
-                defines: &[],
-            },
+            source: wgpu::ShaderSource::SpirV(std::borrow::Cow::Owned(vs_spv)),
         });
         let fs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("fs-{name}")),
-            source: wgpu::ShaderSource::Glsl {
-                shader: std::borrow::Cow::Owned(frag),
-                stage: wgpu::naga::ShaderStage::Fragment,
-                defines: &[],
-            },
+            source: wgpu::ShaderSource::SpirV(std::borrow::Cow::Owned(fs_spv)),
         });
 
         let uniform_size: u64 = 256;
@@ -540,7 +608,7 @@ impl PostPipe {
             eprintln!("warning: custom effect {name}: GLSL 编译/校验失败,已跳过: {err:?}");
             return None;
         }
-        Some(EffPipe { pipeline, bgl, uniform_bufs, uniform_size, uniform_bg: None, screen_bgs: HashMap::new(), glsl: true })
+        Some(EffPipe { pipeline, bgl, uniform_bufs, uniform_size, uniform_bg: None, screen_bgs: HashMap::new(), glsl: true, uniform_layout })
     }
 
     /// Ensure the pipeline + resources exist for a given effect.
@@ -771,14 +839,15 @@ impl PostPipe {
             }
         }
         if ep.glsl {
-            // GLSL 路径:每个 uniform 变量独立 buffer,写各自首 4 字节。
-            for (i, buf) in ep.uniform_bufs.iter().enumerate() {
-                let mut v = [0u8; 4];
+            // GLSL 路径:uniform block 内按 std140 (offset, size) 写入。
+            for (i, &(off, size)) in ep.uniform_layout.iter().enumerate() {
                 let start = i * 4;
-                if start + 4 <= uniform_data.len() {
-                    v.copy_from_slice(&uniform_data[start..start + 4]);
+                let n = (size as usize).min(4).max(1);
+                let mut v = [0u8; 16];
+                if start + n <= uniform_data.len() {
+                    v[..n].copy_from_slice(&uniform_data[start..start + n]);
                 }
-                queue.write_buffer(buf, 0, &v);
+                queue.write_buffer(&ep.uniform_bufs[0], off as u64, &v[..n]);
             }
         } else {
             queue.write_buffer(&ep.uniform_bufs[0], 0, &uniform_data);
@@ -1006,11 +1075,10 @@ mod tests {
     }
 
     #[test]
-    fn glsl_es100_fragment_translates_via_naga() {
-        // 与 build_eff_pipe_glsl 相同的转译路径:ES 100 源预转换(ES300
-        // 语法)后 naga glsl-in 转译。无纹理的数学特效可直接支持;
-        // 带 sampler 的(如 RPE 纹理采样 shader)受 naga 限制转译失败,
-        // 由 error scope 优雅跳过(不 panic)。
+    fn glsl_es100_fragment_compiles_via_glslang() {
+        // 与 build_eff_pipe_glsl 相同的路径:ES 100 源预转换(separate
+        // sampler + 绑定注入)后 glslang 编译 SPIR-V。glslang 完整支持
+        // GLSL(含 sampler 采样),纯 CPU 不依赖 GPU。
         let frag = "#version 100
 precision mediump float;
 varying vec2 v_uv;
@@ -1019,41 +1087,53 @@ void main() {
     gl_FragColor = vec4(c, 1.0);
 }
 ";
-        let (es300, _) = es100_to_glsl(frag);
-        assert!(es300.starts_with("#version 450"));
-        assert!(es300.contains("in vec2 v_uv"));
-        assert!(!es300.contains("precision"));
-        assert!(es300.contains("layout(location = 0) out vec4 fragColor_out"));
-        let _ = wgpu::naga::front::glsl::Frontend::default()
-            .parse(
-                &wgpu::naga::front::glsl::Options::from(wgpu::naga::ShaderStage::Fragment),
-                &es300,
+        let (converted, count, layout) = glsl_for_glslang(frag);
+        assert_eq!(count, 0);
+        assert!(converted.starts_with("#version 450"));
+        assert!(converted.contains("in vec2 v_uv"));
+        assert!(!converted.contains("precision"));
+        assert!(converted.contains("layout(location = 0) out vec4 fragColor_out"));
+        let compiler = glslang::Compiler::acquire().unwrap();
+        let compile = |src: String, stage: glslang::ShaderStage| {
+            let source = glslang::ShaderSource::from(src);
+            let input = glslang::ShaderInput::new(
+                &source,
+                stage,
+                &glslang::CompilerOptions::default(),
+                None::<&[(&str, Option<&str>)]>,
+                None,
             )
             .unwrap();
-        // 共享 vertex 模板同样可转译。
-        let _ = wgpu::naga::front::glsl::Frontend::default()
-            .parse(
-                &wgpu::naga::front::glsl::Options::from(wgpu::naga::ShaderStage::Vertex),
-                crate::render::shaders::GLSL_VERT,
-            )
-            .unwrap();
-        // sampler 版本:预转换正确(sampler2D → texture2D 类型声明,
-        // texture2D 调用 → texture),但 naga 转译失败——这是已知限制,
-        // 运行时由 error scope 优雅跳过。
+            compiler.create_shader(input).unwrap().compile().unwrap()
+        };
+        let _ = compile(converted, glslang::ShaderStage::Fragment);
+        // 共享 vertex 模板同样可编译。
+        let _ = compile(
+            crate::render::shaders::GLSL_VERT.to_string(),
+            glslang::ShaderStage::Vertex,
+        );
+        // 带纹理采样 + 多 uniform 的用户形态(RPE shader 常见结构)。
         let with_tex = "#version 100
 precision mediump float;
 uniform sampler2D u_tex;
+uniform float time;
+uniform float power;
 varying vec2 v_uv;
 void main() {
-    gl_FragColor = texture2D(u_tex, v_uv);
+    vec4 color = texture2D(u_tex, v_uv);
+    gl_FragColor = color + vec4(vec3(power), 0.0);
 }
 ";
-        let (es300, _) = es100_to_glsl(with_tex);
-        assert!(es300.contains("layout(binding = 0) uniform texture2D u_tex"));
-        assert!(es300.contains("texture(u_tex, v_uv)"));
-        // 带纹理采样的转译受 naga glsl-in 限制:texture 内建按 Handle 匹配
-        // 内建类型,用户声明的 image 类型永不匹配(Bad call)。运行时由
-        // error scope 优雅跳过(不崩溃),报错提示需 WGSL 版。
+        let (converted, count, layout) = glsl_for_glslang(with_tex);
+        assert_eq!(count, 1); // 单 uniform block
+        assert_eq!(layout, vec![(0, 4), (4, 4)]); // std140:time@0, power@4
+        assert!(converted.contains("layout(binding = 0) uniform texture2D u_tex"));
+        assert!(converted.contains("layout(binding = 1) uniform sampler u_tex_smp"));
+        assert!(converted.contains("layout(binding = 2) uniform Params"));
+        assert!(converted.contains("    float time;"));
+        assert!(converted.contains("    float power;"));
+        assert!(converted.contains("texture(sampler2D(u_tex, u_tex_smp), v_uv)"));
+        let _ = compile(converted, glslang::ShaderStage::Fragment);
     }
 }
 
