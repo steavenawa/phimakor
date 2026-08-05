@@ -157,6 +157,9 @@ pub struct IcedOverlay {
     notes_cache: Arc<Vec<NoteEntry>>,
     last_drawn_beat: f64,
     show_menu: bool,
+    /// 上次上传后 GPU 上播放头水平线的 y(像素)。fast path 只重传播放头
+    /// 新旧两条水平条(全宽 × ~10px),替代每帧 8MB 全屏上传(PMCORE-69)。
+    last_playhead_y: Option<f32>,
 }
 
 const KIND_COLORS: [(&str, [u8; 3]); 5] = [
@@ -187,6 +190,7 @@ impl IcedOverlay {
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
             drag_note: None, drag_updated: None, ctx_pos: None, ctx_progress: 0.0,
             mouse_beat: 0.0, notes_cache: Arc::new(Vec::new()), last_drawn_beat: 0.0, show_menu: false,
+            last_playhead_y: None,
         }
     }
 
@@ -622,6 +626,8 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
             }
         }
         self.iced_cache.data_mut().copy_from_slice(self.pixmap.data());
+        // 标题界面无播放头:fast path 的脏条基准清零。
+        self.last_playhead_y = None;
         // Upload to both textures
         for (tex, data) in [(&self.iced_tex, self.iced_cache.data()), (&self.timeline_tex, self.pixmap.data())] {
             queue.write_texture(
@@ -791,18 +797,29 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
             }
         }
         self.pixmap.data_mut().copy_from_slice(self.base_pixmap.data());
-        self.draw_playhead(info);
+        // PMCORE-69:只重传播放头新旧两条水平条(全宽 × ~10px),
+        // 替代每帧 8MB 全屏上传。
+        let y_new = self.draw_playhead(info);
+        let y_old = self.last_playhead_y;
+        self.last_playhead_y = y_new;
+        if let Some(yn) = y_new {
+            let vw = self.w as f32;
+            let (y0, y1) = match y_old {
+                Some(yo) => (yo.min(yn) - 2.0, yo.max(yn) + 3.0),
+                None => (yn - 2.0, yn + 3.0),
+            };
+            let y0 = y0.max(0.0) as u32;
+            let y1 = (y1.max(0.0) as u32).min(self.h - 1);
+            if y1 >= y0 {
+                self.upload_rect(queue, 0, y0, vw as u32, y1 - y0 + 1);
+            }
+        }
         self.last_drawn_beat = info.chart_beat;
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-            self.pixmap.data(),
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * self.w), rows_per_image: Some(self.h) },
-            wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
-        );
     }
 
     /// Draw the current-time playhead lines on `pixmap` (assumes base content).
-    fn draw_playhead(&mut self, info: &GameInfo) {
+    /// Returns the playhead y (pixels), or `None` when the timeline is hidden.
+    fn draw_playhead(&mut self, info: &GameInfo) -> Option<f32> {
         let s = self.gui_scale;
         let vw = self.w as f32;
         let vh = self.h as f32;
@@ -841,6 +858,58 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
                 hline(&mut self.pixmap.as_mut(), ct_y - 1.0, notes_x + pad_x, notes_x + pad_x + play_w, [255, 200, 80, 230]);
                 hline(&mut self.pixmap.as_mut(), ct_y + 1.0, notes_x + pad_x, notes_x + pad_x + play_w, [255, 200, 80, 230]);
             }
+            return Some(ct_y);
+        }
+        None
+    }
+
+    /// 播放头水平线 y(像素),供全量上传后同步 last_playhead_y。
+    fn playhead_y(&self, info: &GameInfo) -> Option<f32> {
+        if !self.tl_visible {
+            return None;
+        }
+        let s = self.gui_scale;
+        let vh = self.h as f32;
+        let head_h = HEADER_H * s;
+        let py = head_h + 4.0 * s;
+        let ph = (vh - 56.0 * s - py) as f64;
+        let (scroll, zoom) = (self.tl_scroll as f64, self.tl_zoom as f64);
+        let to_y = |b: f64| py as f64 + ph - (b - scroll) / zoom * ph;
+        Some(to_y(info.chart_beat).clamp(py as f64, py as f64 + ph) as f32)
+    }
+
+    /// 上传 pixmap 的一个矩形区域到 timeline 纹理(PMCORE-69)。
+    /// wgpu 要求 bytes_per_row 256 对齐:pixmap 行步进 4*w 不保证对齐,
+    /// 需要时拷贝到对齐缓冲(条高小,拷贝廉价)。
+    fn upload_rect(&mut self, queue: &wgpu::Queue, x: u32, y: u32, w: u32, h: u32) {
+        if w == 0 || h == 0 || y >= self.h || x >= self.w {
+            return;
+        }
+        let (w, h) = (w.min(self.w - x), h.min(self.h - y));
+        let stride = 4 * self.w as usize;
+        let aligned = (stride + 255) & !255;
+        let data = self.pixmap.data();
+        let start = (y as usize * stride) + x as usize * 4;
+        if aligned == stride {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                &data[start..],
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(stride as u32), rows_per_image: Some(self.h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+        } else {
+            let mut buf = vec![0u8; aligned * h as usize];
+            for row in 0..h as usize {
+                let src = start + row * stride;
+                buf[row * aligned..row * aligned + w as usize * 4]
+                    .copy_from_slice(&data[src..src + w as usize * 4]);
+            }
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo { texture: &self.timeline_tex, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
+                &buf,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(aligned as u32), rows_per_image: Some(h) },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
         }
     }
 
@@ -914,6 +983,10 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
                 wgpu::Extent3d { width: self.w, height: self.h, depth_or_array_layers: 1 },
             );
         }
+        // 全量上传后同步播放头 y(fast path 脏条擦除依赖它)。
+        // 注意:worker 帧可能比本帧 info 旧一帧,但 beat 差 <1 帧窗口内
+        // 播放头只动几像素,多擦/少擦 1-2px 的残影由下一帧脏条自愈。
+        self.last_playhead_y = self.playhead_y(info);
     }
 }
 
