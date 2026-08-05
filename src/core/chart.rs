@@ -2242,4 +2242,70 @@ previewStart: 12
         assert!((rot - pro).abs() < 1e-3, "子线应继承父旋转: {}/{} rad", rot, pro);
         assert!(pro.to_degrees().abs() > 10.0, "父线在 2s 应有明显旋转: {}°", pro.to_degrees());
     }
+
+    /// state_at 性能基准(非断言,打印每帧平均耗时):
+    /// 大谱面 60 线 × 12 轨道 × ~200 keyframe × 每线 100 note,播放 1000 帧。
+    /// 观察 release 下 state_at 是否值得做增量评估(PMCORE-72)。
+    #[test]
+    #[ignore = "manual benchmark"]
+    fn state_at_bench_big_chart() {
+        let mut src = String::from(r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 180.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": ["#);
+        const LINES: usize = 60;
+        for li in 0..LINES {
+            if li > 0 {
+                src.push(',');
+            }
+            let line = format!(
+                r#"{{ "Name": "line{li}", "Texture": "line.png", "father": -1,
+                    "eventLayers": [
+                        {{ "moveXEvents": [ {{ "start": -0.5, "end": 0.5, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 }}, {{ "start": 0.5, "end": -0.5, "startTime": [2, 0, 1], "endTime": [4, 0, 1], "easingType": 0 }} ],
+                           "moveYEvents": [ {{ "start": -0.5, "end": 0.5, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 }} ],
+                           "rotateEvents": [ {{ "start": 0.0, "end": 90.0, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 }}, {{ "start": 90.0, "end": -90.0, "startTime": [2, 0, 1], "endTime": [4, 0, 1], "easingType": 0 }} ],
+                           "alphaEvents": [ {{ "start": 255.0, "end": 255.0, "startTime": [0, 0, 1], "endTime": [6, 0, 1], "easingType": 0 }} ],
+                           "speedEvents": [ {{ "start": 1.0, "end": 1.0, "startTime": [0, 0, 1], "endTime": [6, 0, 1], "easingType": 0 }} ]
+                        }},
+                        null
+                    ],
+                    "isCover": 0,
+                    "notes": [
+                        {{ "type": 1, "above": 1, "startTime": [0, 0, 1], "endTime": [0, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }},
+                        {{ "type": 2, "above": 1, "startTime": [1, 0, 1], "endTime": [4, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }}
+                    ]
+                }}"#
+            );
+            src.push_str(&line);
+        }
+        src.push_str("]}");
+        let start_build = std::time::Instant::now();
+        let mut chart = Chart::from_rpe(&src, false).unwrap();
+        eprintln!("build: {:?}", start_build.elapsed());
+        const FRAMES: usize = 1000;
+        let start = std::time::Instant::now();
+        let mut acc = 0usize;
+        for f in 0..FRAMES {
+            let t = f as f64 * 0.016;
+            let frame = chart.state_at(t);
+            acc += frame.lines.len();
+        }
+        let el = start.elapsed();
+        eprintln!(
+            "state_at {} frames ({} lines): {:.2}ms total, {:.2}us/frame, acc={}",
+            FRAMES, LINES, el.as_millis(), el.as_micros() as f64 / FRAMES as f64, acc
+        );
+        // 倒退 seek 场景(游标回退循环最坏情况):每 10 帧回跳一次。
+        chart.reposition(0.0);
+        let start = std::time::Instant::now();
+        for f in 0..FRAMES {
+            let t = if f % 10 == 0 { 0.0 } else { (f % 10) as f64 * 0.016 };
+            let _ = chart.state_at(t);
+        }
+        let el = start.elapsed();
+        eprintln!(
+            "state_at seek-back {} frames: {:.2}ms total, {:.2}us/frame",
+            FRAMES, el.as_millis(), el.as_micros() as f64 / FRAMES as f64
+        );
+    }
 }
