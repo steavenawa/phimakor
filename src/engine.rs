@@ -174,6 +174,12 @@ impl ChartSession {
         self.chart.as_ref().map(|c| c.duration()).unwrap_or(0.0)
     }
 
+    /// 上一帧场景 pass 的 GPU 耗时(ms)。需 PHIMAKOR_GPU_TIMING=1,
+    /// 否则返回 0。阻塞到 GPU 完成——仅诊断用。
+    pub fn gpu_frame_ms(&mut self) -> f32 {
+        self.engine.gpu_frame_ms()
+    }
+
     /// Total note count (for score calculation).
     pub fn note_count(&self) -> usize {
         self.chart.as_ref().map(|c| c.max_combo()).unwrap_or(0)
