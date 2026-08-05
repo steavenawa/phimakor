@@ -1051,8 +1051,9 @@ void main() {
         let (es300, _) = es100_to_glsl(with_tex);
         assert!(es300.contains("layout(binding = 0) uniform texture2D u_tex"));
         assert!(es300.contains("texture(u_tex, v_uv)"));
-        // 带纹理采样的转译受 naga glsl-in 限制(sampler 配对缺失,Bad call),
-        // 运行时由 error scope 优雅跳过(不崩溃)。此处只验证预转换正确。
+        // 带纹理采样的转译受 naga glsl-in 限制:texture 内建按 Handle 匹配
+        // 内建类型,用户声明的 image 类型永不匹配(Bad call)。运行时由
+        // error scope 优雅跳过(不崩溃),报错提示需 WGSL 版。
     }
 }
 
