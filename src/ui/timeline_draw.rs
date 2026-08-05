@@ -183,23 +183,7 @@ impl TimelineDrawState {
                 }
             }
             if info.show_overlay {
-                let sb_h = 12.0 * s;
-                let sb_y = vh - 56.0 * s;
-                let sb_x = qp_w;
-                let sb_w = (props_x - sb_x).max(20.0);
-                let mut sbg = Paint::default();
-                sbg.set_color_rgba8(40, 45, 55, 200);
-                if let Some(r) = Rect::from_xywh(sb_x, sb_y, sb_w, sb_h) {
-                    fill_rect_clipped(&mut pm.as_mut(), r, &sbg);
-                }
-                let prog = (info.chart_time / info.duration.max(0.01)) as f32;
-                if prog > 0.01 {
-                    let mut fp = Paint::default();
-                    fp.set_color_rgba8(100, 180, 255, 200);
-                    if let Some(r) = Rect::from_xywh(sb_x + 1.0 * s, sb_y + 1.0 * s, (sb_w - 2.0 * s) * prog.min(1.0), (sb_h - 2.0 * s).max(1.0)) {
-                        fill_rect_clipped(&mut pm.as_mut(), r, &fp);
-                    }
-                }
+                draw_seek_bar(&mut pm.as_mut(), info, qp_w, props_x, vh, s);
             }
         }
         // Panel definition matching selected tool
@@ -278,6 +262,38 @@ impl TimelineDrawState {
             }
         }
     }
+}
+
+/// 底部 seek bar(背景 + 进度前景)。全量绘制与 fast path(只重画动态
+/// 区域)共用——fast path 必须整条重画(背景覆盖旧进度,前景画新进度),
+/// 否则播放中进度冻结。
+pub fn draw_seek_bar(pm: &mut PixmapMut, info: &GameInfo, qp_w: f32, props_x: f32, vh: f32, s: f32) {
+    let sb_h = 12.0 * s;
+    let sb_y = vh - 56.0 * s;
+    let sb_x = qp_w;
+    let sb_w = (props_x - sb_x).max(20.0);
+    let mut sbg = Paint::default();
+    sbg.set_color_rgba8(40, 45, 55, 200);
+    if let Some(r) = Rect::from_xywh(sb_x, sb_y, sb_w, sb_h) {
+        fill_rect_clipped(pm, r, &sbg);
+    }
+    let prog = (info.chart_time / info.duration.max(0.01)) as f32;
+    if prog > 0.01 {
+        let mut fp = Paint::default();
+        fp.set_color_rgba8(100, 180, 255, 200);
+        if let Some(r) = Rect::from_xywh(sb_x + 1.0 * s, sb_y + 1.0 * s, (sb_w - 2.0 * s) * prog.min(1.0), (sb_h - 2.0 * s).max(1.0)) {
+            fill_rect_clipped(pm, r, &fp);
+        }
+    }
+}
+
+/// 返回 seek bar 的区域矩形(fast path 的脏区用)。
+pub fn seek_bar_rect(qp_w: f32, props_x: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
+    let sb_h = 12.0 * s;
+    let sb_y = vh - 56.0 * s;
+    let sb_x = qp_w;
+    let sb_w = (props_x - sb_x).max(20.0);
+    (sb_x, sb_y, sb_w, sb_h)
 }
 
 /// 画自定义几何光标:中心菱形 + 4 顶点 + 延迟轨迹。

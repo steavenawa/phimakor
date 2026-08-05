@@ -532,8 +532,8 @@ impl PostPipe {
         src_tag: SrcTag,
     ) -> bool {
         let Some(ep) = self.pipelines.get_mut(key) else { return false };
-        // Write uniform buffer (256 bytes)
-        let mut uniform_data = vec![0u8; 256];
+        // Write uniform buffer (256 bytes, stack array — no per-frame alloc)
+        let mut uniform_data = [0u8; 256];
         for (i, &val) in uv.iter().enumerate() {
             let offset = i * 4;
             if offset + 4 <= uniform_data.len() {

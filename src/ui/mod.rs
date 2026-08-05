@@ -756,12 +756,12 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         self.events_progress = self.approach(self.events_progress, if info.show_events { 1.0 } else { 0.0 });
         self.notes_progress = self.approach(self.notes_progress, if info.show_notes { 1.0 } else { 0.0 });
         self.animate_all();
-        // During playback the timeline scrolls and the seek bar advances every
-        // frame — the base pixmap is stale. Fall back to a full redraw then;
-        // the fast path (base copy + playhead) is only valid while static.
-        // Also include the tool-hover / context-menu animations: their values
-        // keep moving while the panels don't, and the fast path would freeze
-        // the hover/menu at its last-synced state (stuck highlight residue).
+        // 全量路径条件:
+        // - timeline_dirty(视图/内容变化,必须重绘)
+        // - anim_moving(面板动画,iced 同步重绘)
+        // - playing 且跟随滚动(tl_follow:时间轴内容每帧平移,base 失效)
+        // 播放但视图固定(tl_follow=false,手动滚动后)时内容静止,
+        // 只有播放头在动 → 走 fast path(只传播放头脏条,省 8MB/帧)。
         let playing = (info.chart_beat - self.last_drawn_beat).abs() > 1e-4;
         let anim_moving = prev_anim != (
             self.panel_progress,
@@ -770,7 +770,8 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
             self.ctx_progress,
             self.tool_hover_progress,
         );
-        if playing || anim_moving || self.timeline_dirty {
+        let scrolling = playing && self.tl_follow;
+        if scrolling || anim_moving || self.timeline_dirty {
             self.timeline_dirty = false;
             // 面板进度动画中:iced 布局随 progress 变化,需同步重绘,
             // 否则面板关闭后内容定格残留(透明区留存面板名)。
@@ -798,16 +799,32 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         }
         self.pixmap.data_mut().copy_from_slice(self.base_pixmap.data());
         // PMCORE-69:只重传播放头新旧两条水平条(全宽 × ~10px),
-        // 替代每帧 8MB 全屏上传。
+        // 替代每帧 8MB 全屏上传。播放中视图固定时也走这里:
+        // seek bar 进度每帧变,整条重画(背景覆盖旧进度)+ 并入脏区。
+        let s = self.gui_scale;
+        let vw = self.w as f32;
+        let vh = self.h as f32;
+        let pan_w = PANEL_W * s;
+        let props_x = vw - self.panel_progress * pan_w;
+        if self.show_overlay {
+            let (sb_x, sb_y, sb_w, sb_h) = timeline_draw::seek_bar_rect(QP_W * s, props_x, vh, s);
+            timeline_draw::draw_seek_bar(&mut self.pixmap.as_mut(), info, QP_W * s, props_x, vh, s);
+        }
         let y_new = self.draw_playhead(info);
         let y_old = self.last_playhead_y;
         self.last_playhead_y = y_new;
+        // 脏区:播放头条 + seek bar 条(合并为竖直范围,避免多次上传)。
+        let mut y0 = if self.show_overlay { vh - 56.0 * s - 2.0 } else { f32::MAX };
+        let mut y1 = if self.show_overlay { vh - 56.0 * s + 14.0 * s + 2.0 } else { f32::MIN };
         if let Some(yn) = y_new {
-            let vw = self.w as f32;
-            let (y0, y1) = match y_old {
+            let (a, b) = match y_old {
                 Some(yo) => (yo.min(yn) - 2.0, yo.max(yn) + 3.0),
                 None => (yn - 2.0, yn + 3.0),
             };
+            y0 = y0.min(a);
+            y1 = y1.max(b);
+        }
+        if y1 >= y0 {
             let y0 = y0.max(0.0) as u32;
             let y1 = (y1.max(0.0) as u32).min(self.h - 1);
             if y1 >= y0 {
