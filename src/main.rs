@@ -1282,7 +1282,7 @@ impl State {
         let fx_triggers = self.chart.fx_in_window(chart_time - 0.5, chart_time);
         // 预计算每个触发点在 **t0 时刻** 的线位姿:hit-fx 不绑定当前帧线状态,
         // 线之后移动/旋转时已爆散的粒子留在触发瞬间的位置。
-        let fx_poses: Vec<([f32; 2], f32)> = fx_triggers.iter()
+        let fx_poses: Vec<([f32; 2], f32, [f32; 2])> = fx_triggers.iter()
             .map(|tr| self.chart.line_pose_at(tr.line, tr.t0))
             .collect();
         let frame = self.chart.state_at(chart_time);
@@ -1574,14 +1574,18 @@ impl State {
         // 前进/倒退/跳转都按 chart_time 渲染对应帧。位置用触发瞬间 t0
         // 的线位姿(已预计算),不绑定当前帧线状态。
         {
-            let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().zip(fx_poses).map(|(tr, (pos, rot))| {
+            // 与 note 渲染同坐标系(画布 px):
+            //   x_canvas = note.x(±1) × 675 × line.scale_x
+            //   cx = pos[0]×675 + cos(rot)×x_canvas
+            //   cy = pos[1]×450×ev_y + sin(rot)×x_canvas
+            // (渲染的 y 平移用 ev_y = 1.5/aspect;旋转投影是画布 px,
+            //  不乘任何 aspect 因子——旧公式乘 pf_aspect 是错的)
+            let ev_y = 1.5 / (size.width as f32 / size.height.max(1) as f32) as f64;
+            let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().zip(fx_poses).map(|(tr, (pos, rot, scale))| {
                 let rot = rot as f64;
-                // tr.x 是相对线中心的单位(-1..1),与 fired.x 同语义:
-                // cx = (线位置 + 旋转后的相对偏移) × 675 画布 px;
-                // y 方向旋转投影乘 pf_aspect(与原 fired 循环一致)。
-                let x = tr.x as f64;
-                let cx = (pos[0] as f64 + rot.cos() * x) * 675.0;
-                let cy = (pos[1] as f64 + rot.sin() * x * self.renderer.playfield_aspect() as f64) * 450.0;
+                let x = tr.x as f64 * 675.0 * scale[0] as f64;
+                let cx = pos[0] as f64 * 675.0 + rot.cos() * x;
+                let cy = pos[1] as f64 * 450.0 * ev_y + rot.sin() * x;
                 (tr.t0, [cx as f32, cy as f32])
             }).collect();
             self.renderer.set_frame_fx(fx);
