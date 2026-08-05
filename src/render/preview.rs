@@ -304,6 +304,7 @@ impl PreviewEngine {
                 priority: e.priority,
                 uniform_values: uv,
                 uniform_count: count,
+                uniforms_names: e.uniforms_names.clone(),
             });
         }
     }

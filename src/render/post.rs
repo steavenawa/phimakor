@@ -41,8 +41,8 @@ fn std140_layout(ty: &str) -> (u32, u32) {
 /// - 其余 uniform 变量合并进 `layout(binding=2) uniform Params { ... };`
 ///   (Vulkan 禁止 block 外非 opaque uniform),按 std140 计算 offsets
 /// - `gl_FragColor` → 注入的 `fragColor_out`(450 已移除内置,补 out 声明)
-/// 返回 (转换后的源, uniform buffer 数(0 或 1), 变量 std140 (offset, size))。
-fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(u32, u32)>) {
+/// 返回 (转换后的源, uniform buffer 数(0 或 1), 变量 (名字, std140 offset, size))。
+fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32)>) {
     let re_tex_call = regex::Regex::new(r"texture2D\(\s*([A-Za-z_]\w*)\s*,").unwrap();
     let re_sampler = regex::Regex::new(
         r"uniform\s+(sampler2D|sampler3D|samplerCube|sampler2DArray|samplerCubeArray)\s+(\w+)\s*;",
@@ -62,7 +62,6 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(u32, u32)>) {
     let mut out = String::with_capacity(src.len() + 256);
     let mut has_version = false;
     let mut next_in_location = 0u32;
-    let mut var_idx = 0usize;
     for line in src.lines() {
         let t = line.trim_start();
         if t.starts_with("#version") {
@@ -77,7 +76,6 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(u32, u32)>) {
         }
         if re_uniform_var.is_match(t) {
             // uniform 变量由 block 统一声明,原行删除。
-            var_idx += 1;
             continue;
         }
         let mut l = line
@@ -116,13 +114,13 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(u32, u32)>) {
         out.insert_str(ver.len(), "layout(location = 0) out vec4 fragColor_out;\n");
     }
     // uniform block(std140):Vulkan 禁止 block 外非 opaque uniform。
-    let mut layout: Vec<(u32, u32)> = Vec::with_capacity(vars.len());
+    let mut layout: Vec<(String, u32, u32)> = Vec::with_capacity(vars.len());
     let mut block = String::new();
     let mut cursor = 0u32;
     for (name, ty) in &vars {
         let (align, size) = std140_layout(ty);
         cursor = (cursor + align - 1) & !(align - 1);
-        layout.push((cursor, size));
+        layout.push((name.clone(), cursor, size));
         block.push_str(&format!("    {ty} {name};\n"));
         cursor += size;
     }
@@ -149,6 +147,8 @@ pub struct ActiveEffect {
     pub priority: u32,
     /// Float values written into the effect's uniform buffer each frame.
     pub uniform_values: Vec<f32>,
+    /// Uniform 变量名(自定义 GLSL 特效按名匹配 shader 声明;内置留空)。
+    pub uniforms_names: Vec<String>,
     /// How many leading elements of `uniform_values` are meaningful.
     pub uniform_count: usize,
 }
@@ -235,8 +235,8 @@ struct EffPipe {
     /// GLSL 源(自定义 GLSL 特效):单 bind group(tex+sampler+uniforms),
     /// 与 WGSL 路径的 bind group 构建不同。
     glsl: bool,
-    /// GLSL 路径:uniform block 内各变量的 std140 (offset, size)。
-    uniform_layout: Vec<(u32, u32)>,
+    /// GLSL 路径:uniform block 内各变量的 (名字, std140 offset, size)。
+    uniform_layout: Vec<(String, u32, u32)>,
 }
 
 impl PostPipe {
@@ -735,14 +735,14 @@ impl PostPipe {
         }
 
         // Phase 1: ensure all pipelines exist
-        // Copy active descriptors: (pipeline_key, uniform_values, uniform_count)
-        let descriptors: Vec<(String, Vec<f32>, usize)> = active.iter().map(|ae| {
+        // Copy active descriptors: (pipeline_key, uniform_values, uniform_names)
+        let descriptors: Vec<(String, Vec<f32>, Vec<String>)> = active.iter().map(|ae| {
             let key = if ae.shader_idx < usize::MAX {
                 EFFECTS.get(ae.shader_idx).map(|d| d.name.to_string()).unwrap_or_default()
             } else {
                 ae.custom_name.clone().unwrap_or_default()
             };
-            (key, ae.uniform_values.clone(), ae.uniform_count)
+            (key, ae.uniform_values.clone(), ae.uniforms_names.clone())
         }).collect();
         for (key, _, _) in &descriptors {
             if let Some(def) = EFFECTS.iter().find(|d| d.name == key.as_str()) {
@@ -767,10 +767,10 @@ impl PostPipe {
         let mut i = 0usize;
         while i < descriptors.len() {
             if !(half_res && effect_is_half_res(&descriptors[i].0)) {
-                let (key, uv, _) = &descriptors[i];
+                let (key, uv, names) = &descriptors[i];
                 let write_view = self.target_views[write_idx].as_ref().unwrap().clone();
                 write_idx = 1 - write_idx;
-                if self.run_effect(encoder, device, queue, key, uv, &read_view, &write_view, read_tag) {
+                if self.run_effect(encoder, device, queue, key, uv, names, &read_view, &write_view, read_tag) {
                     read_view = write_view;
                     read_tag = SrcTag::Full((1 - write_idx) as u8);
                 } else {
@@ -788,10 +788,10 @@ impl PostPipe {
                 let mut h_read: wgpu::TextureView = h0;
                 let mut h_read_tag = SrcTag::Half(0);
                 let mut h_write = 1usize;
-                for (key, uv, _) in descriptors.iter().take(j).skip(i) {
+                for (key, uv, names) in descriptors.iter().take(j).skip(i) {
                     let wv = self.half_views[h_write].as_ref().unwrap().clone();
                     h_write = 1 - h_write;
-                    if self.run_effect(encoder, device, queue, key, uv, &h_read, &wv, h_read_tag) {
+                    if self.run_effect(encoder, device, queue, key, uv, names, &h_read, &wv, h_read_tag) {
                         h_read = wv;
                         h_read_tag = SrcTag::Half((1 - h_write) as u8);
                     } else {
@@ -825,6 +825,7 @@ impl PostPipe {
         queue: &wgpu::Queue,
         key: &str,
         uv: &[f32],
+        uniform_names: &[String],
         read_view: &wgpu::TextureView,
         write_view: &wgpu::TextureView,
         src_tag: SrcTag,
@@ -839,13 +840,17 @@ impl PostPipe {
             }
         }
         if ep.glsl {
-            // GLSL 路径:uniform block 内按 std140 (offset, size) 写入。
-            for (i, &(off, size)) in ep.uniform_layout.iter().enumerate() {
-                let start = i * 4;
+            // GLSL 路径:uniform block 按变量名匹配写入(extra.json 的
+            // uniform 顺序来自 HashMap,与 shader 声明顺序不一致)。
+            for (i, val) in uv.iter().enumerate() {
+                let Some(name) = uniform_names.get(i) else { continue };
+                let Some(&(_, off, size)) = ep.uniform_layout.iter().find(|(n, _, _)| n == name) else {
+                    continue;
+                };
                 let n = (size as usize).min(4).max(1);
                 let mut v = [0u8; 16];
-                if start + n <= uniform_data.len() {
-                    v[..n].copy_from_slice(&uniform_data[start..start + n]);
+                if i * 4 + n <= uniform_data.len() {
+                    v[..n].copy_from_slice(&uniform_data[i * 4..i * 4 + n]);
                 }
                 queue.write_buffer(&ep.uniform_bufs[0], off as u64, &v[..n]);
             }

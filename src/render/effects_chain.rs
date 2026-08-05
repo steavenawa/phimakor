@@ -39,6 +39,7 @@ fn resolve_one(e: &EvalEffect, chart_time: f64, screen: (f32, f32)) -> Vec<Activ
             priority: e.priority,
             uniform_values: e.uniforms.clone(),
             uniform_count: e.uniforms.len(),
+            uniforms_names: e.uniforms_names.clone(),
         }];
     }
     let def = &EFFECTS[si];
@@ -53,6 +54,7 @@ fn resolve_one(e: &EvalEffect, chart_time: f64, screen: (f32, f32)) -> Vec<Activ
             priority: e.priority,
             uniform_values: uv,
             uniform_count: uc,
+            uniforms_names: Vec::new(),
         }];
     }
     def.stages.iter().filter_map(|sname| {
@@ -64,6 +66,7 @@ fn resolve_one(e: &EvalEffect, chart_time: f64, screen: (f32, f32)) -> Vec<Activ
             priority: e.priority,
             uniform_values: uv,
             uniform_count: uc,
+            uniforms_names: Vec::new(),
         })
     }).collect()
 }
