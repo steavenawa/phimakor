@@ -364,7 +364,10 @@ impl PostPipe {
             return;
         }
         let Some(ref chart_dir) = self.chart_dir else { return };
-        let path = chart_dir.join(&name);
+        // extra.json 的 shader 名常带前导 '/'——PathBuf::join 遇绝对路径
+        // 会丢弃 chart_dir,直接拼成 D:/xxx.glsl。去前导分隔符再拼。
+        let rel = name.trim_start_matches(['/', '\\']);
+        let path = chart_dir.join(rel);
         let wgsl = match std::fs::read_to_string(&path) {
             Ok(w) => w,
             Err(e) => {
