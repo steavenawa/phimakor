@@ -433,6 +433,11 @@ pub struct Renderer {
     disc: wgpu::BindGroup,
     /// 64×64 white play triangle (▶), shown while paused.
     play_tri: wgpu::BindGroup,
+    /// 纹理压缩开关(设置里可关):大纹理超 [`MAX_TEXTURE_DIM`] 时
+    /// Lanczos3 降采样 + BC3 块压缩(显存/带宽 4:1,有损)。
+    pub texture_compress: bool,
+    /// 设备是否支持 BC 压缩纹理(不支持时压缩自动回退 RGBA8)。
+    bc_supported: bool,
     textures: HashMap<String, TexEntry>,
     background: Option<(wgpu::BindGroup, [f32; 2])>,
     background_dim: f32,
@@ -528,6 +533,12 @@ impl Renderer {
     /// Borrow the shared linear sampler.
     pub fn sampler(&self) -> &wgpu::Sampler { &self.sampler }
 
+    /// 场景 pass 的 GPU 耗时(ms)。仅 PHIMAKOR_GPU_TIMING=1 时有效;
+    /// 内部 device.poll(Wait) 阻塞——只用于诊断(perf 模式)。
+    pub fn gpu_frame_ms(&mut self) -> Option<f32> {
+        self.gpu_timers.as_mut().map(|g| g.poll(&self.device, &self.queue))
+    }
+
     /// Acquire the next surface texture. Returns `Err` variants that the caller
     /// should handle (Timeout/Occluded → skip frame, Validation → propagate).
     pub fn surface_acquire(&mut self) -> Result<wgpu::SurfaceTexture, wgpu::CurrentSurfaceTexture> {
@@ -615,10 +626,17 @@ impl Renderer {
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
-                required_features: if std::env::var("PHIMAKOR_GPU_TIMING").is_ok() {
-                    wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
-                } else {
-                    wgpu::Features::empty()
+                required_features: {
+                    let mut f = wgpu::Features::empty();
+                    if std::env::var("PHIMAKOR_GPU_TIMING").is_ok() {
+                        f |= wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+                    }
+                    // BC 纹理压缩(texpresso 编码 BC3):适配器支持才请求,
+                    // 否则纹理压缩开关自动失效(RGBA8 回退)。
+                    if adapter.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
+                        f |= wgpu::Features::TEXTURE_COMPRESSION_BC;
+                    }
+                    f
                 },
                 required_limits: wgpu::Limits::default(),
                 experimental_features: wgpu::ExperimentalFeatures::default(),
@@ -691,6 +709,7 @@ impl Renderer {
         };
 
         let post = post::PostPipe::new(&device, width, height, format);
+        let bc_supported = device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         let scene_tex = Some(post::PostPipe::make_target2(&device, width, height, "scene", format));
         let scene_view = Some(scene_tex.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
         let ui_inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -721,6 +740,8 @@ impl Renderer {
             white,
             disc,
             play_tri,
+            texture_compress: true,
+            bc_supported,
             textures: HashMap::new(),
             gpu_timers,
             background: None,
@@ -749,6 +770,79 @@ impl Renderer {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
+    }
+
+    /// 纹理尺寸上限(px):超出时 Lanczos3 降采样(抗锯齿)。
+    pub const MAX_TEXTURE_DIM: u32 = 2048;
+
+    /// 压缩对齐的纯函数:尺寸限制到 [`MAX_TEXTURE_DIM`],BC3 块压缩时
+    /// 对齐到 4 的倍数。`compress=false` 只限制不缩放非 4 倍尺寸。
+    pub fn fit_texture_dim(w: u32, h: u32, compress: bool) -> (u32, u32) {
+        let scale = Self::MAX_TEXTURE_DIM as f32 / w.max(h).max(1) as f32;
+        let (mut nw, mut nh) = if scale < 1.0 {
+            (((w as f32 * scale).max(1.0)).round() as u32, ((h as f32 * scale).max(1.0)).round() as u32)
+        } else {
+            (w, h)
+        };
+        if compress {
+            nw &= !3;
+            nh &= !3;
+        }
+        (nw.max(1), nh.max(1))
+    }
+
+    /// 上传 RGBA8 到 GPU 纹理(统一入口):
+    /// - 超 [`MAX_TEXTURE_DIM`] → Lanczos3 降采样(抗锯齿,无条件)
+    /// - `texture_compress` 开 → BC3 块压缩(Bc3RgbaUnorm,显存/带宽 4:1)
+    /// - 关 → RGBA8 原样
+    /// 返回 (bind group, 实际尺寸)。
+    fn upload_texture_rgba(&mut self, rgba: &[u8], w: u32, h: u32) -> (wgpu::BindGroup, [f32; 2]) {
+        let compress = self.texture_compress && self.bc_supported;
+        let (nw, nh) = Self::fit_texture_dim(w, h, compress);
+        // 尺寸限制:超上限降采样(抗锯齿)。
+        let data: Vec<u8> = if nw != w || nh != h {
+            let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).unwrap_or_default();
+            image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3).into_raw()
+        } else {
+            rgba.to_vec()
+        };
+        let texture = if compress {
+            // BC3(DXT5):RGBA 块压缩,4:1。API:Format::compress(texpresso 2.x)。
+            let mut blocks = vec![0u8; texpresso::Format::Bc3.compressed_size(nw as usize, nh as usize)];
+            texpresso::Format::Bc3.compress(&data, nw as usize, nh as usize, texpresso::Params::default(), &mut blocks);
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d { width: nw, height: nh, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bc3RgbaUnorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let block_w = nw.div_ceil(4);
+            let block_h = nh.div_ceil(4);
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &blocks,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(block_w * 16),
+                    rows_per_image: Some(block_h),
+                },
+                wgpu::Extent3d { width: nw, height: nh, depth_or_array_layers: 1 },
+            );
+            tex
+        } else {
+            Self::create_texture(&self.device, &self.queue, &data, nw, nh)
+        };
+        let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
+        (bind_group, [nw as f32, nh as f32])
     }
 
     fn create_texture(
@@ -817,7 +911,7 @@ impl Renderer {
         })
     }
 
-    fn upload_image(&self, bytes: &[u8]) -> anyhow::Result<(wgpu::BindGroup, [f32; 2])> {
+    fn upload_image(&mut self, bytes: &[u8]) -> anyhow::Result<(wgpu::BindGroup, [f32; 2])> {
         let mut img = image::load_from_memory(bytes)
             .context("failed to decode image")?
             .to_rgba8();
@@ -825,9 +919,9 @@ impl Renderer {
         // keeping shader UV math (incl. hold atlas) in image space.
         image::imageops::flip_vertical_in_place(&mut img);
         let (w, h) = (img.width().max(1), img.height().max(1));
-        let texture = Self::create_texture(&self.device, &self.queue, img.as_raw(), w, h);
-        let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
-        Ok((bind_group, [w as f32, h as f32]))
+        // 尺寸限制 + 可选 BC3 压缩(与 load_texture_rgba 同路径)。
+        let (bind_group, size) = self.upload_texture_rgba(img.as_raw(), w, h);
+        Ok((bind_group, size))
     }
 
     fn reconfigure(&self) {
@@ -989,16 +1083,15 @@ impl Renderer {
     }
 
     /// 直载预解码 RGBA 纹理(跳过 image 解码,PMCORE 加载优化)。
+    /// 经尺寸限制 + 可选 BC3 压缩(见 `texture_compress`)。
     pub fn load_texture_rgba(&mut self, name: &str, rgba: &[u8], w: u32, h: u32) {
-        let texture = Self::create_texture(&self.device, &self.queue, rgba, w, h);
-        let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
-        self.textures.insert(name.to_string(), TexEntry { bind_group, size: [w as f32, h as f32] });
+        let (bind_group, size) = self.upload_texture_rgba(rgba, w, h);
+        self.textures.insert(name.to_string(), TexEntry { bind_group, size });
     }
 
-    /// 直载预解码背景(已模糊 + 翻转)。
+    /// 直载预解码背景(已模糊 + 翻转)。经尺寸限制 + 可选 BC3 压缩。
     pub fn set_background_rgba(&mut self, rgba: &[u8], w: u32, h: u32, dim: f32) {
-        let texture = Self::create_texture(&self.device, &self.queue, rgba, w, h);
-        let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
+        let (bind_group, _) = self.upload_texture_rgba(rgba, w, h);
         self.background = Some((bind_group, [w as f32, h as f32]));
         self.background_dim = dim;
     }
@@ -1950,6 +2043,54 @@ mod tests {
         let (_, kx, ky, _, ev_y) = letterbox_transform(4. / 3., 1.5);
         assert!((kx - 1.).abs() < 1e-6 && (ky - 0.8889).abs() < 1e-4);
         assert!((ev_y - 1.).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fit_texture_dim_caps_and_aligns() {
+        // 未超限:原尺寸;压缩时对齐 4。
+        assert_eq!(Renderer::fit_texture_dim(1024, 768, true), (1024, 768));
+        // 超限:等比缩到上限内。
+        let (w, h) = Renderer::fit_texture_dim(4096, 2048, true);
+        assert!(w <= Renderer::MAX_TEXTURE_DIM && h <= Renderer::MAX_TEXTURE_DIM);
+        assert_eq!(w % 4, 0);
+        assert_eq!(h % 4, 0);
+        // 不压缩:只限制,不对齐。
+        let (w, h) = Renderer::fit_texture_dim(4096, 2048, false);
+        assert!(w <= Renderer::MAX_TEXTURE_DIM && h <= Renderer::MAX_TEXTURE_DIM);
+        // 非 4 倍数尺寸压缩时对齐。
+        let (w, h) = Renderer::fit_texture_dim(1000, 999, true);
+        assert_eq!(w % 4, 0);
+        assert_eq!(h % 4, 0);
+        assert_eq!(w, 1000 & !3);
+    }
+
+    #[test]
+    fn bc3_compress_roundtrip() {
+        // 64×64 渐变图(含透明通道):BC3 压缩 → 解压 → 尺寸/数据合法。
+        let w = 64usize;
+        let h = 64usize;
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for y in 0..h {
+            for x in 0..w {
+                rgba.extend_from_slice(&[(x * 4) as u8, (y * 4) as u8, 128, (x + y) as u8]);
+            }
+        }
+        let size = texpresso::Format::Bc3.compressed_size(w, h);
+        assert_eq!(size, (w / 4) * (h / 4) * 16);
+        let mut blocks = vec![0u8; size];
+        texpresso::Format::Bc3.compress(&rgba, w, h, texpresso::Params::default(), &mut blocks);
+        let mut decoded = vec![0u8; w * h * 4];
+        texpresso::Format::Bc3.decompress(&blocks, w, h, &mut decoded);
+        // 解压后像素应大致接近原值(有损,容差大)。
+        let mut err = 0.0f64;
+        for i in 0..rgba.len() {
+            let d = (rgba[i] as f64 - decoded[i] as f64).abs();
+            err += d;
+        }
+        let avg = err / rgba.len() as f64;
+        assert!(avg < 20.0, "BC3 roundtrip avg error {avg:.1} too high");
+        // 透明度保留(α 通道解压有值)。
+        assert!(decoded[3] > 0 || decoded.iter().step_by(4).any(|&a| a > 0));
     }
 }
 

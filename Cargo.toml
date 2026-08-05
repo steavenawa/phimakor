@@ -38,6 +38,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 dhat = { version = "*", optional = true }
 tracy-client = { version = "*", optional = true }
 pyo3 = { version = "0.22", optional = true, features = ["extension-module"] }
+texpresso = "2.0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_System_Com", "Win32_UI_Shell"] }

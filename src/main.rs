@@ -996,6 +996,7 @@ impl State {
         self.renderer.set_vsync(self.settings.vsync);
         self.renderer.aggressive = self.settings.aggressive;
         self.renderer.post.half_res_enabled = self.settings.half_res_fx;
+        self.renderer.texture_compress = self.settings.texture_compress;
         self.dpi_scale = self.window.scale_factor() as f32;
         self.gui_scale = self.settings.gui_scale * self.dpi_scale;
         self.overlay.perf_hint = self.settings.perf_hint;
@@ -1623,6 +1624,11 @@ impl State {
                     self.show_overlay, self.ui_dirty,
                     self.show_events || self.show_notes,
                 );
+            }
+            // GPU 场景 pass 耗时(PHIMAKOR_GPU_TIMING=1 时有效,
+            // 定位 CPU vs GPU 瓶颈)。
+            if let Some(gpu_ms) = self.renderer.gpu_frame_ms() {
+                eprintln!("gpu: scene pass {:.2}ms", gpu_ms);
             }
             if acc.1 >= 60 {
                 let avg = |i: usize| acc.0[i] / acc.1 as f64;

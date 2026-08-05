@@ -27,6 +27,10 @@ pub struct SettingsData {
     /// 后处理半分辨率特效降采样(默认开,省 ~75% 像素带宽)。关闭后所有
     /// 特效全分辨率跑,用于排查特效质量问题。
     pub half_res_fx: bool,
+    /// 纹理压缩(BC3,默认开):大纹理超 2048² 时 Lanczos3 降采样(抗锯齿)
+    /// + BC3 块压缩,显存/带宽 4:1。有损(视觉上通常不可察觉);
+    /// 关闭后 RGBA8 原样上传。
+    pub texture_compress: bool,
 }
 
 /// 过激优化:hold 身体按视口裁剪(线段求交+勾股长度),长 hold 省大量
@@ -35,7 +39,7 @@ pub use phimakor::render::AGGRESSIVE_HOLD_CLIP;
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, fps_overlay: true, custom_cursor: false, aggressive: 0, half_res_fx: true }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, fps_overlay: true, custom_cursor: false, aggressive: 0, half_res_fx: true, texture_compress: true }
     }
 }
 
@@ -86,6 +90,7 @@ pub fn build_settings_form(x: f32, y: f32, w: f32, s: f32, settings: &SettingsDa
         ("custom cursor".into(), RTControl::Toggle { on: settings.custom_cursor, anim: if settings.custom_cursor { 1.0 } else { 0.0 }, dir: if settings.custom_cursor { 1.0 } else { -1.0 } }),
         ("aggressive cull".into(), RTControl::Toggle { on: settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0, anim: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { 0.0 }, dir: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { -1.0 } }),
         ("half-res fx".into(), RTControl::Toggle { on: settings.half_res_fx, anim: if settings.half_res_fx { 1.0 } else { 0.0 }, dir: if settings.half_res_fx { 1.0 } else { -1.0 } }),
+        ("tex compress".into(), RTControl::Toggle { on: settings.texture_compress, anim: if settings.texture_compress { 1.0 } else { 0.0 }, dir: if settings.texture_compress { 1.0 } else { -1.0 } }),
     ]);
     form.row_h = 24.0 * s;
     form.gap = 4.0 * s;
@@ -157,6 +162,12 @@ pub fn apply_settings_form(form: &RealtimeForm, settings: &mut SettingsData) -> 
             ("half-res fx", RTControl::Toggle { on, .. }) => {
                 if *on != settings.half_res_fx {
                     settings.half_res_fx = *on;
+                    changed = true;
+                }
+            }
+            ("tex compress", RTControl::Toggle { on, .. }) => {
+                if *on != settings.texture_compress {
+                    settings.texture_compress = *on;
                     changed = true;
                 }
             }
