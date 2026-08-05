@@ -61,7 +61,8 @@ impl TextAnchor {
             Self::BottomRight => (30.0, HAlign::Right(655.0), bottom + 6.0),
             Self::TopRight => (36.0, HAlign::Right(655.0), top - 8.0 - 36.0),
             // Viewport edges: y resolved in push_text from the window size.
-            Self::TopRightEdge => (36.0, HAlign::Right(655.0), top - 8.0 - 36.0),
+            // TopRightEdge: 22px,贴顶小字(HUD 帧时间叠层)。
+            Self::TopRightEdge => (22.0, HAlign::Right(655.0), top - 8.0 - 36.0),
             Self::BottomLeftEdge => (30.0, HAlign::Left(-655.0), bottom),
             Self::BottomRightEdge => (30.0, HAlign::Right(655.0), bottom),
             // Directly below TopCenter on screen (+y = up): 6 px gap, 26 px.
@@ -562,9 +563,9 @@ pub(crate) fn push_text<'a>(
                 TextAnchor::BottomLeftEdge => -1.0 + (MARGIN + sx * 0.5) * 2.0 / window[0],
                 _ => 1.0 - (MARGIN + sx * 0.5) * 2.0 / window[0],
             };
-            // TopRightEdge 贴窗口顶部,其余边缘锚定贴底部。
+            // TopRightEdge 贴窗口顶部(4px 小边距),其余边缘锚定贴底部。
             let cy = match pt.anchor {
-                TextAnchor::TopRightEdge => 1.0 - (MARGIN + sy * 0.5) * 2.0 / window[1],
+                TextAnchor::TopRightEdge => 1.0 - (4.0 + sy * 0.5) * 2.0 / window[1],
                 _ => -1.0 + (MARGIN + sy * 0.5) * 2.0 / window[1],
             };
             mat_mul(&mat_translate(cx, cy), &mat_scale(sx_ndc, sy_ndc))
