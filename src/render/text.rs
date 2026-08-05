@@ -565,6 +565,10 @@ pub(crate) fn push_text<'a>(
                 TextAnchor::TopRightEdge => 1.0 - (MARGIN + sy * 0.5) * 2.0 / window[1],
                 _ => -1.0 + (MARGIN + sy * 0.5) * 2.0 / window[1],
             };
+            // 尺寸换算:px → NDC(否则 sx 被当成 NDC 单位 = 全屏宽倍数,
+            // 文本巨大到超出窗口)。
+            let sx = sx * 2.0 / window[0];
+            let sy = sy * 2.0 / window[1];
             mat_mul(&mat_translate(cx, cy), &mat_scale(sx, sy))
         } else {
             mat_mul(
