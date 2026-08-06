@@ -688,19 +688,24 @@ impl PostPipe {
         }
     }
 
-    /// 预热当前谱目录下的全部自定义 WGSL shader(切谱加载完成时调用,
+    /// 预热当前谱目录下的全部自定义 shader(切谱加载完成时调用,
     /// 一次性编译——运行中首次使用某个自定义特效不再阻塞卡帧)。
+    /// 覆盖 .wgsl(WGSL 特效)与 .glsl/.frag(GLSL 特效)。
     pub fn warmup_custom(&mut self, device: &wgpu::Device) {
         let Some(ref chart_dir) = self.chart_dir else { return };
         let Ok(entries) = std::fs::read_dir(chart_dir) else { return };
         for entry in entries.flatten() {
             let p = entry.path();
-            if p.extension().is_some_and(|e| e == "wgsl") {
+            let is_shader = p.extension().is_some_and(|e| {
+                let e = e.to_string_lossy();
+                e == "wgsl" || e == "glsl" || e == "frag"
+            });
+            if is_shader {
                 let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 if self.pipelines.contains_key(&name) {
                     continue;
                 }
-                let wgsl = match std::fs::read_to_string(&p) {
+                let src = match std::fs::read_to_string(&p) {
                     Ok(w) => w,
                     Err(e) => {
                         eprintln!("warning: custom effect {name}: cannot read {}: {e}", p.display());
@@ -708,7 +713,7 @@ impl PostPipe {
                         continue;
                     }
                 };
-                let pipe = self.build_eff_pipe(device, &name, &wgsl);
+                let pipe = self.build_eff_pipe(device, &name, &src);
                 match pipe {
                     Some(pipe) => {
                         self.pipelines.insert(name.clone(), pipe);
