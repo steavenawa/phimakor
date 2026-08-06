@@ -1399,8 +1399,13 @@ impl Chart {
         }
         // Position: root-first composition (same as state_at)。
         let mut acc = [self.lines[line_idx].move_x.now(), self.lines[line_idx].move_y.now()];
-        // chain = [self, parent, ..., root];rev 后跳过 self → root first。
-        for &pidx in chain.iter().rev().skip(1) {
+        // chain = [self, parent, ..., root];rev 后 = [root, ..., parent, self]。
+        // 从 root 到 parent 组合,**跳过 self**(否则用自己的 own 组合自己,
+        // 父线平移/旋转全部丢失——父线有 move 事件时 fx 落在未组合坐标)。
+        for &pidx in chain.iter().rev() {
+            if pidx == line_idx {
+                continue;
+            }
             let ci = chain.iter().position(|&c| c == pidx).unwrap();
             let pr = rot_resolved[ci];
             let (cos, sin) = (pr.cos(), pr.sin());
@@ -1466,6 +1471,11 @@ impl Chart {
 
     /// Number of judge lines.
     pub fn line_count(&self) -> usize { self.lines.len() }
+
+    /// 线的父线索引(诊断用)。
+    pub fn line_parent(&self, idx: usize) -> Option<usize> {
+        self.lines.get(idx).and_then(|l| l.parent)
+    }
 
     /// Convert seconds to beats at the current playback position.
     pub fn time_to_beat(&mut self, time: f64) -> f64 {
@@ -2203,8 +2213,9 @@ previewStart: 12
 
     #[test]
     fn line_pose_at_with_parent_chain_matches_state_at() {
-        // 双线父链:line0 旋转 0°→90°,line1 挂到 line0(father=0)+ rotateWithFather,
-        // 自身不动。子线位姿应随父线旋转继承 + 位置继承。
+        // 双线父链:line0 旋转 0°→90° 且平移 (0,0)→(0.5,-0.5)(父线有 move
+        // 事件——曾漏组合父平移,子线位姿停在未组合坐标),line1 挂到 line0
+        // (father=0) + rotateWithFather。子线位姿应随父线旋转/平移继承。
         let src = r#"{
             "META": { "offset": 0, "RPEVersion": 160 },
             "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
@@ -2212,7 +2223,11 @@ previewStart: 12
                 {
                     "Name": "parent", "Texture": "line.png", "father": -1, "rotateWithFather": false,
                     "eventLayers": [
-                        { "rotateEvents": [ { "start": 0.0, "end": 90.0, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 } ] },
+                        {
+                            "moveXEvents": [ { "start": 0.0, "end": 0.5, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 } ],
+                            "moveYEvents": [ { "start": 0.0, "end": -0.5, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 } ],
+                            "rotateEvents": [ { "start": 0.0, "end": 90.0, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 } ]
+                        },
                         null
                     ],
                     "isCover": 0, "notes": []
@@ -2225,7 +2240,8 @@ previewStart: 12
             ]
         }"#;
         let mut chart = Chart::from_rpe(&src, false).unwrap();
-        // 0.5s:父线旋转到 22.5°。子线解析旋转 = 自身(0) + 父(22.5°),位置 = 父位(0) + R(父旋转)×子偏移(0)。
+        // 0.5s:父线旋转到 22.5° 且平移 (0.125,-0.125)。
+        // 子线解析旋转 = 自身(0) + 父(22.5°),位置 = 父位 + R(父旋转)×子偏移(0)。
         for t in [0.0, 0.5, 1.0, 2.0] {
             let (fpos, frot) = {
                 let frame = chart.state_at(t);
