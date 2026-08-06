@@ -1105,6 +1105,7 @@ mod tests {
             priority: 0,
             uniform_values: vals.to_vec(),
             uniform_count: vals.len(),
+            uniforms_names: Vec::new(),
         }
     }
 
@@ -1125,6 +1126,7 @@ mod tests {
             priority: 0,
             uniform_values: vec![0.0],
             uniform_count: 1,
+            uniforms_names: Vec::new(),
         };
         assert!(!is_effect_noop(&custom));
     }
@@ -1181,7 +1183,7 @@ void main() {
 ";
         let (converted, count, layout) = glsl_for_glslang(with_tex);
         assert_eq!(count, 1); // 单 uniform block
-        assert_eq!(layout, vec![(0, 4), (4, 4)]); // std140:time@0, power@4
+        assert_eq!(layout, vec![("time".to_string(), 0, 4, None), ("power".to_string(), 4, 4, None)]); // std140:time@0, power@4
         assert!(converted.contains("layout(binding = 0) uniform texture2D u_tex"));
         assert!(converted.contains("layout(binding = 1) uniform sampler u_tex_smp"));
         assert!(converted.contains("layout(binding = 2) uniform Params"));
