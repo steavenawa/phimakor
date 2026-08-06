@@ -1376,6 +1376,8 @@ impl Chart {
             line.rotation.set_time(time);
             line.scale_x.set_time(time);
             line.scale_y.set_time(time);
+            line.ctrl_size_x.set_time(time);
+            line.ctrl_size_y.set_time(time);
         }
         // 每个链成员的解析旋转:自身 + 父链累加(逐级检查当前节点自己的
         // rot_with_parent,与 state_at/phira fetch_rot 一致)。祖先都在 chain 内。
@@ -1410,9 +1412,13 @@ impl Chart {
             acc[0] = self.lines[pidx].move_x.now() + cos * lx - sin * ly;
             acc[1] = self.lines[pidx].move_y.now() + sin * lx + cos * ly;
         }
+        // 有效缩放 = line.scale × CtrlObject sizeControl(与渲染的
+        // mat_scale(scale × ctrl_size)一致——判定线伸缩时 fx 落点同步)。
         let scale = [
-            self.lines[line_idx].scale_x.now_opt().unwrap_or(1.0),
-            self.lines[line_idx].scale_y.now_opt().unwrap_or(1.0),
+            self.lines[line_idx].scale_x.now_opt().unwrap_or(1.0)
+                * self.lines[line_idx].ctrl_size_x.now_opt().unwrap_or(1.0),
+            self.lines[line_idx].scale_y.now_opt().unwrap_or(1.0)
+                * self.lines[line_idx].ctrl_size_y.now_opt().unwrap_or(1.0),
         ];
         (acc, rot_resolved[0], scale)
     }
