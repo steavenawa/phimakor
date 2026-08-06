@@ -842,7 +842,9 @@ impl Renderer {
             Self::create_texture(&self.device, &self.queue, &data, nw, nh)
         };
         let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
-        (bind_group, [nw as f32, nh as f32])
+        // 渲染语义尺寸 = 原始像素尺寸(纹理线宽 = 像素 × 系数,降采样是
+        // 性能优化,不应改变视觉——否则大线纹理降采样后判定线变窄)。
+        (bind_group, [w as f32, h as f32])
     }
 
     fn create_texture(
