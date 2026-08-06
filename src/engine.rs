@@ -105,6 +105,8 @@ impl ChartSession {
         self.chart = Some(chart);
         self.info = Some(info);
         self.chart_dir = Some(dir.to_path_buf());
+        // 自定义 GLSL 特效:engine 的渲染器需要谱目录才能加载 shader 文件。
+        self.engine.set_chart_dir(dir.to_path_buf());
         Ok(())
     }
 

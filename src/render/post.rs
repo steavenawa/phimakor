@@ -524,7 +524,7 @@ impl PostPipe {
                 return None;
             }
         };
-        // GLSL 调试:打印转换后源 + uniform 布局。
+        // GLSL 调试:打印 uniform 布局与转换后源。
         if std::env::var("PHIMAKOR_GLSL_DEBUG").is_ok() {
             eprintln!("[glsl] {name} uniform_layout:");
             for (n, off, sz, _def) in &uniform_layout {
@@ -975,7 +975,12 @@ impl PostPipe {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    // GLSL 调试:LoadOp 清成品红验证链/输出。
+                    load: if std::env::var("PHIMAKOR_GLSL_DEBUG").is_ok() && ep.glsl {
+                        wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 })
+                    } else {
+                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
+                    },
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -989,6 +994,9 @@ impl PostPipe {
             pass.set_bind_group(1, ubg, &[]);
         }
         pass.draw(0..3, 0..1);
+        if std::env::var("PHIMAKOR_GLSL_DEBUG").is_ok() && ep.glsl {
+            eprintln!("[glsl] {key}: pass drawn (glsl pipeline)");
+        }
         true
     }
 

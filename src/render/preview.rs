@@ -224,6 +224,11 @@ impl PreviewEngine {
         self.renderer.load_texture(name, bytes)
     }
 
+    /// Set the chart directory (custom GLSL effect shader files live here).
+    pub fn set_chart_dir(&mut self, dir: std::path::PathBuf) {
+        self.renderer.post.chart_dir = Some(dir);
+    }
+
     /// Switch playfield canvas aspect ratio (delegates to [`Renderer::set_playfield_aspect`]).
     pub fn set_playfield_aspect(&mut self, aspect: f32) {
         self.renderer.set_playfield_aspect(aspect);

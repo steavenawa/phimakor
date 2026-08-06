@@ -1549,6 +1549,9 @@ impl State {
         let t_panel = std::time::Instant::now();
         // 应用 FX 链(已在上方构建,PMCORE-64)。
         self.renderer.post.active.clear();
+        // 自定义 GLSL 特效的 time/u_time 注入(编辑器路径不经
+        // set_effects_from_extra,必须显式传当前谱面时间)。
+        self.renderer.post.chart_time = chart_time as f32;
         if let Some(chain) = &fx_chain {
             self.renderer.post.active.extend(chain.iter().cloned());
         }
