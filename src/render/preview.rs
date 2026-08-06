@@ -268,6 +268,8 @@ impl PreviewEngine {
     pub fn set_effects_from_extra(&mut self, extra: &crate::core::extra::ExtraRoot, chart_beat: f64, chart_time: f32) {
         use crate::render::shaders::EFFECTS;
         use crate::render::post::ActiveEffect;
+        // 自定义 GLSL 特效的 time/u_time 自动注入用。
+        self.renderer.post.chart_time = chart_time;
         self.renderer.post.active.clear();
         let evals = crate::core::extra::evaluate_effects(extra, chart_beat);
         let size = self.renderer.size();

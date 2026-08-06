@@ -41,8 +41,9 @@ fn std140_layout(ty: &str) -> (u32, u32) {
 /// - 其余 uniform 变量合并进 `layout(binding=2) uniform Params { ... };`
 ///   (Vulkan 禁止 block 外非 opaque uniform),按 std140 计算 offsets
 /// - `gl_FragColor` → 注入的 `fragColor_out`(450 已移除内置,补 out 声明)
-/// 返回 (转换后的源, uniform buffer 数(0 或 1), 变量 (名字, std140 offset, size))。
-fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32)>) {
+/// 返回 (转换后的源, uniform buffer 数(0 或 1), 变量 (名字, std140
+/// offset, size, 注释 %默认值%))。
+fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32, Option<f32>)>) {
     let re_tex_call = regex::Regex::new(r"texture2D\(\s*([A-Za-z_]\w*)\s*,").unwrap();
     let re_sampler = regex::Regex::new(
         r"uniform\s+(sampler2D|sampler3D|samplerCube|sampler2DArray|samplerCubeArray)\s+(\w+)\s*;",
@@ -50,12 +51,17 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32)>) {
     .unwrap();
     let re_uniform_var =
         regex::Regex::new(r"uniform\s+(float|int|uint|bool|vec[234]|ivec[234]|uvec[234]|bvec[234]|mat[234])\s+(\w+)\s*;").unwrap();
+    let re_default = regex::Regex::new(r"%\s*([-0-9.]+)\s*%").unwrap();
     // 第一遍:收集非 sampler uniform 变量(声明顺序 = uniform_values 顺序)。
-    let mut vars: Vec<(String, String)> = Vec::new();
+    let mut vars: Vec<(String, String, Option<f32>)> = Vec::new();
     for line in src.lines() {
         let t = line.trim_start();
         if let Some(caps) = re_uniform_var.captures(t) {
-            vars.push((caps[2].to_string(), caps[1].to_string()));
+            // RPE 默认值语法:`uniform float power; // %0.2%`
+            let default = re_default
+                .captures(t)
+                .and_then(|d| d[1].parse::<f32>().ok());
+            vars.push((caps[2].to_string(), caps[1].to_string(), default));
         }
     }
     // 第二遍:生成。
@@ -114,13 +120,13 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32)>) {
         out.insert_str(ver.len(), "layout(location = 0) out vec4 fragColor_out;\n");
     }
     // uniform block(std140):Vulkan 禁止 block 外非 opaque uniform。
-    let mut layout: Vec<(String, u32, u32)> = Vec::with_capacity(vars.len());
+    let mut layout: Vec<(String, u32, u32, Option<f32>)> = Vec::with_capacity(vars.len());
     let mut block = String::new();
     let mut cursor = 0u32;
-    for (name, ty) in &vars {
+    for (name, ty, default) in &vars {
         let (align, size) = std140_layout(ty);
         cursor = (cursor + align - 1) & !(align - 1);
-        layout.push((name.clone(), cursor, size));
+        layout.push((name.clone(), cursor, size, *default));
         block.push_str(&format!("    {ty} {name};\n"));
         cursor += size;
     }
@@ -191,6 +197,8 @@ pub struct PostPipe {
     /// 半分辨率特效降采样开关(设置里可关)。关闭时所有特效全分辨率跑,
     /// 用于排查特效质量问题(如尺寸参数型特效在 half 下变味)。
     pub half_res_enabled: bool,
+    /// 当前谱面时间(自定义 GLSL 特效的 time/u_time 自动注入用)。
+    pub chart_time: f32,
 
     /// 预热队列:启动/切谱时预编译内置特效 pipeline,消除"特效首次出现
     /// 时编译卡顿"(ensure_effect 是惰性的,第一次用某个特效会卡一帧)。
@@ -235,8 +243,9 @@ struct EffPipe {
     /// GLSL 源(自定义 GLSL 特效):单 bind group(tex+sampler+uniforms),
     /// 与 WGSL 路径的 bind group 构建不同。
     glsl: bool,
-    /// GLSL 路径:uniform block 内各变量的 (名字, std140 offset, size)。
-    uniform_layout: Vec<(String, u32, u32)>,
+    /// GLSL 路径:uniform block 内各变量的 (名字, std140 offset, size,
+    /// 注释 %默认值%)。
+    uniform_layout: Vec<(String, u32, u32, Option<f32>)>,
 }
 
 impl PostPipe {
@@ -345,7 +354,7 @@ impl PostPipe {
             half_res_enabled: true,
             warmup_pending: Vec::new(),
             failed_custom: HashSet::new(),
-            width: 0, height: 0, tex_format: tex_fmt,
+            width: 0, height: 0, tex_format: tex_fmt, chart_time: 0.0,
         };
         pipe.resize(device, width, height);
         pipe
@@ -515,6 +524,15 @@ impl PostPipe {
                 return None;
             }
         };
+        // GLSL 调试:打印转换后源 + uniform 布局。
+        if std::env::var("PHIMAKOR_GLSL_DEBUG").is_ok() {
+            eprintln!("[glsl] {name} uniform_layout:");
+            for (n, off, sz, _def) in &uniform_layout {
+                eprintln!("  {n}: offset={off} size={sz}");
+            }
+            let (src, _, _) = glsl_for_glslang(body);
+            eprintln!("[glsl] {name} converted source:\n{src}");
+        }
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("vs-{name}")),
@@ -831,6 +849,8 @@ impl PostPipe {
         src_tag: SrcTag,
     ) -> bool {
         let Some(ep) = self.pipelines.get_mut(key) else { return false };
+        // 提前拷贝(chart_time 与 ep 的借用分离)。
+        let chart_time = self.chart_time;
         // Write uniform buffer (256 bytes, stack array — no per-frame alloc)
         let mut uniform_data = [0u8; 256];
         for (i, &val) in uv.iter().enumerate() {
@@ -840,19 +860,36 @@ impl PostPipe {
             }
         }
         if ep.glsl {
-            // GLSL 路径:uniform block 按变量名匹配写入(extra.json 的
-            // uniform 顺序来自 HashMap,与 shader 声明顺序不一致)。
-            for (i, val) in uv.iter().enumerate() {
-                let Some(name) = uniform_names.get(i) else { continue };
-                let Some(&(_, off, size)) = ep.uniform_layout.iter().find(|(n, _, _)| n == name) else {
-                    continue;
-                };
-                let n = (size as usize).min(4).max(1);
+            // GLSL 路径:按变量名匹配写入,优先级:
+            //   1. 面板/extra 传入值
+            //   2. time/u_time → 当前谱面时间(动画)
+            //   3. 声明注释 %默认值%
+            //   4. 跳过(保持 0)
+            let mut matched = 0usize;
+            for (name, off, size, default) in &ep.uniform_layout {
+                let val = uniform_names
+                    .iter()
+                    .position(|n| n == name)
+                    .and_then(|i| uv.get(i).copied())
+                    .or_else(|| {
+                        if name == "time" || name == "u_time" {
+                            Some(chart_time)
+                        } else {
+                            *default
+                        }
+                    });
+                let Some(val) = val else { continue };
+                matched += 1;
+                let n = (*size as usize).min(4).max(1);
                 let mut v = [0u8; 16];
-                if i * 4 + n <= uniform_data.len() {
-                    v[..n].copy_from_slice(&uniform_data[i * 4..i * 4 + n]);
-                }
-                queue.write_buffer(&ep.uniform_bufs[0], off as u64, &v[..n]);
+                v[..n].copy_from_slice(&val.to_le_bytes()[..n]);
+                queue.write_buffer(&ep.uniform_bufs[0], *off as u64, &v[..n]);
+            }
+            if std::env::var("PHIMAKOR_GLSL_DEBUG").is_ok() {
+                eprintln!(
+                    "[glsl] {key}: wrote {matched}/{} uniforms, values {:?}, names {:?}",
+                    ep.uniform_layout.len(), uv, uniform_names
+                );
             }
         } else {
             queue.write_buffer(&ep.uniform_bufs[0], 0, &uniform_data);
