@@ -1102,8 +1102,6 @@ impl Chart {
             // [E] CtrlObject evaluation
             line.ctrl_pos_x.set_time(time);
             line.ctrl_pos_y.set_time(time);
-            line.ctrl_size_x.set_time(time);
-            line.ctrl_size_y.set_time(time);
             line.ctrl_alpha.set_time(time);
             line.ctrl_y.set_time(time);
             line.incline.set_time(time);
@@ -1355,7 +1353,7 @@ impl Chart {
     ///
     /// 幂等:只对事件轨道 set_time(无游标副作用),不会扰动 notes 可见性
     /// 游标或 fired 状态,可安全插在任何 state_at 调用之间。
-    pub fn line_pose_at(&mut self, line_idx: usize, time: f64) -> ([f32; 2], f32, [f32; 2]) {
+    pub fn line_pose_at(&mut self, line_idx: usize, time: f64) -> ([f32; 2], f32) {
         // 只 set_time 目标线 + 其父链(位姿组合只依赖这些线),其余线不动。
         // 密集谱面每帧多次调用时这是数量级差异(全量 set_time → 定向)。
         let mut chain: Vec<usize> = vec![line_idx];
@@ -1376,8 +1374,6 @@ impl Chart {
             line.rotation.set_time(time);
             line.scale_x.set_time(time);
             line.scale_y.set_time(time);
-            line.ctrl_size_x.set_time(time);
-            line.ctrl_size_y.set_time(time);
         }
         // 每个链成员的解析旋转:自身 + 父链累加(逐级检查当前节点自己的
         // rot_with_parent,与 state_at/phira fetch_rot 一致)。祖先都在 chain 内。
@@ -1412,15 +1408,7 @@ impl Chart {
             acc[0] = self.lines[pidx].move_x.now() + cos * lx - sin * ly;
             acc[1] = self.lines[pidx].move_y.now() + sin * lx + cos * ly;
         }
-        // 有效缩放 = line.scale × CtrlObject sizeControl(与渲染的
-        // mat_scale(scale × ctrl_size)一致——判定线伸缩时 fx 落点同步)。
-        let scale = [
-            self.lines[line_idx].scale_x.now_opt().unwrap_or(1.0)
-                * self.lines[line_idx].ctrl_size_x.now_opt().unwrap_or(1.0),
-            self.lines[line_idx].scale_y.now_opt().unwrap_or(1.0)
-                * self.lines[line_idx].ctrl_size_y.now_opt().unwrap_or(1.0),
-        ];
-        (acc, rot_resolved[0], scale)
+(acc, rot_resolved[0])
     }
 
     /// Total chart duration in seconds.
@@ -2195,15 +2183,14 @@ previewStart: 12
                 let frame = chart.state_at(t);
                 (frame.lines[0].position, frame.lines[0].rotation)
             };
-            let (pos, rot, scale) = chart.line_pose_at(0, t);
+            let (pos, rot) = chart.line_pose_at(0, t);
             assert!((pos[0] - fpos[0]).abs() < 1e-3, "t={t} px");
             assert!((pos[1] - fpos[1]).abs() < 1e-3, "t={t} py");
             assert!((rot - frot).abs() < 1e-3, "t={t} rot");
-            assert!((scale[0] - 1.0).abs() < 1e-3, "t={t} scale_x");
         }
         // 时间不同位姿不同:移动线在 1s 与 3s 位置不应相同(moveX 值域 -1..1)。
-        let (p1, _, _) = chart.line_pose_at(0, 1.0);
-        let (p3, _, _) = chart.line_pose_at(0, 3.0);
+        let (p1, _) = chart.line_pose_at(0, 1.0);
+        let (p3, _) = chart.line_pose_at(0, 3.0);
         assert!((p1[0] - p3[0]).abs() > 0.01, "线位姿应随时间移动: {p1:?} vs {p3:?}");
         // 幂等:line_pose_at 不扰动 state_at 的结果。
         let frame_a = chart.state_at(2.0);
@@ -2244,14 +2231,14 @@ previewStart: 12
                 let frame = chart.state_at(t);
                 (frame.lines[1].position, frame.lines[1].rotation)
             };
-            let (pos, rot, _) = chart.line_pose_at(1, t);
+            let (pos, rot) = chart.line_pose_at(1, t);
             assert!((pos[0] - fpos[0]).abs() < 1e-3, "t={t} px");
             assert!((pos[1] - fpos[1]).abs() < 1e-3, "t={t} py");
             assert!((rot - frot).abs() < 1e-3, "t={t} rot: {rot} vs {frot}");
         }
         // 2s 时父线旋转 90°:子线旋转应继承父线位姿的旋转(rot_with_parent)。
-        let (_, rot, _) = chart.line_pose_at(1, 2.0);
-        let (_, pro, _) = chart.line_pose_at(0, 2.0);
+        let (_, rot) = chart.line_pose_at(1, 2.0);
+        let (_, pro) = chart.line_pose_at(0, 2.0);
         assert!((rot - pro).abs() < 1e-3, "子线应继承父旋转: {}/{} rad", rot, pro);
         assert!(pro.to_degrees().abs() > 10.0, "父线在 2s 应有明显旋转: {}°", pro.to_degrees());
     }

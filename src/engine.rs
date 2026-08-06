@@ -127,7 +127,7 @@ impl ChartSession {
         // state_at (which mutably borrows chart; the frame borrows it too).
         let triggers = chart.fx_in_window(chart_time - 0.5, chart_time);
         // 预计算触发瞬间 t0 的线位姿:hit-fx 不绑定当前帧线状态。
-        let poses: Vec<([f32; 2], f32, [f32; 2])> = triggers.iter()
+        let poses: Vec<([f32; 2], f32)> = triggers.iter()
             .map(|tr| chart.line_pose_at(tr.line, tr.t0))
             .collect();
         let frame = chart.state_at(chart_time);
@@ -137,14 +137,12 @@ impl ChartSession {
             fake: f.fake, tick: f.tick, hold_tail: f.hold_tail,
         }));
         // Convert trigger points to canvas positions via t0 line transforms.
-        // 与 main.rs 同公式(对齐 note 渲染坐标系):
-        //   x_canvas = tr.x(±1) × 675 × scale_x
-        //   cy = pos[1]×450×ev_y + sin(rot)×x_canvas(ev_y = 1.5/aspect)
+        // 与 main.rs 同公式:note 偏移不乘 scale(渲染 note_m 只含平移+旋转)。
         {
             let ev_y = 1.5 / (self.width as f32 / self.height.max(1) as f32) as f64;
-            let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().zip(poses).map(|(tr, (pos, rot, scale))| {
+            let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().zip(poses).map(|(tr, (pos, rot))| {
                 let rot = rot as f64;
-                let x = tr.x as f64 * 675.0 * scale[0] as f64;
+                let x = tr.x as f64 * 675.0;
                 let cx = pos[0] as f64 * 675.0 + rot.cos() * x;
                 let cy = pos[1] as f64 * 450.0 * ev_y + rot.sin() * x;
                 (tr.t0, [cx as f32, cy as f32])
