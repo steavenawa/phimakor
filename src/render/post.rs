@@ -524,15 +524,6 @@ impl PostPipe {
                 return None;
             }
         };
-        // GLSL 调试:打印 uniform 布局与转换后源。
-        if std::env::var("PHIMAKOR_GLSL_DEBUG").is_ok() {
-            eprintln!("[glsl] {name} uniform_layout:");
-            for (n, off, sz, _def) in &uniform_layout {
-                eprintln!("  {n}: offset={off} size={sz}");
-            }
-            let (src, _, _) = glsl_for_glslang(body);
-            eprintln!("[glsl] {name} converted source:\n{src}");
-        }
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let vs = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some(&format!("vs-{name}")),
@@ -870,7 +861,6 @@ impl PostPipe {
             //   2. time/u_time → 当前谱面时间(动画)
             //   3. 声明注释 %默认值%
             //   4. 跳过(保持 0)
-            let mut matched = 0usize;
             for (name, off, size, default) in &ep.uniform_layout {
                 let val = uniform_names
                     .iter()
@@ -884,17 +874,10 @@ impl PostPipe {
                         }
                     });
                 let Some(val) = val else { continue };
-                matched += 1;
                 let n = (*size as usize).min(4).max(1);
                 let mut v = [0u8; 16];
                 v[..n].copy_from_slice(&val.to_le_bytes()[..n]);
                 queue.write_buffer(&ep.uniform_bufs[0], *off as u64, &v[..n]);
-            }
-            if std::env::var("PHIMAKOR_GLSL_DEBUG").is_ok() {
-                eprintln!(
-                    "[glsl] {key}: wrote {matched}/{} uniforms, values {:?}, names {:?}",
-                    ep.uniform_layout.len(), uv, uniform_names
-                );
             }
         } else {
             queue.write_buffer(&ep.uniform_bufs[0], 0, &uniform_data);
@@ -980,12 +963,7 @@ impl PostPipe {
                 depth_slice: None,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    // GLSL 调试:LoadOp 清成品红验证链/输出。
-                    load: if std::env::var("PHIMAKOR_GLSL_DEBUG").is_ok() && ep.glsl {
-                        wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 0.0, b: 1.0, a: 1.0 })
-                    } else {
-                        wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
-                    },
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -999,9 +977,6 @@ impl PostPipe {
             pass.set_bind_group(1, ubg, &[]);
         }
         pass.draw(0..3, 0..1);
-        if std::env::var("PHIMAKOR_GLSL_DEBUG").is_ok() && ep.glsl {
-            eprintln!("[glsl] {key}: pass drawn (glsl pipeline)");
-        }
         true
     }
 

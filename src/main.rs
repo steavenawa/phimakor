@@ -1282,8 +1282,8 @@ impl State {
         let fx_triggers = self.chart.fx_in_window(chart_time - 0.5, chart_time);
         // 预计算每个触发点在 **t0 时刻** 的线位姿:hit-fx 不绑定当前帧线状态,
         // 线之后移动/旋转时已爆散的粒子留在触发瞬间的位置。
-        let fx_poses: Vec<(([f32; 2], f32), Option<usize>)> = fx_triggers.iter()
-            .map(|tr| (self.chart.line_pose_at(tr.line, tr.t0), self.chart.line_parent(tr.line)))
+        let fx_poses: Vec<([f32; 2], f32)> = fx_triggers.iter()
+            .map(|tr| self.chart.line_pose_at(tr.line, tr.t0))
             .collect();
         let frame = self.chart.state_at(chart_time);
 
@@ -1583,20 +1583,11 @@ impl State {
             //   cx = pos[0]×675 + cos(rot)×x_canvas
             //   cy = pos[1]×450×ev_y + sin(rot)×x_canvas
             let ev_y = 1.5 / (size.width as f32 / size.height.max(1) as f32) as f64;
-            let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().zip(fx_poses).map(|(tr, ((pos, rot), parent))| {
+            let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().zip(fx_poses).map(|(tr, (pos, rot))| {
                 let rot = rot as f64;
                 let x = tr.x as f64 * 675.0;
                 let cx = pos[0] as f64 * 675.0 + rot.cos() * x;
                 let cy = pos[1] as f64 * 450.0 * ev_y + rot.sin() * x;
-                if std::env::var("PHIMAKOR_FX_DEBUG").is_ok() {
-                    let cur = &frame.lines[tr.line];
-                    eprintln!(
-                        "[fx] line={} x={:.3} t0={:.2} pose=({:.3},{:.3}) rot={:.2}deg | cur=({:.3},{:.3}) cur_rot={:.2}deg parent={:?}",
-                        tr.line, tr.x, tr.t0, pos[0], pos[1], rot.to_degrees(),
-                        cur.position[0], cur.position[1], cur.rotation.to_degrees(),
-                        parent,
-                    );
-                }
                 (tr.t0, [cx as f32, cy as f32])
             }).collect();
             self.renderer.set_frame_fx(fx);

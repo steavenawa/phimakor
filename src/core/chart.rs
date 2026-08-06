@@ -1472,11 +1472,6 @@ impl Chart {
     /// Number of judge lines.
     pub fn line_count(&self) -> usize { self.lines.len() }
 
-    /// 线的父线索引(诊断用)。
-    pub fn line_parent(&self, idx: usize) -> Option<usize> {
-        self.lines.get(idx).and_then(|l| l.parent)
-    }
-
     /// Convert seconds to beats at the current playback position.
     pub fn time_to_beat(&mut self, time: f64) -> f64 {
         self.bpm_list.beat(time)
