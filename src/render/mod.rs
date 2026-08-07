@@ -33,7 +33,8 @@ mod text;
 pub use text::TextAnchor;
 
 /// Playfield aspect ratio (w/h). 3:2 = native RPE canvas (1350×900).
-const ASPECT: f32 = 3.0 / 2.0;
+/// pub:fx 位置计算(main.rs/engine.rs)必须用同一常量,不能用窗口比例。
+pub const ASPECT: f32 = 3.0 / 2.0;
 
 // Contract render-semantics constants, in RPE CANVAS pixels (1350×900).
 const CANVAS_W: f32 = 675.0; // world x ±1 ↔ ±675 canvas px

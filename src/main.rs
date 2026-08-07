@@ -2564,7 +2564,9 @@ impl State {
             //   渲染 note_m 只含平移+旋转,明确 NOT its scale)
             //   cx = pos[0]×675 + cos(rot)×x_canvas
             //   cy = pos[1]×450×ev_y + sin(rot)×x_canvas
-            let ev_y = 1.5 / (size.width as f32 / size.height.max(1) as f32) as f64;
+            // ev_y 必须用判定区比例(render::ASPECT=3:2,letterbox 后恒定),
+            // 不能用窗口比例——否则非 3:2 窗口 fx 的 y 比例与 note 错位。
+            let ev_y = 1.5 / render::ASPECT as f64;
             let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().zip(fx_poses).map(|(tr, (pos, rot))| {
                 let rot = rot as f64;
                 let x = tr.x as f64 * 675.0;

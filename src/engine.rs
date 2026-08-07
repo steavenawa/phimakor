@@ -138,7 +138,9 @@ impl ChartSession {
         // Convert trigger points to canvas positions via t0 line transforms.
         // 与 main.rs 同公式:note 偏移不乘 scale(渲染 note_m 只含平移+旋转)。
         {
-            let ev_y = 1.5 / (self.width as f32 / self.height.max(1) as f32) as f64;
+            // ev_y 用判定区比例(render::ASPECT=3:2),不用窗口比例——否则
+            // 非 3:2 窗口 fx 的 y 比例与 note 错位(与 main.rs 同修正)。
+            let ev_y = 1.5 / crate::render::ASPECT as f64;
             let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().zip(poses).map(|(tr, (pos, rot))| {
                 let rot = rot as f64;
                 let x = tr.x as f64 * 675.0;
