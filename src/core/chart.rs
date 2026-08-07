@@ -1538,7 +1538,8 @@ impl Chart {
             acc[0] = self.lines[pidx].move_x.now() + cos * lx - sin * ly;
             acc[1] = self.lines[pidx].move_y.now() + sin * lx + cos * ly;
         }
-(acc, rot_resolved[0])
+        let result = (acc, rot_resolved[0]);
+        result
     }
 
     /// 批量求多个 fx 触发点在各自 **t0 时刻** 的线位姿(PMCORE-79 聚合)。
@@ -1552,14 +1553,21 @@ impl Chart {
     pub fn fx_poses(&mut self, triggers: &[FxTrigger]) -> Vec<([f32; 2], f32)> {
         // ponytail: 线性扫键去重(键数 ≤ 窗口内触发点数),无需 f64 位哈希;
         // 单帧触发点上万时才值得换 HashMap,真到那天再换。
-        let mut keys: Vec<(usize, f64)> = Vec::new();
+        // [fix] 缓存必须按 (line, t0 位模式) 显式存 pose——旧实现用
+        // keys/poses 双 Vec 同序推进,真实谱面(密集窗口)下命中索引与
+        // pose 错位,同 t0 的第二个触发点拿到别的位姿(fx 瞬跳,用户
+        // 在 QuomodocunquizE 复现)。
+        let mut cache: std::collections::HashMap<(usize, u64), ([f32; 2], f32)> =
+            std::collections::HashMap::with_capacity(triggers.len());
         let mut poses: Vec<([f32; 2], f32)> = Vec::with_capacity(triggers.len());
         for tr in triggers {
-            match keys.iter().position(|&k| k == (tr.line, tr.t0)) {
-                Some(i) => poses.push(poses[i]),
+            let key = (tr.line, tr.t0.to_bits());
+            match cache.get(&key) {
+                Some(&p) => poses.push(p),
                 None => {
-                    keys.push((tr.line, tr.t0));
-                    poses.push(self.line_pose_at(tr.line, tr.t0));
+                    let p = self.line_pose_at(tr.line, tr.t0);
+                    cache.insert(key, p);
+                    poses.push(p);
                 }
             }
         }
@@ -2842,6 +2850,48 @@ previewStart: 12
         assert!((poses[0].0[0] - fpos[0]).abs() < 1e-3);
         assert!((poses[0].0[1] - fpos[1]).abs() < 1e-3);
         assert!((poses[0].1 - frot).abs() < 1e-3);
+    }
+
+    #[test]
+    fn fx_poses_stable_across_frames_on_real_chart() {
+        // 回归(QuomodocunquizE 用户实测 fx 瞬跳):细步进全程播放,同一
+        // (line, t0) 的 fx 位姿必须逐位一致。修复前旧去重缓存(keys/poses
+        // 双 Vec 同序)在密集窗口下命中索引错位,31,705/149,191 漂移;
+        // HashMap 按 (line, t0 位模式) 缓存后为 0。
+        let root = std::env::var("PHIMAKOR_CHARTS_DIR")
+            .unwrap_or_else(|_| "D:/DOCU/PhiMakor/charts".to_string());
+        let dir = std::path::Path::new(&root).join("QuomodocunquizE");
+        if !dir.exists() {
+            eprintln!("skip: {:?} not found", dir);
+            return;
+        }
+        let (_info, mut chart) = Chart::load(&dir).unwrap();
+        let mut seen: std::collections::HashMap<(usize, u64), ([f32; 2], f32)> = std::collections::HashMap::new();
+        let mut t = 0.0f64;
+        let mut drifted = 0usize;
+        while t <= chart.duration() + 1.0 {
+            chart.state_at(t);
+            let trigs = chart.fx_in_window(t - 0.5, t);
+            if !trigs.is_empty() {
+                let poses = chart.fx_poses(&trigs);
+                for (tr, p) in trigs.iter().zip(poses.iter()) {
+                    let key = (tr.line, tr.t0.to_bits());
+                    if let Some(prev) = seen.get(&key) {
+                        if prev != p {
+                            drifted += 1;
+                            if drifted <= 3 {
+                                eprintln!("DRIFT t={t:.4} line={} t0={:.9} prev=({:.6},{:.6} r{:.6}) now=({:.6},{:.6} r{:.6})",
+                                    tr.line, tr.t0, prev.0[0], prev.0[1], prev.1, p.0[0], p.0[1], p.1);
+                            }
+                        }
+                    } else {
+                        seen.insert(key, *p);
+                    }
+                }
+            }
+            t += 1.0 / 60.0;
+        }
+        assert_eq!(drifted, 0, "fx pose drifted for {drifted} (line,t0) keys");
     }
 
     #[test]
