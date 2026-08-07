@@ -1,5 +1,7 @@
 res*/
 /target/
+player-wasm/target/
+player-wasm/pkg/
 *.lock
 config.json
 dhat-heap.json
