@@ -108,7 +108,7 @@ impl MirrorServer {
                                     // 视为截断错误(浏览器 ERR_CONTENT_LENGTH_MISMATCH,
                                     // wasm 编译中止——用户实测)。
                                     s.conn.send_close_notify();
-                                    let _ = s.flush();
+                                    let _ = flush_nb(&mut s);
                                     return;
                                 }
                             }
@@ -305,7 +305,7 @@ fn handle_conn<T: Read + Write>(
                 };
                 let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
                 if write_all(stream, &head).is_ok() {
-                    let _ = stream.write_all(&bytes);
+                    let _ = write_all_nb(stream, &bytes);
                 }
                 return;
             }
@@ -331,9 +331,40 @@ fn handle_conn<T: Read + Write>(
     let _ = write_all(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
+/// 非阻塞语义下的全量写入(WouldBlock 轮询重试——TcpStream 被设为
+/// 非阻塞后,大块写入(wasm 1~2MB)会撞内核缓冲 WouldBlock,普通
+/// write_all 直接 Err → 响应截断(浏览器 ERR_CONTENT_LENGTH_MISMATCH,
+/// 用户实测 wasm 编译中止)。
+fn write_all_nb<T: Write>(stream: &mut T, mut buf: &[u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match stream.write(buf) {
+            Ok(0) => return Err(std::io::Error::new(ErrorKind::WriteZero, "write zero")),
+            Ok(n) => buf = &buf[n..],
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// flush 的 WouldBlock 重试版(TLS 内部缓冲刷 socket 同样可能 WouldBlock)。
+fn flush_nb<T: Write>(stream: &mut T) -> std::io::Result<()> {
+    loop {
+        match stream.flush() {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 fn write_all<T: Write>(stream: &mut T, s: &str) -> std::io::Result<()> {
-    stream.write_all(s.as_bytes())?;
-    stream.flush()
+    write_all_nb(stream, s.as_bytes())?;
+    flush_nb(stream)
 }
 
 fn read_http_body<T: Read>(stream: &mut T, head_buf: &[u8], get: &dyn Fn(&str) -> Option<String>) -> Vec<u8> {
@@ -422,7 +453,7 @@ fn serve_music<T: Read + Write>(stream: &mut T, charts_dir: &Path, music_name: &
         match f.read(&mut chunk[..n]) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if stream.write_all(&chunk[..n]).is_err() {
+                if write_all_nb(stream, &chunk[..n]).is_err() {
                     break;
                 }
                 remaining -= n as u64;
@@ -458,8 +489,8 @@ fn ws_send_binary<T: Write>(stream: &mut T, payload: &[u8]) -> std::io::Result<(
         frame.extend_from_slice(&(len as u64).to_be_bytes());
     }
     frame.extend_from_slice(payload);
-    stream.write_all(&frame)?;
-    stream.flush()
+    write_all_nb(stream, &frame)?;
+    flush_nb(stream)
 }
 
 /// 非阻塞读满 `buf`(WouldBlock 轮询,`wait` 内超时)。返回是否读满。
