@@ -32,6 +32,10 @@ pub struct NewChartDlg {
     pub name: String,
     /// 创建失败提示(留在对话框显示,不崩溃)。
     pub err: Option<String>,
+    /// 可选音乐文件(None = 未选择,创建时跳过复制)。
+    pub music: Option<std::path::PathBuf>,
+    /// 可选封面图(None = 未选择)。
+    pub illustration: Option<std::path::PathBuf>,
 }
 
 /// What the splash cursor is currently over. Indexes are positions in the
@@ -51,6 +55,9 @@ pub enum SplashHover {
     NewInput,
     NewCreate,
     NewCancel,
+    /// PMCORE-36:对话框内音乐 / 封面浏览按钮。
+    NewMusic,
+    NewCover,
     Settings,
     // Settings page rows
     Vsync,
@@ -119,9 +126,13 @@ const SPLASH_HDR_BTN_H: f32 = 28.0;  // header buttons height
 
 // ── New Chart dialog (PMCORE-36) ──
 const NEW_DLG_W: f32 = 440.0;       // dialog width
-const NEW_DLG_H: f32 = 200.0;       // dialog height
+const NEW_DLG_H: f32 = 250.0;       // dialog height(输入框 + 音乐/封面行 + 按钮)
 const NEW_INPUT_H: f32 = 32.0;      // name input box height
 const NEW_BTN_H: f32 = 28.0;        // Create / Cancel buttons
+const NEW_ROW_H: f32 = 28.0;        // 音乐/封面行高(与按钮一致)
+const NEW_MUSIC_Y: f32 = 112.0;     // 音乐行 top(输入框下方 4px)
+const NEW_COVER_Y: f32 = 144.0;     // 封面行 top
+const NEW_BROWSE_W: f32 = 72.0;     // [浏览…] 按钮宽
 
 /// New Chart 对话框面板矩形(已乘 `s`)。垂直居中偏上。
 pub fn splash_new_dlg_rect(vw: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
@@ -135,6 +146,32 @@ pub fn splash_new_dlg_rect(vw: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
 pub fn splash_new_input_rect(vw: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
     let (dx, dy, dw, _) = splash_new_dlg_rect(vw, vh, s);
     (dx + 20.0 * s, dy + 76.0 * s, dw - 40.0 * s, NEW_INPUT_H * s)
+}
+
+/// 对话框内音乐行整行矩形(标签 + 文件名区域,已乘 `s`);绘制与命中共用。
+pub fn splash_new_music_rect(vw: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
+    let (dx, dy, dw, _) = splash_new_dlg_rect(vw, vh, s);
+    (dx + 20.0 * s, dy + NEW_MUSIC_Y * s, dw - 40.0 * s, NEW_ROW_H * s)
+}
+
+/// 音乐行右侧 [浏览…] 按钮矩形(已乘 `s`)。
+pub fn splash_new_music_btn_rect(vw: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
+    let (dx, _dy, dw, _) = splash_new_dlg_rect(vw, vh, s);
+    let (_, ry, _, rh) = splash_new_music_rect(vw, vh, s);
+    (dx + dw - 16.0 * s - NEW_BROWSE_W * s, ry, NEW_BROWSE_W * s, rh)
+}
+
+/// 对话框内封面行整行矩形(标签 + 文件名区域,已乘 `s`);绘制与命中共用。
+pub fn splash_new_cover_rect(vw: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
+    let (dx, dy, dw, _) = splash_new_dlg_rect(vw, vh, s);
+    (dx + 20.0 * s, dy + NEW_COVER_Y * s, dw - 40.0 * s, NEW_ROW_H * s)
+}
+
+/// 封面行右侧 [浏览…] 按钮矩形(已乘 `s`)。
+pub fn splash_new_cover_btn_rect(vw: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
+    let (dx, _dy, dw, _) = splash_new_dlg_rect(vw, vh, s);
+    let (_, ry, _, rh) = splash_new_cover_rect(vw, vh, s);
+    (dx + dw - 16.0 * s - NEW_BROWSE_W * s, ry, NEW_BROWSE_W * s, rh)
 }
 
 pub fn splash_detail_x(vw: f32, s: f32) -> f32 { vw - SPLASH_M * s - SPLASH_DETAIL_W * s }
@@ -182,11 +219,16 @@ pub fn splash_hit_test(mx: f32, my: f32, vw: f32, vh: f32, s: f32, filtered_len:
         return SplashHover::None;
     }
     if new_dlg {
-        // 对话框为模态:框外点击不落到任何目标,框内只认输入框与两个按钮。
+        // 对话框为模态:框外点击不落到任何目标,框内只认输入框、浏览按钮与两个按钮。
         let (dx, dy, dw, dh) = splash_new_dlg_rect(vw, vh, s);
         if mx < dx || mx > dx + dw || my < dy || my > dy + dh { return SplashHover::None; }
         let (ix, iy, iw, ih) = splash_new_input_rect(vw, vh, s);
         if mx >= ix && mx <= ix + iw && my >= iy && my <= iy + ih { return SplashHover::NewInput; }
+        // 音乐/封面行:整行为只读显示,仅 [浏览…] 按钮可命中(几何与绘制共用)。
+        let (bx, by, bw, bh) = splash_new_music_btn_rect(vw, vh, s);
+        if mx >= bx && mx <= bx + bw && my >= by && my <= by + bh { return SplashHover::NewMusic; }
+        let (bx, by, bw, bh) = splash_new_cover_btn_rect(vw, vh, s);
+        if mx >= bx && mx <= bx + bw && my >= by && my <= by + bh { return SplashHover::NewCover; }
         let btn_w = 100.0 * s;
         let by = dy + dh - 14.0 * s - NEW_BTN_H * s;
         let right = dx + dw - 16.0 * s;
@@ -426,9 +468,9 @@ fn draw_splash_btn(pm: &mut tiny_skia::PixmapMut, x: f32, y: f32, w: f32, h: f32
     }
 }
 
-/// PMCORE-36:新建谱面命名对话框(全屏遮罩 + 标题 + 输入框 + 错误提示 +
-/// Create/Cancel)。命中在 [`splash_hit_test`] 的 `new_dlg` 分支,几何共用
-/// [`splash_new_dlg_rect`] / [`splash_new_input_rect`]。
+/// PMCORE-36:新建谱面命名对话框(全屏遮罩 + 标题 + 输入框 + 音乐/封面行 +
+/// 错误提示 + Create/Cancel)。命中在 [`splash_hit_test`] 的 `new_dlg` 分支,几何共用
+/// [`splash_new_dlg_rect`] / [`splash_new_input_rect`] / [`splash_new_music_rect`] 等。
 fn draw_new_chart_dlg(pm: &mut tiny_skia::PixmapMut, dlg: &NewChartDlg, hover: SplashHover, vw: f32, vh: f32, s: f32) {
     let (dx, dy, dw, dh) = splash_new_dlg_rect(vw, vh, s);
     // 全屏遮罩
@@ -450,6 +492,11 @@ fn draw_new_chart_dlg(pm: &mut tiny_skia::PixmapMut, dlg: &NewChartDlg, hover: S
     if let Some(r) = tiny_skia::Rect::from_xywh(ix, iy, iw, ih) {
         fill_rect_clipped(pm, r, &ip);
     }
+    // 音乐/封面行 [浏览…] 按钮(与 Create/Cancel 同风格)。
+    let (mbx, mby, mbw, mbh) = splash_new_music_btn_rect(vw, vh, s);
+    draw_splash_btn(pm, mbx, mby, mbw, mbh, hover == SplashHover::NewMusic, "浏览…", 12.0, s);
+    let (cbx, cby, cbw, cbh) = splash_new_cover_btn_rect(vw, vh, s);
+    draw_splash_btn(pm, cbx, cby, cbw, cbh, hover == SplashHover::NewCover, "浏览…", 12.0, s);
     // 按钮行:Create(右)、Cancel(其左)。
     let btn_w = 100.0 * s;
     let by = dy + dh - 14.0 * s - NEW_BTN_H * s;
@@ -473,6 +520,27 @@ fn draw_new_chart_dlg(pm: &mut tiny_skia::PixmapMut, dlg: &NewChartDlg, hover: S
             let tw = text_width(&t, 13.0 * s);
             draw_text_on_pixmap(pm, "|", draw_x + tw + 2.0 * s, txt_y, 13.0 * s, font);
         }
+        // 音乐/封面行:标签 + 文件名(未选灰色"未选择",截断到浏览按钮前)
+        let (mrx, mry, _, mrh) = splash_new_music_rect(vw, vh, s);
+        let (crx, cry, _, crh) = splash_new_cover_rect(vw, vh, s);
+        let label_w = 44.0 * s;
+        let ty_m = mry + mrh * 0.5 + 4.0 * s;
+        let ty_c = cry + crh * 0.5 + 4.0 * s;
+        draw_text_on_pixmap(pm, "音乐", mrx, ty_m, 12.0 * s, font);
+        draw_text_on_pixmap(pm, "封面", crx, ty_c, 12.0 * s, font);
+        // 仅 file_name();未选择(或路径无文件名)显示灰色"未选择"。
+        let mut draw_file = |fx: f32, ty: f32, btn_x: f32, f: Option<&std::path::Path>| {
+            let fname = f.and_then(|p| p.file_name()).and_then(|n| n.to_str()).unwrap_or("");
+            let max_w = (btn_x - 8.0 * s - (fx + label_w)).max(0.0);
+            if fname.is_empty() {
+                draw_text_c(pm, "未选择", fx + label_w, ty, 12.0 * s, font, [130, 130, 140]);
+            } else {
+                let t = fit_text(fname, max_w, 12.0 * s);
+                draw_text_on_pixmap(pm, &t, fx + label_w, ty, 12.0 * s, font);
+            }
+        };
+        draw_file(mrx, ty_m, mbx, dlg.music.as_deref());
+        draw_file(crx, ty_c, cbx, dlg.illustration.as_deref());
         // 错误提示(创建失败/重名等,留在对话框)
         if let Some(err) = &dlg.err {
             let mut e = err.clone();
@@ -482,7 +550,7 @@ fn draw_new_chart_dlg(pm: &mut tiny_skia::PixmapMut, dlg: &NewChartDlg, hover: S
             if e.len() < err.len() {
                 e.push('…');
             }
-            draw_text_c(pm, &e, dx + 20.0 * s, dy + 122.0 * s, 11.0 * s, font, [255, 110, 110]);
+            draw_text_c(pm, &e, dx + 20.0 * s, dy + 180.0 * s, 11.0 * s, font, [255, 110, 110]);
         }
     }
 }

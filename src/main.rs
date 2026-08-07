@@ -33,10 +33,12 @@ struct App {
 }
 
 /// 菜单 Load/Export 对话框线程的结果(PMCORE-7)。
-/// rfd 阻塞对话框放到后台线程运行,避免冻结 winit 事件循环。
+/// `Music`/`Cover`:新建谱面对话框的音乐/封面选择(PMCORE-36 扩展)。
 enum DialogChoice {
     Load(Option<PathBuf>),
     Export(Option<PathBuf>),
+    Music(Option<PathBuf>),
+    Cover(Option<PathBuf>),
 }
 
 // ── Core state ──
@@ -326,8 +328,10 @@ impl App {
         let window = Arc::new(event_loop.create_window(
             WindowAttributes::default().with_title("phimakor").with_inner_size(LogicalSize::new(1200.0, 800.0)),
         )?);
-        // 编辑器模式不处理 IME(PMCORE-8 scope 仅 splash 搜索框)。
-        window.set_ime_allowed(false);
+        // IME 全程允许:编辑器面板文本输入(Chart 元信息 / Eff / BPM 文本行)
+        // 与 splash 搜索框共用中文输入(PMCORE-8 扩展,编辑器原先关闭导致
+        // 面板无法打中文)。候选窗位置由 update_ime_area 按焦点控件粗定位。
+        window.set_ime_allowed(true);
         // Apply persisted settings (vsync, fullscreen, backend) to the fresh window.
         let settings = load_settings();
         let mut renderer = pollster::block_on(render::Renderer::new(window.clone(), backends_from_settings(&settings)))?;
@@ -509,8 +513,8 @@ impl App {
             if let Some((slot_path, loaded)) = preloaded {
                 if slot_path == path {
                     state.splash_mode = false;
-                    // 进入编辑器:关闭 IME(splash 搜索框专用,PMCORE-8)。
-                    state.window.set_ime_allowed(false);
+                    // 进入编辑器:IME 保持允许(编辑器面板文本输入需要中文)。
+                    state.window.set_ime_allowed(true);
                     state.ime_active = false;
                     // 与 reload_chart 相同的前置:停旧音频 + 清 chart 纹理,
                     // 再设 chart_dir(apply_loaded_chart 用它填 post.chart_dir)。
@@ -532,8 +536,8 @@ impl App {
             match state.reload_chart(&path) {
                 Ok(()) => {
                     state.splash_mode = false;
-                    // 进入编辑器:关闭 IME(splash 搜索框专用,PMCORE-8)。
-                    state.window.set_ime_allowed(false);
+                    // 进入编辑器:IME 保持允许(编辑器面板文本输入需要中文)。
+                    state.window.set_ime_allowed(true);
                     state.ime_active = false;
                     return;
                 }
@@ -592,8 +596,53 @@ impl App {
                     self.export_current_chart(&dir);
                 }
             }
+            // 新建谱面对话框的音乐/封面选择结果(PMCORE-36)。
+            Ok(DialogChoice::Music(picked)) => {
+                self.dialog_rx = None;
+                if let Some(state) = &mut self.state {
+                    if let Some(d) = state.splash_new.as_mut() {
+                        d.music = picked;
+                        state.ui_dirty = true;
+                    }
+                }
+            }
+            Ok(DialogChoice::Cover(picked)) => {
+                self.dialog_rx = None;
+                if let Some(state) = &mut self.state {
+                    if let Some(d) = state.splash_new.as_mut() {
+                        d.illustration = picked;
+                        state.ui_dirty = true;
+                    }
+                }
+            }
             Err(_) => {} // 对话框仍在运行,下一帧再查
         }
+    }
+
+    /// 新建谱面对话框:弹 rfd 音乐文件选择(后台线程,结果经 channel 回传)。
+    fn start_music_dialog(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("选择音乐文件(可选)")
+                .add_filter("音频", &["mp3", "ogg", "wav", "flac", "m4a"])
+                .pick_file();
+            let _ = tx.send(DialogChoice::Music(picked));
+        });
+        self.dialog_rx = Some(rx);
+    }
+
+    /// 新建谱面对话框:弹 rfd 封面图选择(后台线程)。
+    fn start_cover_dialog(&mut self) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("选择封面图(可选)")
+                .add_filter("图片", &["png", "jpg", "jpeg", "webp"])
+                .pick_file();
+            let _ = tx.send(DialogChoice::Cover(picked));
+        });
+        self.dialog_rx = Some(rx);
     }
 
     /// 菜单 Load 结果:目录 → 直接加载;.zip 谱面包 → import_chart_zip 解包
@@ -1922,22 +1971,38 @@ impl State {
             })
     }
 
-    /// 把 IME 候选窗定位到 splash 搜索框或新建对话框输入框(PMCORE-8/36)。
-    /// 仅 splash 搜索可见时有效;gui_scale 已预乘系统 DPI,
-    /// set_ime_cursor_area 收物理像素。
+    /// 把 IME 候选窗定位到焦点输入:splash 搜索框 / 新建对话框输入框
+    /// (PMCORE-8/36),或编辑器属性面板(粗定位:面板区域;行级跟随暂缺)。
+    /// gui_scale 已预乘系统 DPI,set_ime_cursor_area 收物理像素。
     fn update_ime_area(&self) {
-        if !self.splash_mode || self.show_settings { return; }
-        let vw = self.window.inner_size().width as f32;
-        let vh = self.window.inner_size().height as f32;
-        let (x, y, w, h) = if self.splash_new.is_some() {
-            ui::splash_new_input_rect(vw, vh, self.gui_scale)
-        } else {
-            ui::splash_search_rect(vw, self.gui_scale)
-        };
-        self.window.set_ime_cursor_area(
-            winit::dpi::PhysicalPosition::new(x as i32, y as i32),
-            winit::dpi::PhysicalSize::new(w.max(1.0) as u32, h.max(1.0) as u32),
-        );
+        if self.splash_mode && !self.show_settings {
+            let vw = self.window.inner_size().width as f32;
+            let vh = self.window.inner_size().height as f32;
+            let (x, y, w, h) = if self.splash_new.is_some() {
+                ui::splash_new_input_rect(vw, vh, self.gui_scale)
+            } else {
+                ui::splash_search_rect(vw, self.gui_scale)
+            };
+            self.window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(x as i32, y as i32),
+                winit::dpi::PhysicalSize::new(w.max(1.0) as u32, h.max(1.0) as u32),
+            );
+            return;
+        }
+        // 编辑器模式:面板文本输入(Chart 元信息 / Eff / BPM / Settings)。
+        // 候选窗粗定位到属性面板区域(行级跟随需要绘制侧几何回传,暂不做;
+        // ponytail: 面板级足够用,行级候选窗位置等用户反馈再跟进)。
+        if self.show_properties {
+            let vw = self.window.inner_size().width as f32;
+            let pp = self.overlay.props_progress();
+            let pan_w = ui::PANEL_W * self.gui_scale;
+            let px = vw - pp * pan_w;
+            let (x, y, w, h) = (px, 56.0 * self.gui_scale, pan_w, 200.0 * self.gui_scale);
+            self.window.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(x as i32, y as i32),
+                winit::dpi::PhysicalSize::new(w.max(1.0) as u32, h.max(1.0) as u32),
+            );
+        }
     }
 
     fn render_frame(&mut self) {
@@ -2912,8 +2977,11 @@ impl App {
                                 let mut open_path: Option<PathBuf> = None;
                                 match code {
                                     KeyCode::Enter => {
-                                        let name = state.splash_new.as_ref().map(|d| d.name.clone()).unwrap_or_default();
-                                        match create_new_chart(&name) {
+                                        let d = state.splash_new.as_ref();
+                                        let name = d.map(|d| d.name.clone()).unwrap_or_default();
+                                        let music = d.and_then(|d| d.music.as_ref());
+                                        let illu = d.and_then(|d| d.illustration.as_ref());
+                                        match create_new_chart(&name, music, illu) {
                                             Ok(dir) => {
                                                 state.splash_new = None;
                                                 state.splash_charts = scan_charts();
@@ -3554,9 +3622,15 @@ impl ApplicationHandler for App {
                             st.update_ime_area();
                         }
                         ui::SplashHover::NewInput => { st.update_ime_area(); }
+                        // PMCORE-36 扩展:音乐/封面浏览按钮 → 后台 rfd 文件选择。
+                        ui::SplashHover::NewMusic => { self.start_music_dialog(); }
+                        ui::SplashHover::NewCover => { self.start_cover_dialog(); }
                         ui::SplashHover::NewCreate => {
-                            let name = st.splash_new.as_ref().map(|d| d.name.clone()).unwrap_or_default();
-                            match create_new_chart(&name) {
+                            let d = st.splash_new.as_ref();
+                            let name = d.map(|d| d.name.clone()).unwrap_or_default();
+                            let music = d.and_then(|d| d.music.as_ref());
+                            let illu = d.and_then(|d| d.illustration.as_ref());
+                            match create_new_chart(&name, music, illu) {
                                 Ok(dir) => {
                                     st.splash_new = None;
                                     st.splash_charts = scan_charts();
@@ -3787,15 +3861,15 @@ impl ApplicationHandler for App {
                 state.drag_preview = None;
             }
             WindowEvent::Ime(ime) => {
-                // PMCORE-8:splash 搜索框 IME 中文输入。组合期间(Preedit)
-                // 只标记+跟随候选窗,Commit 一次性写入 splash_search。编辑器
-                // 模式 set_ime_allowed(false) 收不到 IME 事件(数字输入后续再议)。
+                // IME 中文输入:splash 搜索框/新建对话框 + 编辑器面板文本行
+                // (Chart 元信息 / Eff / BPM / Settings 表单 Text)。组合期间
+                // (Preedit)只标记+跟随候选窗,Commit 一次性写入目标控件。
                 match ime {
-                    winit::event::Ime::Enabled => { if state.splash_mode { state.update_ime_area(); } }
+                    winit::event::Ime::Enabled => { state.update_ime_area(); }
                     winit::event::Ime::Preedit(..) => {
                         state.ime_active = true;
                         state.ui_dirty = true;
-                        if state.splash_mode { state.update_ime_area(); }
+                        state.update_ime_area();
                     }
                     winit::event::Ime::Commit(text) => {
                         state.ime_active = false;
@@ -3807,6 +3881,41 @@ impl ApplicationHandler for App {
                                 state.splash_search.push_str(&text);
                                 state.splash_sel = None;
                                 state.splash_scroll = 0.0;
+                            }
+                        } else if !state.splash_mode && !text.is_empty() {
+                            // 编辑器:转发到当前焦点控件(逐字符走 on_key,
+                            // Number 行天然过滤非数字,Text 行全收)。
+                            let mut applied = false;
+                            // Chart 面板(tool 0)元信息行编辑中。
+                            if state.show_properties && state.overlay.selected_tool == 0 {
+                                if let Some(grid) = state.overlay.chart_grid.as_mut() {
+                                    if grid.editing.is_some() {
+                                        for c in text.chars() {
+                                            grid.on_key(ui::widgets::WidgetKey::Char(c));
+                                        }
+                                        applied = true;
+                                    }
+                                }
+                            }
+                            // BPM / Eff / Settings 表单(RealtimeForm Text 行)。
+                            if !applied {
+                                let form = match state.overlay.selected_tool {
+                                    4 => state.overlay.bpm_form.as_mut(),
+                                    3 => state.overlay.eff_form.as_mut(),
+                                    2 => state.overlay.settings_form.as_mut(),
+                                    _ => None,
+                                };
+                                if let Some(form) = form {
+                                    if form.focus_row.is_some() {
+                                        for c in text.chars() {
+                                            form.on_key(ui::widgets::WidgetKey::Char(c));
+                                        }
+                                        applied = true;
+                                    }
+                                }
+                            }
+                            if applied {
+                                state.ui_dirty = true;
                             }
                         }
                         state.ui_dirty = true;
@@ -4734,8 +4843,9 @@ fn delete_chart_entry(entry: &ui::ChartEntry) {
 ///   避开 ≥170 的现代 speed 语义;字段齐全,满足 detect_format/from_rpe_chart)。
 ///
 /// 重名自动去重(`name`、`name-2`、`name-3`…),不静默覆盖现有谱面。
-/// 失败返回可读错误(留在 splash 对话框显示)。
-fn create_new_chart(name: &str) -> Result<PathBuf, String> {
+/// `music`/`illustration`:可选文件,复制进新谱面目录并写入 info.json
+/// (相对路径);失败返回可读错误(留在 splash 对话框显示)。
+fn create_new_chart(name: &str, music: Option<&PathBuf>, illustration: Option<&PathBuf>) -> Result<PathBuf, String> {
     let name = name.trim();
     if name.is_empty() {
         return Err("谱名不能为空".into());
@@ -4753,6 +4863,25 @@ fn create_new_chart(name: &str) -> Result<PathBuf, String> {
         n += 1;
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建目录 {}: {e}", dir.display()))?;
+    // 复制可选文件(保留源文件名,避免重名扩展冲突);失败不阻断创建。
+    let mut music_name = String::new();
+    if let Some(src) = music {
+        if let Some(fname) = src.file_name().and_then(|f| f.to_str()) {
+            match std::fs::copy(src, dir.join(fname)) {
+                Ok(_) => music_name = fname.to_string(),
+                Err(e) => eprintln!("copy music {}: {e}", src.display()),
+            }
+        }
+    }
+    let mut illu_name = String::new();
+    if let Some(src) = illustration {
+        if let Some(fname) = src.file_name().and_then(|f| f.to_str()) {
+            match std::fs::copy(src, dir.join(fname)) {
+                Ok(_) => illu_name = fname.to_string(),
+                Err(e) => eprintln!("copy illustration {}: {e}", src.display()),
+            }
+        }
+    }
     let info = core::model::ChartInfo {
         name: name.to_string(),
         chart: "chart.json".into(),
@@ -4761,8 +4890,8 @@ fn create_new_chart(name: &str) -> Result<PathBuf, String> {
         charter: String::new(),
         composer: String::new(),
         illustrator: String::new(),
-        music: String::new(),
-        illustration: String::new(),
+        music: music_name,
+        illustration: illu_name,
         ..Default::default()
     };
     let info_json = serde_json::to_string_pretty(&info).map_err(|e| format!("info.json 序列化失败: {e}"))?;

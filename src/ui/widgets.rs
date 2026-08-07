@@ -1328,17 +1328,13 @@ impl KeyValueGrid {
         self.edit_kind.get(i).copied().flatten().is_some()
     }
 
-    /// 进入第 `i` 行编辑:以当前行值初始化缓冲(Number 行缓冲预填当前值,
-    /// Backspace 可清空重输)。
+    /// 进入第 `i` 行编辑:Text 缓冲初始化为行值;Number 缓冲留空(替换语义,
+    /// 首次字符从空 buf 开始),未输入时绘制回退到行值。
     fn start_edit(&mut self, i: usize) {
         let value = self.rows.get(i).map(|r| r.1.clone()).unwrap_or_default();
         self.buf = value;
         self.insert = self.buf.chars().count();
-        self.num_buf = if self.edit_kind.get(i) == Some(&Some(GridFieldKind::Number)) {
-            Some(self.buf.clone())
-        } else {
-            None
-        };
+        self.num_buf = None; // Number 行替换语义:输入从空 buf 开始
         self.caret = 0.0;
         self.editing = Some(i);
     }
@@ -1355,15 +1351,21 @@ impl KeyValueGrid {
     /// 编辑态的值区绘制:缓冲 + 闪烁光标(Text 光标停在 insert 后)。
     fn draw_edit_value(&self, cv: &mut dyn Canvas, theme: &Theme, i: usize, r: Rect) {
         let is_num = self.edit_kind.get(i) == Some(&Some(GridFieldKind::Number));
-        let (shown, caret_idx): (&str, usize) = if is_num {
-            // Number 光标固定缓冲尾(与 Form 一致)。
-            (self.num_buf.as_deref().unwrap_or(""), usize::MAX)
+        let (shown, caret_idx) = if is_num {
+            // Number 光标固定缓冲尾;未输入时显示行值(与 Form 一致)。
+            let s: std::borrow::Cow<str> = match &self.num_buf {
+                Some(b) => std::borrow::Cow::Borrowed(b),
+                None => std::borrow::Cow::Owned(
+                    self.rows.get(i).map(|r| r.1.clone()).unwrap_or_default(),
+                ),
+            };
+            (s, usize::MAX)
         } else {
-            (&self.buf, self.insert.min(self.buf.chars().count()))
+            (std::borrow::Cow::Borrowed(self.buf.as_str()), self.insert.min(self.buf.chars().count()))
         };
-        let tw = cv.text_width(shown, theme.font_size);
+        let tw = cv.text_width(&shown, theme.font_size);
         let vx = (r.x() + r.width() - tw - theme.pad_x).max(r.x() + theme.pad_x);
-        cv.text(shown, vx, r.y() + r.height() * 0.72, theme.font_size, theme.accent);
+        cv.text(&shown, vx, r.y() + r.height() * 0.72, theme.font_size, theme.accent);
         if (self.caret * 2.0) as i32 % 2 == 0 {
             let before: String = shown.chars().take(caret_idx).collect();
             let btw = cv.text_width(&before, theme.font_size);
@@ -1407,10 +1409,14 @@ impl Widget for KeyValueGrid {
         if is_num {
             match k {
                 WidgetKey::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
-                    let b = self.num_buf.get_or_insert_with(|| {
-                        let cur = self.rows.get(i).map(|r| r.1.clone()).unwrap_or_default();
-                        format!("{:.1}", cur.parse::<f64>().unwrap_or(0.0))
-                    });
+                    // 替换语义:首次字符从空 buf 开始(不再预填当前值)。
+                    let b = self.num_buf.get_or_insert_with(String::new);
+                    if c == '.' && b.contains('.') {
+                        return; // 已有一个小数点,忽略
+                    }
+                    if c == '-' && !b.is_empty() {
+                        return; // '-' 仅允许在开头
+                    }
                     b.push(c);
                 }
                 WidgetKey::Backspace => {
@@ -2289,7 +2295,14 @@ impl Widget for Form {
             if let Some(FormField::Number { value, min, max, buf, .. }) = self.fields.get_mut(i) {
                 match k {
                     WidgetKey::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
-                        let b = buf.get_or_insert_with(|| format!("{value:.3}"));
+                        // 替换语义:首次字符从空 buf 开始(不再预填当前值)。
+                        let b = buf.get_or_insert_with(String::new);
+                        if c == '.' && b.contains('.') {
+                            return; // 已有一个小数点,忽略
+                        }
+                        if c == '-' && !b.is_empty() {
+                            return; // '-' 仅允许在开头
+                        }
                         b.push(c);
                     }
                     WidgetKey::Backspace => {
@@ -2665,7 +2678,14 @@ impl Widget for RealtimeForm {
             if let Some((_, RTControl::Number { value, step, min, max, buf, .. })) = self.rows.get_mut(i) {
                 match k {
                     WidgetKey::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
-                        let b = buf.get_or_insert_with(|| format!("{value:.3}"));
+                        // 替换语义:首次字符从空 buf 开始(不再预填当前值)。
+                        let b = buf.get_or_insert_with(String::new);
+                        if c == '.' && b.contains('.') {
+                            return; // 已有一个小数点,忽略
+                        }
+                        if c == '-' && !b.is_empty() {
+                            return; // '-' 仅允许在开头
+                        }
                         b.push(c);
                     }
                     WidgetKey::Backspace => {
@@ -3202,12 +3222,16 @@ mod tests {
         g.on_click(center(g.row_rect(2)));
         assert_eq!(g.editing, None);
 
-        // Number 行:缓冲以当前值格式化开头(与 Form 同语义),Backspace 清空
-        // 后重新输入,Enter 解析 + clamp,无效输入回退原值。
+        // Number 行:缓冲从空开始(替换语义),Backspace 清空后重新输入,
+        // Enter 解析 + clamp,无效输入回退原值。
         g.on_click(center(g.row_rect(1)));
         assert_eq!(g.editing, Some(1));
+        for c in ['1', '0', '.', '0'] {
+            g.on_key(WidgetKey::Char(c));
+        }
+        assert_eq!(g.num_buf, Some("10.0".to_string()));
         for _ in 0..4 {
-            g.on_key(WidgetKey::Backspace); // 清掉 "10.0"
+            g.on_key(WidgetKey::Backspace); // 清空 buf
         }
         assert_eq!(g.num_buf, Some(String::new()));
         for c in ['9', '9', '9', '.', '5'] {
@@ -3367,19 +3391,19 @@ mod tests {
         assert_eq!(f.focus_row, Some(0));
         f.on_key(WidgetKey::Char('5'));
         if let FormField::Number { value, buf, .. } = &f.fields[0] {
-            assert_eq!(buf.as_deref(), Some("120.0005"));
+            assert_eq!(buf.as_deref(), Some("5")); // 替换语义:从空 buf 开始
             assert!((*value - 120.0).abs() < 1e-9);
         }
         f.on_key(WidgetKey::Enter);
         if let FormField::Number { value, buf, .. } = &f.fields[0] {
-            assert!((*value - 120.0005).abs() < 1e-9);
+            assert!((*value - 5.0).abs() < 1e-9);
             assert!(buf.is_none());
         }
         // Enter 后焦点前进(环回)
         assert_eq!(f.focus_row, Some(0));
         // 输入超 max → clamp:先打字创建 buf,清空后输入 999
         f.on_click(center(f.row_rect(0)));
-        f.on_key(WidgetKey::Char('9')); // 创建 buf(从当前值 120.001 开始)
+        f.on_key(WidgetKey::Char('9')); // 创建 buf(从空 buf 开始)
         for _ in 0..10 { f.on_key(WidgetKey::Backspace); }
         f.on_key(WidgetKey::Char('9'));
         f.on_key(WidgetKey::Char('9'));
@@ -3466,35 +3490,35 @@ mod tests {
         // 聚焦 Number 行
         f.on_click(center(f.value_rect(0)));
         assert_eq!(f.focus_row, Some(0));
-        // 打字:buf 初始化为当前值,追加数字
+        // 打字:buf 从空开始(替换语义),追加数字
         f.on_key(WidgetKey::Char('2'));
         f.on_key(WidgetKey::Char('5'));
         if let (_, RTControl::Number { value, buf, .. }) = &f.rows[0] {
-            assert_eq!(buf.as_deref(), Some("1.00025"));
+            assert_eq!(buf.as_deref(), Some("25"));
             assert!((*value - 1.0).abs() < 1e-9); // 值未提交
         }
         // 退格
         f.on_key(WidgetKey::Backspace);
         if let (_, RTControl::Number { buf, .. }) = &f.rows[0] {
-            assert_eq!(buf.as_deref(), Some("1.0002"));
+            assert_eq!(buf.as_deref(), Some("2"));
         }
         // Enter 提交
         f.on_key(WidgetKey::Enter);
         if let (_, RTControl::Number { value, buf, .. }) = &f.rows[0] {
-            assert!((*value - 1.0002).abs() < 1e-9);
+            assert!((*value - 2.0).abs() < 1e-9);
             assert!(buf.is_none());
         }
         // 焦点清除
         assert_eq!(f.focus_row, None);
-        // 直接输入数值(新 buf 从当前值开始)+ Esc 取消
+        // 直接输入数值(新 buf 从空开始)+ Esc 取消
         f.on_click(center(f.value_rect(0)));
         f.on_key(WidgetKey::Char('9'));
         if let (_, RTControl::Number { buf, .. }) = &f.rows[0] {
-            assert_eq!(buf.as_deref(), Some("1.0009"));
+            assert_eq!(buf.as_deref(), Some("9"));
         }
         f.on_key(WidgetKey::Escape);
         if let (_, RTControl::Number { value, buf, .. }) = &f.rows[0] {
-            assert!((*value - 1.0002).abs() < 1e-9);
+            assert!((*value - 2.0).abs() < 1e-9);
             assert!(buf.is_none());
         }
     }
@@ -3555,14 +3579,14 @@ mod tests {
             FormField::Text { label: "t".into(), value: String::new(), insert: 0, caret: 0.0 },
         ]);
         f.focus_row = Some(0);
-        // 打字 → buf 出现(初始为当前值的 "1.000",再 push '1')
+        // 打字 → buf 出现(从空 buf 开始,替换语义)
         f.on_key(WidgetKey::Char('1'));
         let FormField::Number { buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
-        assert_eq!(buf.as_deref(), Some("1.0001"));
+        assert_eq!(buf.as_deref(), Some("1"));
         // Enter → 提交并前进焦点
         f.on_key(WidgetKey::Enter);
         let FormField::Number { value, buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
-        assert!((*value - 1.0001).abs() < 1e-9, "value {value}");
+        assert!((*value - 1.0).abs() < 1e-9, "value {value}");
         assert!(buf.is_none());
         assert_eq!(f.focus_row, Some(1));
     }
@@ -3582,7 +3606,7 @@ mod tests {
         assert!((*value - 3.0).abs() < 1e-12, "value {value}");
         assert!(buf.is_none());
 
-        // 超 max 被 clamp:value=5.0=max,输入 '9' → buf "5.0009" 解析后 5.0009 > 5.0 → 钳回 5.0
+        // 超 max 被 clamp:value=5.0=max,输入 '9' → buf "9" 解析后 9.0 > 5.0 → 钳回 5.0
         let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
             FormField::Number { label: "n".into(), value: 5.0, min: 0.0, max: 5.0, buf: None },
         ]);
@@ -3590,14 +3614,14 @@ mod tests {
         f.on_key(WidgetKey::Char('9'));
         f.on_key(WidgetKey::Enter);
         let FormField::Number { value, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
-        assert_eq!(*value, 5.0, "若未 clamp 会是 5.0009");
+        assert_eq!(*value, 5.0, "若未 clamp 会是 9.0");
 
-        // 低于 min 被 clamp:value=1.0 < min=2.0,输入 '9' → 1.0009 → 钳到 2.0
+        // 低于 min 被 clamp:value=1.0 < min=2.0,输入 '1' → buf "1" 解析后 1.0 < 2.0 → 钳到 2.0
         let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
             FormField::Number { label: "n".into(), value: 1.0, min: 2.0, max: 10.0, buf: None },
         ]);
         f.focus_row = Some(0);
-        f.on_key(WidgetKey::Char('9'));
+        f.on_key(WidgetKey::Char('1'));
         f.on_key(WidgetKey::Enter);
         let FormField::Number { value, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
         assert_eq!(*value, 2.0);
@@ -3625,6 +3649,40 @@ mod tests {
         assert!((*value - 4.0).abs() < 1e-12, "value {value}");
         assert!(buf.is_none());
         assert_eq!(f.focus_row, Some(0));
+
+        // 重复 '.' 被忽略:'1','.','.','5' → buf "1.5"
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 3.0, min: -10.0, max: 10.0, buf: None },
+        ]);
+        f.focus_row = Some(0);
+        for c in ['1', '.', '.', '5'] {
+            f.on_key(WidgetKey::Char(c));
+        }
+        let FormField::Number { buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert_eq!(buf.as_deref(), Some("1.5"));
+
+        // '-' 仅允许开头:'-1.5' 可解析并提交;中段 '-' 被忽略
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 3.0, min: -10.0, max: 10.0, buf: None },
+        ]);
+        f.focus_row = Some(0);
+        for c in ['-', '1', '.', '5'] {
+            f.on_key(WidgetKey::Char(c));
+        }
+        f.on_key(WidgetKey::Enter);
+        let FormField::Number { value, buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert!((*value + 1.5).abs() < 1e-9, "value {value}");
+        assert!(buf.is_none());
+
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 3.0, min: -10.0, max: 10.0, buf: None },
+        ]);
+        f.focus_row = Some(0);
+        f.on_key(WidgetKey::Char('5'));
+        f.on_key(WidgetKey::Char('-')); // 中段 '-' 被忽略
+        f.on_key(WidgetKey::Char('5'));
+        let FormField::Number { buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert_eq!(buf.as_deref(), Some("55"));
     }
 
     #[test]
@@ -3634,11 +3692,11 @@ mod tests {
             FormField::Text { label: "t".into(), value: String::new(), insert: 0, caret: 0.0 },
         ]);
         f.focus_row = Some(0);
-        // 输入 '1' 再 Backspace → 回到初始 buf "1.000",Enter 提交后值不变
+        // 输入 '1' 再 Backspace → buf "",Enter 提交后值不变
         f.on_key(WidgetKey::Char('1'));
         f.on_key(WidgetKey::Backspace);
         let FormField::Number { buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
-        assert_eq!(buf.as_deref(), Some("1.000"));
+        assert_eq!(buf.as_deref(), Some(""));
         f.on_key(WidgetKey::Enter);
         let FormField::Number { value, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
         assert!((*value - 1.0).abs() < 1e-12, "value {value}");
@@ -3657,10 +3715,10 @@ mod tests {
         // 打字 → buf;Enter → 提交且失焦(与 Form 的焦点前进不同)
         f.on_key(WidgetKey::Char('1'));
         let (_, RTControl::Number { buf, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
-        assert_eq!(buf.as_deref(), Some("1.0001"));
+        assert_eq!(buf.as_deref(), Some("1"));
         f.on_key(WidgetKey::Enter);
         let (_, RTControl::Number { value, buf, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
-        assert!((*value - 1.0001).abs() < 1e-9, "value {value}");
+        assert!((*value - 1.0).abs() < 1e-9, "value {value}");
         assert!(buf.is_none());
         assert_eq!(f.focus_row, None);
     }
@@ -3677,12 +3735,12 @@ mod tests {
         let (_, RTControl::Number { buf, value, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
         assert!(buf.is_none());
         assert!((*value - 1.0).abs() < 1e-12, "value {value}");
-        // 输入 '9' → "1.0009" < min=2.0 → Enter 后 clamp 到 2.0;Backspace 删尾字符
+        // 输入 '9' 再 Backspace → buf "";再输 '1' → 1.0 < min=2.0 → Enter 后 clamp 到 2.0
         f.on_key(WidgetKey::Char('9'));
         f.on_key(WidgetKey::Backspace);
         let (_, RTControl::Number { buf, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
-        assert_eq!(buf.as_deref(), Some("1.000"));
-        f.on_key(WidgetKey::Char('9'));
+        assert_eq!(buf.as_deref(), Some(""));
+        f.on_key(WidgetKey::Char('1'));
         f.on_key(WidgetKey::Enter);
         let (_, RTControl::Number { value, buf, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
         assert_eq!(*value, 2.0, "clamp 生效");
