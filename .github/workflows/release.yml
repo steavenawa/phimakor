@@ -1,0 +1,94 @@
+# PMCORE-28 Release:push tag v* → Windows x86_64 release 构建 + 打包 zip +
+# maturin .whl,全部附加为 GitHub Release 资产。不做 PyPI 发布。
+# res/ 资源有版权考量不入库、不打包 —— zip 内附 README(含"资源来源"节)。
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows x86_64 release + zip
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rel-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-rel-
+      - name: Build (release, lto=fat)
+        run: cargo build --release
+      - name: Package zip (exe + LICENSE + README)
+        shell: pwsh
+        run: ./scripts/package-release.ps1 -Version ${{ github.ref_name }}
+      - name: Smoke test (unzip + launch, no panic in 5s)
+        shell: pwsh
+        # 尽力而为:runner 无 GPU 适配器时 wgpu 可能直接退出(非 panic),不阻断发版;
+        # 人工验证清单见 workflow 底部注释。
+        continue-on-error: true
+        run: |
+          $zip = Get-ChildItem 'phimakor-windows-*.zip' | Select-Object -First 1
+          if (-not $zip) { Write-Host 'zip not found'; exit 1 }
+          $smoke = Join-Path $env:TEMP 'phimakor-smoke'
+          Remove-Item $smoke -Recurse -ErrorAction SilentlyContinue
+          Expand-Archive $zip.FullName $smoke
+          $exe = Join-Path $smoke 'phimakor.exe'
+          if (-not (Test-Path $exe)) { Write-Host 'exe missing in zip'; exit 1 }
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 5
+          if ($p.HasExited) {
+            Write-Host "exe exited early with code $($p.ExitCode) (may be no-GPU on runner)"
+          } else {
+            Write-Host 'exe alive after 5s (no panic)'
+            Stop-Process -Id $p.Id -Force
+          }
+      - name: Upload zip to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: phimakor-windows-*.zip
+          # changelog 草稿:由 tag 间 commit 自动生成
+          generate_release_notes: true
+
+  build-python:
+    name: Python wheel (maturin, attached asset only)
+    needs: build-windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-rel-py-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-rel-py-
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build wheel
+        run: maturin build --release --features python
+      - name: Upload wheel to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/wheels/*.whl
+
+# ── 人工验证清单(本地执行,对应 smoke test 的降级路径)──
+# 1. 解压 zip,运行 phimakor.exe(带或不带谱面目录参数),确认窗口正常打开;
+# 2. 无 res/ 时程序应告警并降级(README「资源来源」节),不 panic;
+# 3. 按 README 放入资源包后,音符贴图/点击音效/字体正常;
+# 4. pip install dist 下的 .whl(或 python -c "import phimakor")可导入。

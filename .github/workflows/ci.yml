@@ -1,0 +1,125 @@
+# PMCORE-28 CI:push/PR 触发 build --release + test + clippy(单独 job)。
+# 边界:loom 测试单列 Linux job(Windows STATUS_STACK_OVERFLOW);
+# benches/extract.rs 为 PMCORE-27 CPU-only 基准(自动生成 target/bench_chart_10k,
+# 无 GPU/example_chart 依赖),单独 bench job 以 criterion --quick 冒烟。
+name: CI
+
+on:
+  push:
+    branches: [alpha, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-test:
+    name: build + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # Windows 用 rust-lld(.cargo/config.toml 已入库);stable 自带 rust-lld,
+      # 无需额外配置。release profile 是 lto=fat,首次构建 10-20 分钟,缓存兜底。
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: Build (release)
+        run: cargo build --release
+      - name: Test (regular)
+        run: cargo test
+
+  # 独立 job:存量 clippy/rustc warning 显式 allow(下方 -A 清单 = 当前基线),
+  # 其余保持 -D warnings 红线 —— 新出现的 lint 类别仍会让 job 红。
+  # 存量清零后删除 -A 列表即可恢复全量 -D warnings。
+  clippy:
+    name: clippy (lib + bins, -D warnings with baseline allows)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-clippy-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-clippy-
+      - name: Clippy
+        run: cargo clippy --lib --bins -- -D warnings
+          -A clippy::needless_range_loop -A clippy::manual_range_contains
+          -A clippy::needless_lifetimes -A clippy::unnecessary_map_or
+          -A clippy::redundant_closure -A clippy::field_reassign_with_default
+          -A clippy::ptr_arg -A clippy::len_without_is_empty
+          -A clippy::type_complexity -A clippy::unnecessary_lazy_evaluations
+          -A clippy::manual_flatten -A clippy::question_mark
+          -A clippy::too_many_arguments -A clippy::collapsible_str_replace
+          -A clippy::doc_lazy_continuation -A clippy::needless_return
+          -A clippy::manual_clamp -A clippy::needless_borrow
+          -A clippy::unnecessary_cast -A clippy::map_entry
+          -A clippy::empty_line_after_doc_comments -A clippy::if_same_then_else
+          -A clippy::collapsible_if -A clippy::possible_missing_else
+          -A clippy::redundant_field_names -A clippy::collapsible_match
+          -A clippy::useless_format -A clippy::clone_on_copy
+          -A clippy::misnamed_getters -A clippy::manual_is_multiple_of
+          -A clippy::useless_asref -A clippy::single_match
+          -A unused_imports -A unused_variables -A dead_code
+
+  # loom 并发模型测试:只在 Linux 跑。tests/loom_audio.rs 以
+  # #![cfg(all(loom, not(windows)))] 门控,常规 cargo test 不含此文件;
+  # 本 job 用 RUSTFLAGS='--cfg loom' 使其编译并运行。
+  loom:
+    name: loom concurrency tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-loom-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-loom-
+      - name: Loom tests
+        run: RUSTFLAGS='--cfg loom' cargo test --release --test loom_audio
+
+  # PMCORE-27 基准冒烟:bench 自动生成 target/bench_chart_10k(10k 音符),
+  # CPU-only 无 GPU 依赖。criterion --quick 降低采样,跑通编译+全部 group。
+  # 注意:仅跑 ubuntu —— cargo bench 在 bench profile(继承 release 的
+  # lto=fat/panic=abort)下会连带编译 bin 目标,Windows 上 rust-lld 链接
+  # bins 有 drop_slow undefined symbol 的已知怪癖(本机实测,与 bench 代码无关),
+  # ubuntu 默认 linker 无此问题。
+  bench:
+    name: criterion bench (extract, --quick)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-bench-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: ${{ runner.os }}-bench-
+      - name: Criterion bench (quick)
+        run: cargo bench --bench extract -- --quick

@@ -6,8 +6,12 @@
 //! `STATUS_STACK_OVERFLOW` in `loom::rt::thread`), so these tests are skipped
 //! there. Run them on Linux/WSL instead:
 //! `RUSTFLAGS="--cfg loom" cargo +nightly test --release --test loom_audio`
+//!
+//! The `loom` crate is a `cfg(loom)`-gated dependency (`[target.'cfg(loom)'.dependencies]`
+//! in Cargo.toml), so the whole file must be gated on `loom` too — otherwise a plain
+//! `cargo test` (no RUSTFLAGS) fails to compile `use loom::...` on Linux. (PMCORE-28)
 
-#![cfg(not(windows))]
+#![cfg(all(loom, not(windows)))]
 
 use loom::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 use loom::sync::mpsc;
