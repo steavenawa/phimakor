@@ -219,7 +219,7 @@ pub fn from_stream_bytes(bytes: &[u8]) -> Result<(RPEChart, ChartInfo)> {
                     notes: None, is_cover: ld.is_cover, z_order: ld.z_order,
                     attach_ui: ld.attach_ui,
                     pos_control: vec![], size_control: vec![],
-                    alpha_control: vec![], y_control: vec![],
+                    alpha_control: vec![], y_control: vec![], comment: None,
                 });
             }
             StreamRecord::Chunk(c) => {
@@ -241,7 +241,7 @@ pub fn from_stream_bytes(bytes: &[u8]) -> Result<(RPEChart, ChartInfo)> {
                         event_layers: Vec::new(), extended: None,
                         notes: None, is_cover: 0, z_order: 0, attach_ui: None,
                         pos_control: vec![], size_control: vec![],
-                        alpha_control: vec![], y_control: vec![],
+                        alpha_control: vec![], y_control: vec![], comment: None,
                     });
                     // Ensure enough layers
                     while line.event_layers.len() <= ly {
@@ -279,7 +279,7 @@ pub fn from_stream_bytes(bytes: &[u8]) -> Result<(RPEChart, ChartInfo)> {
                         position_x: n.x, y_offset: n.y, alpha: n.alpha,
                         hitsound: None, size: n.size, speed: n.speed,
                         is_fake: n.fake, visible_time: 999999.,
-                        tint: None, tint_hit_effects: None, judge_area: None,
+                        tint: None, tint_hit_effects: None, judge_area: None, comment: None,
                     };
                     let line = judge_lines.entry(li).or_insert_with(|| RPEJudgeLine {
                         name: format!("Line {li}"), texture: "line.png".into(),
@@ -287,7 +287,7 @@ pub fn from_stream_bytes(bytes: &[u8]) -> Result<(RPEChart, ChartInfo)> {
                         event_layers: Vec::new(), extended: None,
                         notes: None, is_cover: 0, z_order: 0, attach_ui: None,
                         pos_control: vec![], size_control: vec![],
-                        alpha_control: vec![], y_control: vec![],
+                        alpha_control: vec![], y_control: vec![], comment: None,
                     });
                     line.notes.get_or_insert_with(Vec::new).push(note);
                 }
@@ -322,7 +322,7 @@ pub fn from_stream_bytes(bytes: &[u8]) -> Result<(RPEChart, ChartInfo)> {
             event_layers: vec![None], extended: None,
             notes: None, is_cover: 0, z_order: 0, attach_ui: None,
             pos_control: vec![], size_control: vec![],
-            alpha_control: vec![], y_control: vec![],
+            alpha_control: vec![], y_control: vec![], comment: None,
         }));
     }
 

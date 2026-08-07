@@ -3,6 +3,7 @@
 
 use super::timeline::{PANEL_W, QP_W, TL_W, NT_W};
 
+use crate::core::model::RPENote;
 use iced::{Element, Length, Theme};
 use std::sync::Arc;
 use iced_tiny_skia::Renderer;
@@ -21,9 +22,26 @@ pub struct NoteEntry {
     pub start_beats: f64,
     pub end_beats: f64,
     pub x: f32,
-    #[allow(dead_code)] pub speed: f32,
     pub scale: f32,      // note size multiplier
-    #[allow(dead_code)] pub texture: String, // custom texture name, empty for default
+    /// True when this note carries a comment (PMCORE-77, timeline marker).
+    pub comment: bool,
+}
+
+impl NoteEntry {
+    /// RPENote → 面板条目(索引 = 列表行号,由调用方给出)。
+    /// 用 `crate::core` 而非 `phimakor::core`:measure bin 以 #[path]
+    /// 引入本地 core 保持类型一致(见 measure.rs 头注释)。
+    pub fn from_rpe_note(n: &RPENote, index: usize) -> Self {
+        Self {
+            index,
+            kind: n.kind,
+            start_beats: n.start_time.beats(),
+            end_beats: n.end_time.beats(),
+            x: n.position_x,
+            scale: n.size,
+            comment: n.comment.is_some(),
+        }
+    }
 }
 
 /// Helper: build a value map from GameInfo for panel template resolution.
@@ -55,25 +73,6 @@ pub fn gameinfo_values(info: &GameInfo) -> std::collections::HashMap<&str, Strin
     m
 }
 
-/// One row in the Eff panel's effect list (all effects, sorted by start beat).
-#[derive(Clone)]
-pub struct EffectRow {
-    /// Index of this effect in `ExtraRoot::effects` (edits map back through it).
-    pub index: usize,
-    /// Shader name (built-in or custom file name).
-    pub shader: String,
-    /// Start/end position in beats.
-    pub start_beats: f64,
-    pub end_beats: f64,
-    /// Whether the effect applies to the whole frame.
-    pub global: bool,
-    /// Whether the effect is active at the current playhead beat.
-    pub active: bool,
-    /// Uniform variables: (name, display value). A plain number is editable
-    /// with the wheel; keyframed values show "N kf" (read-only).
-    pub vars: Vec<(String, String)>,
-}
-
 /// One keyframe row of an expanded Eff-panel uniform variable.
 #[derive(Clone)]
 pub struct KfRow {
@@ -84,7 +83,7 @@ pub struct KfRow {
     pub easing: i32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct GameInfo {
     pub chart_time: f64, pub chart_beat: f64, pub audio_time: f64, pub fps: f64,
     /// 主线程帧延迟(ms,性能提示用)。
@@ -101,6 +100,10 @@ pub struct GameInfo {
     pub selected_line: usize, pub line_name: String, pub line_count: usize,
     pub selected_layer: usize, pub max_layers: usize, pub events: Arc<Vec<EventEntry>>,
     pub notes: Arc<Vec<NoteEntry>>,
+    /// 当前线选中音符(线内索引,PMCORE-18 高亮绘制用)。
+    pub selected_notes: Arc<Vec<usize>>,
+    /// 事件时间轴框选集合(扁平索引,PMCORE-20 批量高亮/删除/平移用)。
+    pub selected_events: Arc<Vec<usize>>,
     pub gui_scale: f32,
     pub snap: f32,
     pub vsync: bool,
@@ -116,19 +119,31 @@ pub struct GameInfo {
     pub ev_end_val: f32,
     pub ev_easing: i32,
     pub effect_names: Vec<String>,
-    /// All post-processing effects, sorted by start beat (Eff panel list).
-    pub effects: Arc<Vec<EffectRow>>,
-    /// Selected row index into `effects`, plus the edit field under the
-    /// wheel: 0 = shader, 1 = start, 2 = end, 3 = global.
-    pub selected_effect: Option<usize>,
-    pub eff_edit_field: u8,
-    /// Eff panel double-click numeric input: (field id, typed buffer) or None.
+    /// Eff panel double-click numeric input (keyframe 行): (field id, typed
+    /// buffer) or None. Eff 字段行的打字已迁移到 RealtimeForm(PMCORE-59)。
     pub num_edit: Option<(u8, String)>,
     /// Eff keyframe editor: expanded var index (into sorted var names),
     /// selected keyframe row, and the parsed rows for display.
     pub eff_kf_var: Option<usize>,
     pub eff_kf_sel: Option<usize>,
     pub eff_kf_rows: Vec<KfRow>,
+
+    // ── A-B loop (PMCORE-22) ──
+    /// 循环开关。
+    pub loop_on: bool,
+    /// A 点(拍,时间轴高亮带用)。
+    pub loop_a: Option<f64>,
+    /// B 点(拍)。
+    pub loop_b: Option<f64>,
+    /// A/B 对应的 chart 秒(seek bar 高亮带用)。
+    pub loop_a_time: Option<f64>,
+    pub loop_b_time: Option<f64>,
+    /// 短暂提示 toast:(文本, 剩余秒)。过期后 main.rs 触发全量重绘擦除。
+    pub loop_toast: Option<(String, f32)>,
+    /// 当前选中线是否带注释(PMCORE-77,时间轴头部标记)。
+    pub line_comment: bool,
+    /// 进行中的注释编辑:(目标标签, 已输入文本);Some 时绘制输入框。
+    pub comment_edit: Option<(String, String)>,
 }
 
 pub(crate) fn build_ui<'a>(info: &'a GameInfo, panel: f32) -> Element<'a, (), Theme, Renderer> {

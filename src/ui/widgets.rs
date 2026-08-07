@@ -72,6 +72,12 @@ pub enum AreaKind {
     ColorPreview,
     /// 多选列表行。
     ListBoxRow,
+    /// 单选组选项行。
+    RadioRow,
+    /// 菜单外部捕获区(全窗;点击外部关闭菜单,全屏时兼遮罩)。
+    MenuMask,
+    /// 菜单项行。
+    MenuItem,
 }
 
 /// 命中区域:组件在布局阶段产出的可交互矩形。
@@ -101,6 +107,8 @@ pub enum WidgetKey {
     Backspace,
     Left,
     Right,
+    Up,
+    Down,
     Home,
     End,
     Enter,
@@ -124,6 +132,12 @@ pub trait Widget {
     fn update(&mut self, _dt: f32) {}
     /// 点击(按下):切换状态。`p` 为指针位置。
     fn on_click(&mut self, _p: (f32, f32)) {}
+    /// 带文本度量的点击(PMCORE-61):宿主注入 `pad_x` 与 `measure`(text_width
+    /// 回调,字号须与 draw 一致),文本类组件据此把光标定位到最近字符边界。
+    /// 默认退化为 `on_click`,未覆盖的组件行为不变。
+    fn on_click_with_measure(&mut self, p: (f32, f32), _pad_x: f32, _measure: &dyn Fn(&str) -> f32) {
+        self.on_click(p);
+    }
     /// 拖拽(按下后移动):更新值。`p` 为指针位置。
     fn on_drag(&mut self, _p: (f32, f32)) {}
     /// 键盘输入一个字符(焦点组件接收)。默认忽略。
@@ -161,6 +175,45 @@ fn approach_anim(anim: &mut f32, target: f32, dt: f32, speed: f32) {
 /// 点是否在 `r` 内(右开区间,与 HList::hit 一致)。
 fn inside(p: (f32, f32), r: Rect) -> bool {
     p.0 >= r.left() && p.0 < r.right() && p.1 >= r.top() && p.1 < r.bottom()
+}
+
+/// 点击 x(相对文本左缘)→ 最近字符边界的光标位置(PMCORE-61)。
+/// 边界 = 各前缀的 text_width(与 draw 光标同一度量来源);`avail` 为可见
+/// 文本区宽度(输入框宽 − pad_x)。文本超宽时,点击落在最后一个可见边界
+/// 右侧 → 直接到末尾(光标不再右移,也不会超过 len)。
+fn caret_from_x(text: &str, x: f32, avail: f32, measure: &dyn Fn(&str) -> f32) -> usize {
+    let n = text.chars().count();
+    if n == 0 {
+        return 0;
+    }
+    let avail = avail.max(0.0);
+    // 前缀宽度表:widths[i] = 前 i 个字符的宽度(0..=n)。
+    let mut widths = Vec::with_capacity(n + 1);
+    widths.push(0.0);
+    let mut prefix = String::with_capacity(text.len());
+    for c in text.chars() {
+        prefix.push(c);
+        widths.push(measure(&prefix));
+    }
+    let x = x.max(0.0).min(avail);
+    // 超宽:点击 ≥ 最后一个可见边界 → len。
+    if widths[n] > avail {
+        let last_visible = widths.iter().rposition(|&w| w <= avail).unwrap_or(0);
+        if x >= widths[last_visible] {
+            return n;
+        }
+    }
+    // 最近字符边界(距某前缀 text_width 的差最小)。
+    let mut best = 0;
+    let mut best_d = (x - widths[0]).abs();
+    for i in 1..=n {
+        let d = (x - widths[i]).abs();
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
 }
 
 /// 矩形中心点(tiny_skia 的 Rect 没有 center())。
@@ -1219,7 +1272,18 @@ impl Widget for ProgressBar {
     }
 }
 
-/// 键值网格:key 左、value 右的多行只读属性(可选中行)。
+/// 键值网格行的编辑类型(PMCORE-23):None = 只读。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridFieldKind {
+    /// 自由字符串(Char/Backspace/方向键 + Enter 提交)。
+    Text,
+    /// f64 数值(打字 → 缓冲,Enter 解析 + clamp 提交)。
+    Number,
+}
+
+/// 键值网格:key 左、value 右的多行属性(可选中行)。
+/// PMCORE-23:行可标记为可编辑(`edit_kind`),点击进入输入、Enter 提交;
+/// 提交后置 `committed = Some(行索引)`,由宿主读取 `rows[行].1` 并清空。
 #[derive(Clone, Debug)]
 pub struct KeyValueGrid {
     pub x: f32,
@@ -1232,11 +1296,51 @@ pub struct KeyValueGrid {
     pub selected: Option<usize>,
     /// 标题(显示在首行上方);空 = 无标题。
     pub title: String,
+    /// PMCORE-23:每行编辑类型;与 rows 等长(不足视为只读)。
+    pub edit_kind: Vec<Option<GridFieldKind>>,
+    /// 正在编辑的行(进入输入态后值来源为 buf/num_buf)。
+    pub editing: Option<usize>,
+    /// Text 编辑缓冲(与行值同源,Enter 提交后写回 rows)。
+    pub buf: String,
+    /// Text 光标插入位置(字符索引)。
+    pub insert: usize,
+    /// Number 编辑缓冲(Form 同语义:Enter 解析+clamp,Esc 取消)。
+    pub num_buf: Option<String>,
+    /// Number 提交钳制范围。
+    pub num_min: f64,
+    pub num_max: f64,
+    /// 光标闪烁相位(update 推进)。
+    pub caret: f32,
+    /// Enter 提交后置 Some(行索引);宿主消费后置 None。
+    pub committed: Option<usize>,
 }
 
 impl KeyValueGrid {
     pub fn new(x: f32, y: f32, w: f32, rows: Vec<(String, String)>) -> Self {
-        Self { x, y, w, rows, row_h: 22.0, gap: 4.0, selected: None, title: String::new() }
+        Self {
+            x, y, w, rows, row_h: 22.0, gap: 4.0, selected: None, title: String::new(),
+            edit_kind: Vec::new(), editing: None, buf: String::new(), insert: 0,
+            num_buf: None, num_min: 0.0, num_max: 9999.0, caret: 0.0, committed: None,
+        }
+    }
+
+    fn editable(&self, i: usize) -> bool {
+        self.edit_kind.get(i).copied().flatten().is_some()
+    }
+
+    /// 进入第 `i` 行编辑:以当前行值初始化缓冲(Number 行缓冲预填当前值,
+    /// Backspace 可清空重输)。
+    fn start_edit(&mut self, i: usize) {
+        let value = self.rows.get(i).map(|r| r.1.clone()).unwrap_or_default();
+        self.buf = value;
+        self.insert = self.buf.chars().count();
+        self.num_buf = if self.edit_kind.get(i) == Some(&Some(GridFieldKind::Number)) {
+            Some(self.buf.clone())
+        } else {
+            None
+        };
+        self.caret = 0.0;
+        self.editing = Some(i);
     }
 
     fn title_h(&self) -> f32 {
@@ -1246,6 +1350,28 @@ impl KeyValueGrid {
     fn row_rect(&self, i: usize) -> Rect {
         Rect::from_xywh(self.x, self.y + self.title_h() + i as f32 * (self.row_h + self.gap), self.w, self.row_h)
             .expect("KeyValueGrid row rect")
+    }
+
+    /// 编辑态的值区绘制:缓冲 + 闪烁光标(Text 光标停在 insert 后)。
+    fn draw_edit_value(&self, cv: &mut dyn Canvas, theme: &Theme, i: usize, r: Rect) {
+        let is_num = self.edit_kind.get(i) == Some(&Some(GridFieldKind::Number));
+        let (shown, caret_idx): (&str, usize) = if is_num {
+            // Number 光标固定缓冲尾(与 Form 一致)。
+            (self.num_buf.as_deref().unwrap_or(""), usize::MAX)
+        } else {
+            (&self.buf, self.insert.min(self.buf.chars().count()))
+        };
+        let tw = cv.text_width(shown, theme.font_size);
+        let vx = (r.x() + r.width() - tw - theme.pad_x).max(r.x() + theme.pad_x);
+        cv.text(shown, vx, r.y() + r.height() * 0.72, theme.font_size, theme.accent);
+        if (self.caret * 2.0) as i32 % 2 == 0 {
+            let before: String = shown.chars().take(caret_idx).collect();
+            let btw = cv.text_width(&before, theme.font_size);
+            cv.fill(
+                Rect::from_xywh(vx + btw + 1.0, r.y() + 3.0, 2.0, r.height() - 6.0).expect("KeyValueGrid caret"),
+                [theme.accent[0], theme.accent[1], theme.accent[2], 255],
+            );
+        }
     }
 }
 
@@ -1259,8 +1385,97 @@ impl Widget for KeyValueGrid {
         self.areas().into_iter().find(|a| inside(p, a.rect))
     }
     fn on_click(&mut self, p: (f32, f32)) {
+        self.committed = None;
         if let Some(a) = self.hit_area(p) {
-            self.selected = Some(a.id as usize);
+            let i = a.id as usize;
+            self.selected = Some(i);
+            if self.editing == Some(i) {
+                return; // 已在该行编辑,点击不重置缓冲
+            }
+            if self.editable(i) {
+                self.start_edit(i);
+            } else {
+                self.editing = None; // 点击只读行/空白:退出编辑
+            }
+        } else {
+            self.editing = None;
+        }
+    }
+    fn on_key(&mut self, k: WidgetKey) {
+        let Some(i) = self.editing else { return };
+        let is_num = self.edit_kind.get(i) == Some(&Some(GridFieldKind::Number));
+        if is_num {
+            match k {
+                WidgetKey::Char(c) if c.is_ascii_digit() || c == '.' || c == '-' => {
+                    let b = self.num_buf.get_or_insert_with(|| {
+                        let cur = self.rows.get(i).map(|r| r.1.clone()).unwrap_or_default();
+                        format!("{:.1}", cur.parse::<f64>().unwrap_or(0.0))
+                    });
+                    b.push(c);
+                }
+                WidgetKey::Backspace => {
+                    if let Some(b) = &mut self.num_buf {
+                        b.pop();
+                    }
+                }
+                WidgetKey::Enter => {
+                    let fallback = self.rows.get(i).and_then(|r| r.1.parse::<f64>().ok()).unwrap_or(0.0);
+                    let value = self
+                        .num_buf
+                        .take()
+                        .and_then(|b| b.parse::<f64>().ok())
+                        .map(|v| v.clamp(self.num_min, self.num_max))
+                        .unwrap_or(fallback);
+                    let s = format!("{value:.1}");
+                    if let Some(r) = self.rows.get_mut(i) {
+                        r.1 = s;
+                    }
+                    self.committed = Some(i);
+                    self.editing = None;
+                }
+                WidgetKey::Escape => {
+                    self.num_buf = None;
+                    self.editing = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+        // Text 行
+        match k {
+            WidgetKey::Char(c) => {
+                let ins = self.insert.min(self.buf.chars().count());
+                self.buf.insert(ins, c);
+                self.insert = ins + 1;
+            }
+            WidgetKey::Backspace => {
+                let ins = self.insert.min(self.buf.chars().count());
+                if ins > 0 {
+                    self.buf.remove(ins - 1);
+                    self.insert = ins - 1;
+                }
+            }
+            WidgetKey::Enter => {
+                let s = self.buf.clone();
+                if let Some(r) = self.rows.get_mut(i) {
+                    r.1 = s;
+                }
+                self.committed = Some(i);
+                self.editing = None;
+            }
+            WidgetKey::Escape => {
+                self.editing = None;
+            }
+            WidgetKey::Left => self.insert = self.insert.saturating_sub(1),
+            WidgetKey::Right => self.insert = (self.insert + 1).min(self.buf.chars().count()),
+            WidgetKey::Home => self.insert = 0,
+            WidgetKey::End => self.insert = self.buf.chars().count(),
+            _ => {}
+        }
+    }
+    fn update(&mut self, dt: f32) {
+        if self.editing.is_some() {
+            self.caret += dt;
         }
     }
     fn draw(&self, cv: &mut dyn Canvas, theme: &Theme, hover: Option<&Area>) {
@@ -1273,11 +1488,16 @@ impl Widget for KeyValueGrid {
             let r = self.row_rect(i);
             let on = hover.map_or(false, |a| a.kind == AreaKind::GridRow && a.id == i as u32);
             let sel = self.selected == Some(i);
-            cv.fill(r, if sel { theme.hover } else if on { theme.hover } else { theme.row });
+            let editing = self.editing == Some(i);
+            cv.fill(r, if sel || on || editing { theme.hover } else { theme.row });
             cv.text(k, r.x() + theme.pad_x, r.y() + r.height() * 0.72, theme.font_size, theme.text);
-            let tw = v.len() as f32 * theme.font_size * 0.55;
-            cv.text(v, r.x() + r.width() - tw - theme.pad_x, r.y() + r.height() * 0.72, theme.font_size,
-                if sel { theme.accent } else { theme.text_dim });
+            if editing {
+                self.draw_edit_value(cv, theme, i, r);
+            } else {
+                let tw = v.len() as f32 * theme.font_size * 0.55;
+                cv.text(v, r.x() + r.width() - tw - theme.pad_x, r.y() + r.height() * 0.72, theme.font_size,
+                    if sel { theme.accent } else if self.editable(i) { theme.text } else { theme.text_dim });
+            }
         }
     }
 }
@@ -1317,7 +1537,14 @@ impl Widget for TextInput {
         inside(p, self.rect()).then(|| Area { kind: AreaKind::TextInput, id: 0, rect: self.rect() })
     }
     fn on_click(&mut self, _p: (f32, f32)) {
-        // 点击定位光标:由宿主调 text_width 计算最近字符边界(简化:按宽度比例)。
+        // 无度量访问,保持现状;宿主需要光标定位时调用 on_click_with_measure。
+    }
+    fn on_click_with_measure(&mut self, p: (f32, f32), pad_x: f32, measure: &dyn Fn(&str) -> f32) {
+        // 点击定位光标:按 text_width 逐前缀测量最近字符边界(与 draw 光标同源)。
+        // 空文本/placeholder 态 → insert=0;超宽文本点击最右 → len。
+        self.focused = true;
+        self.caret = 0.0;
+        self.insert = caret_from_x(&self.text, p.0 - (self.x + pad_x), self.w - pad_x, measure);
     }
     fn on_text(&mut self, c: char) {
         if self.focused {
@@ -1594,11 +1821,333 @@ impl Widget for ListBox {
     }
 }
 
+/// 互斥单选组:点击选项选中,同组至多一个选中(设置表单用)。
+/// 行 id = 行索引,`AreaKind::RadioRow`。
+#[derive(Clone, Debug)]
+pub struct RadioGroup {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub rows: Vec<(String, bool)>,
+    pub gap: f32,
+}
+
+impl RadioGroup {
+    pub fn new(x: f32, y: f32, w: f32, h: f32, rows: Vec<String>, selected: usize) -> Self {
+        let sel = selected.min(rows.len().saturating_sub(1));
+        Self {
+            x, y, w, h, gap: 4.0,
+            rows: rows.into_iter().enumerate().map(|(i, label)| (label, i == sel)).collect(),
+        }
+    }
+
+    /// 当前选中行索引(不变式:恒有且仅有一行选中)。
+    pub fn selected(&self) -> usize {
+        self.rows.iter().position(|(_, s)| *s).unwrap_or(0)
+    }
+
+    fn row_rect(&self, i: usize) -> Rect {
+        Rect::from_xywh(self.x, self.y + i as f32 * (self.h + self.gap), self.w, self.h)
+            .expect("RadioGroup row rect")
+    }
+
+    /// 点击选择;返回选中是否发生变化(供调用方判断变更)。
+    pub fn click(&mut self, p: (f32, f32)) -> bool {
+        let Some(a) = self.hit_area(p) else { return false };
+        let i = a.id as usize;
+        if self.selected() == i {
+            return false;
+        }
+        for (_, s) in self.rows.iter_mut() {
+            *s = false;
+        }
+        self.rows[i].1 = true;
+        true
+    }
+}
+
+impl Widget for RadioGroup {
+    fn areas(&self) -> Vec<Area> {
+        (0..self.rows.len())
+            .map(|i| Area { kind: AreaKind::RadioRow, id: i as u32, rect: self.row_rect(i) })
+            .collect()
+    }
+    fn hit_area(&self, p: (f32, f32)) -> Option<Area> {
+        self.areas().into_iter().find(|a| inside(p, a.rect))
+    }
+    fn on_click(&mut self, p: (f32, f32)) {
+        self.click(p);
+    }
+    fn draw(&self, cv: &mut dyn Canvas, theme: &Theme, hover: Option<&Area>) {
+        for (i, (label, sel)) in self.rows.iter().enumerate() {
+            let r = self.row_rect(i);
+            let on = hover.map_or(false, |a| a.kind == AreaKind::RadioRow && a.id == i as u32);
+            cv.fill(r, if *sel || on { theme.hover } else { theme.row });
+            // 圆圈:外框 + 选中时实心内点(与勾选框的 "x" 区分)。
+            let box_rect = Rect::from_xywh(r.x() + theme.pad_x, r.y() + 3.0, r.height() - 6.0, r.height() - 6.0)
+                .expect("RadioGroup box");
+            cv.fill(box_rect, theme.disabled);
+            if *sel {
+                let dot = Rect::from_xywh(box_rect.x() + 3.0, box_rect.y() + 3.0, box_rect.width() - 6.0, box_rect.height() - 6.0)
+                    .expect("RadioGroup dot");
+                cv.fill(dot, [theme.accent[0], theme.accent[1], theme.accent[2], 255]);
+            }
+            cv.text(label, r.x() + theme.pad_x * 2.0 + box_rect.width(), r.y() + r.height() * 0.72, theme.font_size,
+                if *sel { theme.text } else { theme.text_dim });
+        }
+    }
+}
+
+/// 多选组:每行独立勾选,点击切换(可全选/全不选)。
+/// 行 id = 行索引;复用 `AreaKind::Checkbox` 语义(行命中即切换)。
+#[derive(Clone, Debug)]
+pub struct CheckboxGroup {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub rows: Vec<(String, bool)>,
+    pub gap: f32,
+}
+
+impl CheckboxGroup {
+    pub fn new(x: f32, y: f32, w: f32, h: f32, rows: Vec<String>, checked: Vec<usize>) -> Self {
+        Self {
+            x, y, w, h, gap: 4.0,
+            rows: rows.into_iter().enumerate()
+                .map(|(i, label)| (label, checked.contains(&i)))
+                .collect(),
+        }
+    }
+
+    /// 勾选的行索引(升序)。
+    pub fn checked(&self) -> Vec<usize> {
+        self.rows.iter().enumerate().filter(|(_, (_, c))| *c).map(|(i, _)| i).collect()
+    }
+
+    /// 切换第 `idx` 行的勾选状态(越界忽略)。
+    pub fn toggle(&mut self, idx: usize) {
+        if let Some((_, c)) = self.rows.get_mut(idx) {
+            *c = !*c;
+        }
+    }
+
+    fn row_rect(&self, i: usize) -> Rect {
+        Rect::from_xywh(self.x, self.y + i as f32 * (self.h + self.gap), self.w, self.h)
+            .expect("CheckboxGroup row rect")
+    }
+}
+
+impl Widget for CheckboxGroup {
+    fn areas(&self) -> Vec<Area> {
+        (0..self.rows.len())
+            .map(|i| Area { kind: AreaKind::Checkbox, id: i as u32, rect: self.row_rect(i) })
+            .collect()
+    }
+    fn hit_area(&self, p: (f32, f32)) -> Option<Area> {
+        self.areas().into_iter().find(|a| inside(p, a.rect))
+    }
+    fn on_click(&mut self, p: (f32, f32)) {
+        if let Some(a) = self.hit_area(p) {
+            self.toggle(a.id as usize);
+        }
+    }
+    fn draw(&self, cv: &mut dyn Canvas, theme: &Theme, hover: Option<&Area>) {
+        for (i, (label, sel)) in self.rows.iter().enumerate() {
+            let r = self.row_rect(i);
+            let on = hover.map_or(false, |a| a.kind == AreaKind::Checkbox && a.id == i as u32);
+            cv.fill(r, if *sel || on { theme.hover } else { theme.row });
+            let box_rect = Rect::from_xywh(r.x() + theme.pad_x, r.y() + 3.0, r.height() - 6.0, r.height() - 6.0)
+                .expect("CheckboxGroup box");
+            cv.fill(box_rect, if *sel { [theme.accent[0], theme.accent[1], theme.accent[2], 255] } else { theme.disabled });
+            if *sel {
+                cv.text("x", box_rect.x() + 3.0, box_rect.y() + box_rect.height() * 0.78, theme.font_size,
+                    [theme.knob[0], theme.knob[1], theme.knob[2]]);
+            }
+            cv.text(label, r.x() + theme.pad_x * 2.0 + box_rect.width(), r.y() + r.height() * 0.72, theme.font_size,
+                if *sel { theme.text } else { theme.text_dim });
+        }
+    }
+}
+
+/// 可搜索下拉:ComboBox + 顶部搜索输入行。输入按大小写不敏感子串过滤选项,
+/// 方向键在高亮项间移动,Enter 选中(原始索引),Esc/失焦关闭。
+/// 收起时主按钮为 `ComboBoxButton`;展开时搜索行为 `TextInput`(宿主焦点
+/// 系统据此给它键盘),选项行为 `ComboBoxItem`,id = 1 + 原始索引。
+#[derive(Clone, Debug)]
+pub struct SearchableCombo {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub items: Vec<String>,
+    /// 已选中的原始索引(未选为 None)。
+    pub selected: Option<usize>,
+    pub open: bool,
+    pub focused: bool,
+    /// 搜索词。
+    pub filter: String,
+    /// 过滤后列表中高亮项下标(0..可见数)。
+    pub highlighted: usize,
+}
+
+impl SearchableCombo {
+    pub fn new(x: f32, y: f32, w: f32, h: f32, items: Vec<String>) -> Self {
+        Self {
+            x, y, w, h, items, selected: None,
+            open: false, focused: false, filter: String::new(), highlighted: 0,
+        }
+    }
+
+    /// 当前选中项原始索引(未选 None)。
+    pub fn selected(&self) -> Option<usize> {
+        self.selected
+    }
+
+    fn rect(&self) -> Rect {
+        Rect::from_xywh(self.x, self.y, self.w, self.h).expect("SearchableCombo rect")
+    }
+
+    fn option_rect(&self, vi: usize) -> Rect {
+        Rect::from_xywh(self.x, self.y + self.h + vi as f32 * self.h, self.w, self.h)
+            .expect("SearchableCombo option rect")
+    }
+
+    /// 过滤后可见项的原始索引(保持原顺序)。空过滤 = 全部。
+    fn visible(&self) -> Vec<usize> {
+        let f = self.filter.to_lowercase();
+        self.items.iter().enumerate()
+            .filter(|(_, it)| f.is_empty() || it.to_lowercase().contains(&f))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn open_up(&mut self) {
+        self.open = true;
+        self.focused = true;
+        self.filter.clear();
+        self.highlighted = 0;
+    }
+
+    fn close_down(&mut self) {
+        self.open = false;
+        self.focused = false;
+        self.filter.clear();
+    }
+}
+
+impl Widget for SearchableCombo {
+    fn areas(&self) -> Vec<Area> {
+        let mut out = vec![Area {
+            kind: if self.open { AreaKind::TextInput } else { AreaKind::ComboBoxButton },
+            id: 0,
+            rect: self.rect(),
+        }];
+        if self.open {
+            for (vi, i) in self.visible().iter().enumerate() {
+                out.push(Area { kind: AreaKind::ComboBoxItem, id: (i + 1) as u32, rect: self.option_rect(vi) });
+            }
+        }
+        out
+    }
+    fn hit_area(&self, p: (f32, f32)) -> Option<Area> {
+        self.areas().into_iter().find(|a| inside(p, a.rect))
+    }
+    fn on_click(&mut self, p: (f32, f32)) {
+        if self.open {
+            // 点选项:选中原始索引并收起;点搜索行:保持展开(不误关)。
+            if let Some(a) = self.hit_area(p) {
+                if a.kind == AreaKind::ComboBoxItem {
+                    self.selected = Some(a.id as usize - 1);
+                    self.close_down();
+                }
+            }
+        } else if inside(p, self.rect()) {
+            self.open_up();
+        }
+    }
+    fn on_text(&mut self, c: char) {
+        self.on_key(WidgetKey::Char(c));
+    }
+    fn on_key(&mut self, k: WidgetKey) {
+        if !self.open && !self.focused {
+            // 关闭且无焦点:仅打字可唤醒(输入即搜索),其余按键忽略。
+            if matches!(k, WidgetKey::Char(_)) {
+                self.open_up();
+            } else {
+                return;
+            }
+        }
+        match k {
+            WidgetKey::Char(c) => {
+                self.filter.push(c);
+                self.highlighted = 0;
+            }
+            WidgetKey::Backspace => {
+                self.filter.pop();
+                self.highlighted = 0;
+            }
+            WidgetKey::Down => {
+                let n = self.visible().len();
+                if n > 0 {
+                    self.highlighted = (self.highlighted + 1).min(n - 1);
+                }
+            }
+            WidgetKey::Up => {
+                self.highlighted = self.highlighted.saturating_sub(1);
+            }
+            WidgetKey::Enter => {
+                let v = self.visible();
+                if let Some(&i) = v.get(self.highlighted.min(v.len().saturating_sub(1))) {
+                    self.selected = Some(i);
+                    self.close_down();
+                }
+            }
+            WidgetKey::Escape => self.close_down(),
+            _ => {}
+        }
+    }
+    fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+        if !focused && self.open {
+            self.close_down();
+        }
+    }
+    fn draw(&self, cv: &mut dyn Canvas, theme: &Theme, hover: Option<&Area>) {
+        let on = hover.map_or(false, |a| a.id == 0);
+        cv.fill(self.rect(), if on || self.open { theme.hover } else { theme.row });
+        if self.open || !self.filter.is_empty() {
+            cv.text(&self.filter, self.x + theme.pad_x, self.y + self.h * 0.72, theme.font_size, theme.text);
+        } else {
+            let label = self.selected
+                .and_then(|i| self.items.get(i).cloned())
+                .unwrap_or_else(|| "select…".into());
+            cv.text(&label, self.x + theme.pad_x, self.y + self.h * 0.72, theme.font_size,
+                if self.selected.is_some() { theme.text } else { theme.text_dim });
+        }
+        cv.text("v", self.x + self.w - theme.pad_x - 6.0, self.y + self.h * 0.72, theme.font_size, theme.text_dim);
+    }
+    /// 展开的过滤选项列表画在 overlay 层,悬浮于其他组件之上。
+    fn draw_overlay(&self, cv: &mut dyn Canvas, theme: &Theme, hover: Option<&Area>) {
+        if !self.open {
+            return;
+        }
+        for (vi, i) in self.visible().iter().enumerate() {
+            let r = self.option_rect(vi);
+            let ion = hover.map_or(false, |a| a.kind == AreaKind::ComboBoxItem && a.id == (i + 1) as u32);
+            cv.fill(r, if vi == self.highlighted || ion { theme.hover } else { theme.row });
+            cv.text(&self.items[*i], r.x() + theme.pad_x, r.y() + r.height() * 0.72, theme.font_size,
+                if self.selected == Some(*i) { theme.accent } else { theme.text });
+        }
+    }
+}
+
 /// 表单字段(Form 的行)。
 #[derive(Clone, Debug)]
 pub enum FormField {
     Text { label: String, value: String, insert: usize, caret: f32 },
-    Number { label: String, value: f64, #[allow(dead_code)] step: f64, min: f64, max: f64, buf: Option<String> },
+    Number { label: String, value: f64, min: f64, max: f64, buf: Option<String> },
     Combo { label: String, items: Vec<String>, selected: usize, open: bool },
     Toggle { label: String, on: bool, anim: f32, dir: f32 },
     Checkbox { label: String, checked: bool },
@@ -1662,6 +2211,45 @@ impl Form {
         Rect::from_xywh(r.x(), r.y() + r.height() + (i as f32 + 0.0) * r.height(), r.width(), r.height())
             .expect("Form combo item")
     }
+
+    /// 统一点击处理:`measure` 存在时 Text 行把光标定位到最近字符边界(PMCORE-61),
+    /// 否则与旧 on_click 行为一致(Text 行只设焦点)。
+    fn handle_click(&mut self, p: (f32, f32), pad_x: Option<f32>, measure: Option<&dyn Fn(&str) -> f32>) {
+        let Some(a) = self.hit_area(p) else { return };
+        if a.id == 0 {
+            return;
+        }
+        let i = (a.id - 1) as usize;
+        // 展开的 Combo 选项优先
+        if a.kind == AreaKind::ComboBoxItem && a.id >= 1000 {
+            let field = (a.id - 1000) / 100;
+            let opt = (a.id - 1000) % 100;
+            if let Some(FormField::Combo { selected, open, .. }) = self.fields.get_mut(field as usize) {
+                *selected = opt as usize;
+                *open = false;
+            }
+            return;
+        }
+        // 值列几何(点击定位用):先算几何(不可变借用),再可变借用行。
+        let vr = self.value_rect(i);
+        if let Some(f) = self.fields.get_mut(i) {
+            match f {
+                FormField::Toggle { on, .. } => *on = !*on,
+                FormField::Checkbox { checked, .. } => *checked = !*checked,
+                FormField::Combo { open, .. } => *open = !*open,
+                FormField::Number { .. } => self.focus_row = Some(i),
+                FormField::Text { value, insert, .. } => {
+                    self.focus_row = Some(i);
+                    if let (Some(px), Some(m)) = (pad_x, measure) {
+                        // 点击 label 列只设焦点;值列内才定位光标。
+                        if p.0 >= vr.left() {
+                            *insert = caret_from_x(value, p.0 - (vr.left() + px), vr.width() - px, m);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Widget for Form {
@@ -1690,29 +2278,10 @@ impl Widget for Form {
         self.areas().into_iter().find(|a| inside(p, a.rect))
     }
     fn on_click(&mut self, p: (f32, f32)) {
-        let Some(a) = self.hit_area(p) else { return };
-        if a.id == 0 {
-            return;
-        }
-        let i = (a.id - 1) as usize;
-        // 展开的 Combo 选项优先
-        if a.kind == AreaKind::ComboBoxItem && a.id >= 1000 {
-            let field = (a.id - 1000) / 100;
-            let opt = (a.id - 1000) % 100;
-            if let Some(FormField::Combo { selected, open, .. }) = self.fields.get_mut(field as usize) {
-                *selected = opt as usize;
-                *open = false;
-            }
-            return;
-        }
-        if let Some(f) = self.fields.get_mut(i) {
-            match f {
-                FormField::Toggle { on, .. } => *on = !*on,
-                FormField::Checkbox { checked, .. } => *checked = !*checked,
-                FormField::Combo { open, .. } => *open = !*open,
-                FormField::Text { .. } | FormField::Number { .. } => self.focus_row = Some(i),
-            }
-        }
+        self.handle_click(p, None, None);
+    }
+    fn on_click_with_measure(&mut self, p: (f32, f32), pad_x: f32, measure: &dyn Fn(&str) -> f32) {
+        self.handle_click(p, Some(pad_x), Some(measure));
     }
     fn on_key(&mut self, k: WidgetKey) {
         // 焦点行的 Number 编辑(打字 → buf,Enter 提交,Esc 取消)。
@@ -1971,6 +2540,56 @@ impl RealtimeForm {
         Rect::from_xywh(r.x(), r.y() + r.height() + j as f32 * r.height(), r.width(), r.height())
             .expect("RealtimeForm combo item")
     }
+
+    /// 统一点击处理:`measure` 存在时 Text 行把光标定位到最近字符边界(PMCORE-61),
+    /// 否则与旧 on_click 行为一致(Text 行只设焦点)。
+    fn handle_click(&mut self, p: (f32, f32), pad_x: Option<f32>, measure: Option<&dyn Fn(&str) -> f32>) {
+        let Some(a) = self.hit_area(p) else { return };
+        if a.id == 0 {
+            return;
+        }
+        // Add 按钮
+        if a.id as usize == self.rows.len() + 1 {
+            self.add_row(format!("var{}", self.rows.len() + 1), RTControl::Number { value: 0.0, step: 0.1, min: -100.0, max: 100.0, last_x: 0.0, buf: None });
+            return;
+        }
+        // Combo 选项
+        if a.kind == AreaKind::ComboBoxItem && a.id >= 1000 {
+            let field = (a.id - 1000) / 100;
+            let opt = (a.id - 1000) % 100;
+            if let Some((_, RTControl::Combo { selected, open, .. })) = self.rows.get_mut(field as usize) {
+                *selected = opt as usize;
+                *open = false;
+            }
+            return;
+        }
+        let i = (a.id - 1) as usize;
+        // 先算几何(不可变借用),再可变借用行。
+        let r = self.value_rect(i);
+        if let Some((_, c)) = self.rows.get_mut(i) {
+            match c {
+                RTControl::Toggle { on, .. } => *on = !*on,
+                RTControl::Combo { open, .. } => *open = !*open,
+                RTControl::Number { last_x, .. } => {
+                    self.focus_row = Some(i);
+                    *last_x = p.0;
+                }
+                RTControl::Text { value, insert, .. } => {
+                    self.focus_row = Some(i);
+                    if let (Some(px), Some(m)) = (pad_x, measure) {
+                        // 点击 label 列只设焦点;值列内才定位光标。
+                        if p.0 >= r.left() {
+                            *insert = caret_from_x(value, p.0 - (r.left() + px), r.width() - px, m);
+                        }
+                    }
+                }
+                RTControl::Slider { value } => {
+                    *value = ((p.0 - r.left()) / r.width()).clamp(0.0, 1.0);
+                    self.focus_row = None;
+                }
+            }
+        }
+    }
 }
 
 impl Widget for RealtimeForm {
@@ -2003,43 +2622,10 @@ impl Widget for RealtimeForm {
         self.areas().into_iter().find(|a| inside(p, a.rect))
     }
     fn on_click(&mut self, p: (f32, f32)) {
-        let Some(a) = self.hit_area(p) else { return };
-        if a.id == 0 {
-            return;
-        }
-        // Add 按钮
-        if a.id as usize == self.rows.len() + 1 {
-            self.add_row(format!("var{}", self.rows.len() + 1), RTControl::Number { value: 0.0, step: 0.1, min: -100.0, max: 100.0, last_x: 0.0, buf: None });
-            return;
-        }
-        // Combo 选项
-        if a.kind == AreaKind::ComboBoxItem && a.id >= 1000 {
-            let field = (a.id - 1000) / 100;
-            let opt = (a.id - 1000) % 100;
-            if let Some((_, RTControl::Combo { selected, open, .. })) = self.rows.get_mut(field as usize) {
-                *selected = opt as usize;
-                *open = false;
-            }
-            return;
-        }
-        let i = (a.id - 1) as usize;
-        // 先算几何(不可变借用),再可变借用行。
-        let r = self.value_rect(i);
-        if let Some((_, c)) = self.rows.get_mut(i) {
-            match c {
-                RTControl::Toggle { on, .. } => *on = !*on,
-                RTControl::Combo { open, .. } => *open = !*open,
-                RTControl::Number { last_x, .. } => {
-                    self.focus_row = Some(i);
-                    *last_x = p.0;
-                }
-                RTControl::Text { .. } => self.focus_row = Some(i),
-                RTControl::Slider { value } => {
-                    *value = ((p.0 - r.left()) / r.width()).clamp(0.0, 1.0);
-                    self.focus_row = None;
-                }
-            }
-        }
+        self.handle_click(p, None, None);
+    }
+    fn on_click_with_measure(&mut self, p: (f32, f32), pad_x: f32, measure: &dyn Fn(&str) -> f32) {
+        self.handle_click(p, Some(pad_x), Some(measure));
     }
     fn on_drag(&mut self, p: (f32, f32)) {
         let Some(a) = self.hit_area(p) else { return };
@@ -2565,6 +3151,81 @@ mod tests {
     }
 
     #[test]
+    fn keyvaluegrid_editable_rows_commit_on_enter() {
+        let mut g = KeyValueGrid::new(0.0, 0.0, 240.0, vec![
+            ("name".into(), "old".into()),
+            ("difficulty".into(), "10.0".into()),
+            ("notes".into(), "42".into()), // 只读
+        ]);
+        g.edit_kind = vec![
+            Some(GridFieldKind::Text),
+            Some(GridFieldKind::Number),
+            None,
+        ];
+        g.num_min = 0.0;
+        g.num_max = 100.0;
+
+        // 点击可编辑行 → 进入编辑;缓冲初始化为行值,光标在末尾。
+        g.on_click(center(g.row_rect(0)));
+        assert_eq!(g.editing, Some(0));
+        assert_eq!(g.buf, "old");
+
+        // 打字(末尾追加)+ Left 移动 + Backspace 删光标前字符。
+        g.on_key(WidgetKey::Char('N'));
+        g.on_key(WidgetKey::Char('e'));
+        assert_eq!(g.buf, "oldNe");
+        g.on_key(WidgetKey::Left);
+        g.on_key(WidgetKey::Backspace); // 删 'N'
+        assert_eq!(g.buf, "olde");
+        g.on_key(WidgetKey::Home);
+        g.on_key(WidgetKey::Char('N'));
+        assert_eq!(g.buf, "Nolde");
+
+        // Enter 提交:行值更新 + committed 通知;编辑态退出。
+        g.on_key(WidgetKey::Enter);
+        assert_eq!(g.committed, Some(0));
+        assert_eq!(g.editing, None);
+        assert_eq!(g.rows[0].1, "Nolde");
+        g.committed = None;
+
+        // 点击只读行 → 不进入编辑。
+        g.on_click(center(g.row_rect(2)));
+        assert_eq!(g.editing, None);
+
+        // Number 行:缓冲以当前值格式化开头(与 Form 同语义),Backspace 清空
+        // 后重新输入,Enter 解析 + clamp,无效输入回退原值。
+        g.on_click(center(g.row_rect(1)));
+        assert_eq!(g.editing, Some(1));
+        for _ in 0..4 {
+            g.on_key(WidgetKey::Backspace); // 清掉 "10.0"
+        }
+        assert_eq!(g.num_buf, Some(String::new()));
+        for c in ['9', '9', '9', '.', '5'] {
+            g.on_key(WidgetKey::Char(c));
+        }
+        g.on_key(WidgetKey::Enter);
+        assert_eq!(g.committed, Some(1));
+        assert_eq!(g.rows[1].1, "100.0", "999.5 被 clamp 到 100.0");
+        g.committed = None;
+
+        // 无效数字 Enter → 保持原行值。
+        g.on_click(center(g.row_rect(1)));
+        g.on_key(WidgetKey::Char('a')); // Number 行忽略非数字
+        g.on_key(WidgetKey::Char('b'));
+        g.on_key(WidgetKey::Enter);
+        assert_eq!(g.rows[1].1, "100.0");
+        g.committed = None;
+
+        // Escape 取消编辑,不提交。
+        g.on_click(center(g.row_rect(0)));
+        g.on_key(WidgetKey::Char('x'));
+        g.on_key(WidgetKey::Escape);
+        assert_eq!(g.editing, None);
+        assert_eq!(g.committed, None);
+        assert_eq!(g.rows[0].1, "Nolde", "Escape 不写回");
+    }
+
+    #[test]
     fn textinput_focus_chars_backspace() {
         let mut t = TextInput::new(0.0, 0.0, 200.0, 24.0, "search…");
         // 未聚焦:字符被忽略
@@ -2650,7 +3311,7 @@ mod tests {
     fn form_tab_navigation_and_text_edit() {
         let mut f = Form::new(0.0, 0.0, 300.0, "Params", vec![
             FormField::Text { label: "name".into(), value: String::new(), insert: 0, caret: 0.0 },
-            FormField::Number { label: "bpm".into(), value: 120.0, step: 1.0, min: 0.0, max: 300.0, buf: None },
+            FormField::Number { label: "bpm".into(), value: 120.0, min: 0.0, max: 300.0, buf: None },
             FormField::Toggle { label: "global".into(), on: false, anim: 0.0, dir: -1.0 },
         ]);
         // 点击 Text 行聚焦
@@ -2690,7 +3351,7 @@ mod tests {
     #[test]
     fn form_number_keyboard_input() {
         let mut f = Form::new(0.0, 0.0, 300.0, "Params", vec![
-            FormField::Number { label: "bpm".into(), value: 120.0, step: 1.0, min: 0.0, max: 300.0, buf: None },
+            FormField::Number { label: "bpm".into(), value: 120.0, min: 0.0, max: 300.0, buf: None },
         ]);
         f.on_click(center(f.row_rect(0)));
         assert_eq!(f.focus_row, Some(0));
@@ -2873,6 +3534,428 @@ mod tests {
                 assert_eq!((hit.kind, hit.id), (a.kind, a.id), "center of {:?}", a);
             }
         }
+    }
+
+    // ── Form/RealtimeForm Number 键盘编辑(PMCORE-60)──
+
+    #[test]
+    fn form_number_typing_then_enter_commits_and_advances() {
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 1.0, min: 0.0, max: 10.0, buf: None },
+            FormField::Text { label: "t".into(), value: String::new(), insert: 0, caret: 0.0 },
+        ]);
+        f.focus_row = Some(0);
+        // 打字 → buf 出现(初始为当前值的 "1.000",再 push '1')
+        f.on_key(WidgetKey::Char('1'));
+        let FormField::Number { buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert_eq!(buf.as_deref(), Some("1.0001"));
+        // Enter → 提交并前进焦点
+        f.on_key(WidgetKey::Enter);
+        let FormField::Number { value, buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert!((*value - 1.0001).abs() < 1e-9, "value {value}");
+        assert!(buf.is_none());
+        assert_eq!(f.focus_row, Some(1));
+    }
+
+    #[test]
+    fn form_number_boundary_cases() {
+        // 非法字符 'abc' 被忽略,Enter 后值不变
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 3.0, min: 0.0, max: 10.0, buf: None },
+        ]);
+        f.focus_row = Some(0);
+        for c in ['a', 'b', 'c'] {
+            f.on_key(WidgetKey::Char(c));
+        }
+        f.on_key(WidgetKey::Enter);
+        let FormField::Number { value, buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert!((*value - 3.0).abs() < 1e-12, "value {value}");
+        assert!(buf.is_none());
+
+        // 超 max 被 clamp:value=5.0=max,输入 '9' → buf "5.0009" 解析后 5.0009 > 5.0 → 钳回 5.0
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 5.0, min: 0.0, max: 5.0, buf: None },
+        ]);
+        f.focus_row = Some(0);
+        f.on_key(WidgetKey::Char('9'));
+        f.on_key(WidgetKey::Enter);
+        let FormField::Number { value, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert_eq!(*value, 5.0, "若未 clamp 会是 5.0009");
+
+        // 低于 min 被 clamp:value=1.0 < min=2.0,输入 '9' → 1.0009 → 钳到 2.0
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 1.0, min: 2.0, max: 10.0, buf: None },
+        ]);
+        f.focus_row = Some(0);
+        f.on_key(WidgetKey::Char('9'));
+        f.on_key(WidgetKey::Enter);
+        let FormField::Number { value, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert_eq!(*value, 2.0);
+
+        // buf 空(未输入)Enter → 值不变,仅焦点前进
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 7.0, min: 0.0, max: 10.0, buf: None },
+            FormField::Text { label: "t".into(), value: String::new(), insert: 0, caret: 0.0 },
+        ]);
+        f.focus_row = Some(0);
+        f.on_key(WidgetKey::Enter);
+        let FormField::Number { value, buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert!((*value - 7.0).abs() < 1e-12, "value {value}");
+        assert!(buf.is_none());
+        assert_eq!(f.focus_row, Some(1));
+
+        // Escape 清 buf,值不变、焦点不动
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 4.0, min: 0.0, max: 10.0, buf: None },
+        ]);
+        f.focus_row = Some(0);
+        f.on_key(WidgetKey::Char('1'));
+        f.on_key(WidgetKey::Escape);
+        let FormField::Number { value, buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert!((*value - 4.0).abs() < 1e-12, "value {value}");
+        assert!(buf.is_none());
+        assert_eq!(f.focus_row, Some(0));
+    }
+
+    #[test]
+    fn form_number_backspace_and_enter_wraps() {
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Number { label: "n".into(), value: 1.0, min: 0.0, max: 10.0, buf: None },
+            FormField::Text { label: "t".into(), value: String::new(), insert: 0, caret: 0.0 },
+        ]);
+        f.focus_row = Some(0);
+        // 输入 '1' 再 Backspace → 回到初始 buf "1.000",Enter 提交后值不变
+        f.on_key(WidgetKey::Char('1'));
+        f.on_key(WidgetKey::Backspace);
+        let FormField::Number { buf, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert_eq!(buf.as_deref(), Some("1.000"));
+        f.on_key(WidgetKey::Enter);
+        let FormField::Number { value, .. } = &f.fields[0] else { panic!("field 0 must be Number") };
+        assert!((*value - 1.0).abs() < 1e-12, "value {value}");
+        assert_eq!(f.focus_row, Some(1));
+        // 连续第二次 Enter:焦点 1 → 0(rem_euclid 循环回绕)
+        f.on_key(WidgetKey::Enter);
+        assert_eq!(f.focus_row, Some(0));
+    }
+
+    #[test]
+    fn realtime_form_number_keyboard_edit() {
+        let mut f = RealtimeForm::new(0.0, 0.0, 320.0, "RT", vec![
+            ("n".into(), RTControl::Number { value: 1.0, step: 0.1, min: 0.0, max: 10.0, last_x: 0.0, buf: None }),
+        ]);
+        f.focus_row = Some(0);
+        // 打字 → buf;Enter → 提交且失焦(与 Form 的焦点前进不同)
+        f.on_key(WidgetKey::Char('1'));
+        let (_, RTControl::Number { buf, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
+        assert_eq!(buf.as_deref(), Some("1.0001"));
+        f.on_key(WidgetKey::Enter);
+        let (_, RTControl::Number { value, buf, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
+        assert!((*value - 1.0001).abs() < 1e-9, "value {value}");
+        assert!(buf.is_none());
+        assert_eq!(f.focus_row, None);
+    }
+
+    #[test]
+    fn realtime_form_number_boundaries_and_backspace() {
+        let mut f = RealtimeForm::new(0.0, 0.0, 320.0, "RT", vec![
+            ("n".into(), RTControl::Number { value: 1.0, step: 0.1, min: 2.0, max: 5.0, last_x: 0.0, buf: None }),
+        ]);
+        f.focus_row = Some(0);
+        // 非法字符忽略;Escape 清 buf,值不变
+        f.on_key(WidgetKey::Char('a'));
+        f.on_key(WidgetKey::Escape);
+        let (_, RTControl::Number { buf, value, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
+        assert!(buf.is_none());
+        assert!((*value - 1.0).abs() < 1e-12, "value {value}");
+        // 输入 '9' → "1.0009" < min=2.0 → Enter 后 clamp 到 2.0;Backspace 删尾字符
+        f.on_key(WidgetKey::Char('9'));
+        f.on_key(WidgetKey::Backspace);
+        let (_, RTControl::Number { buf, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
+        assert_eq!(buf.as_deref(), Some("1.000"));
+        f.on_key(WidgetKey::Char('9'));
+        f.on_key(WidgetKey::Enter);
+        let (_, RTControl::Number { value, buf, .. }) = &f.rows[0] else { panic!("row 0 must be Number") };
+        assert_eq!(*value, 2.0, "clamp 生效");
+        assert!(buf.is_none());
+        assert_eq!(f.focus_row, None); // Enter 失焦
+    }
+
+    // ── TextInput/Form/RealtimeForm 点击定位光标(PMCORE-61)──
+
+    /// 假度量表:半角 10px、全角/CJK 20px(全角字符按字符边界定位,不按字节)。
+    fn fake_measure(s: &str) -> f32 {
+        s.chars().map(|c| if c as u32 > 0x7F { 20.0 } else { 10.0 }).sum()
+    }
+
+    #[test]
+    fn textinput_click_positions_caret_by_text_width() {
+        let mut t = TextInput::new(0.0, 0.0, 200.0, 24.0, "");
+        t.text = "ab界c".into(); // 宽度 10,10,20,10 → 边界 0,10,20,40,50
+        let measure = |s: &str| fake_measure(s);
+        // 左缘 → 0
+        t.on_click_with_measure((8.0, 12.0), 8.0, &measure);
+        assert!(t.focused);
+        assert_eq!(t.insert, 0);
+        // 各字符间隙:点中边界 → 落在右侧字符前(与 draw 光标位置一致)
+        t.on_click_with_measure((8.0 + 10.0, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 1);
+        t.on_click_with_measure((8.0 + 20.0, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 2); // 全角"界"之后
+        t.on_click_with_measure((8.0 + 40.0, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 3);
+        // 右缘 → chars 数
+        t.on_click_with_measure((8.0 + 50.0, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 4);
+        // 中间点:27 → 距 20(7)/40(13) → 2
+        t.on_click_with_measure((8.0 + 27.0, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 2);
+        // pad 左侧点击 → 钳到 0
+        t.on_click_with_measure((4.0, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 0);
+    }
+
+    #[test]
+    fn textinput_click_overflow_snaps_to_end() {
+        // 文本 10 字符 × 10px = 100,可用宽 60-8 = 52 → 超宽
+        let mut t = TextInput::new(0.0, 0.0, 60.0, 24.0, "");
+        t.text = "abcdefghij".into();
+        let measure = |s: &str| s.chars().count() as f32 * 10.0;
+        // 点击最右(框右缘)→ insert = len,不再右移
+        t.on_click_with_measure((59.5, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 10);
+        // 可见区中间(36 → 距 40 比 30 近)→ 正常最近边界
+        t.on_click_with_measure((8.0 + 36.0, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 4);
+        // 空文本点击 → insert=0(placeholder 态 focus + 0)
+        let mut e = TextInput::new(0.0, 0.0, 60.0, 24.0, "ph");
+        e.on_click_with_measure((30.0, 12.0), 8.0, &measure);
+        assert!(e.focused);
+        assert_eq!(e.insert, 0);
+    }
+
+    /// 假画布:记录窄竖线填充(光标)的 x,与点击测距用同一度量表。
+    struct FakeCanvas {
+        caret_x: Option<f32>,
+    }
+    impl Canvas for FakeCanvas {
+        fn fill(&mut self, r: Rect, _rgba: [u8; 4]) {
+            if r.width() <= 2.0 && r.height() > 4.0 {
+                self.caret_x = Some(r.x());
+            }
+        }
+        fn text(&mut self, _s: &str, _x: f32, _y: f32, _size: f32, _rgb: [u8; 3]) {}
+        fn text_width(&mut self, s: &str, _size: f32) -> f32 {
+            fake_measure(s)
+        }
+    }
+
+    #[test]
+    fn textinput_click_and_draw_caret_same_measure() {
+        // 点击定位与 draw 光标使用同一 text_width 来源:点击边界 x → insert i,
+        // 该 insert 的光标也画在同一边界 x(差一个光标自身 1px 偏移)。
+        let mut t = TextInput::new(0.0, 0.0, 200.0, 24.0, "");
+        t.text = "a界bc".into(); // 宽度 10,20,10,10 → 边界 0,10,30,40,50
+        let measure = |s: &str| fake_measure(s);
+        t.on_click_with_measure((8.0 + 30.0, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 2); // "界"之后
+        // draw 光标 x = x + pad_x + text_width(前 2 字符)+ 1 = 0+8+30+1
+        let mut cv = FakeCanvas { caret_x: None };
+        t.draw(&mut cv, &Theme::default(), None);
+        assert_eq!(cv.caret_x, Some(39.0));
+        // 点中光标线本身 → 仍落回同一边界
+        t.on_click_with_measure((39.0, 12.0), 8.0, &measure);
+        assert_eq!(t.insert, 2);
+    }
+
+    #[test]
+    fn form_text_row_click_positions_caret_in_value_column() {
+        let measure = |s: &str| fake_measure(s);
+        let mut f = Form::new(0.0, 0.0, 300.0, "F", vec![
+            FormField::Text { label: "name".into(), value: "hello".into(), insert: 0, caret: 0.0 },
+        ]);
+        // 值列文本起点 = row.x + 90 + pad_x = 98;点 98+20(h 与 e 之间)→ insert=2
+        f.on_click_with_measure((98.0 + 20.0, 30.0), 8.0, &measure);
+        assert_eq!(f.focus_row, Some(0));
+        let FormField::Text { insert, .. } = &f.fields[0] else { panic!("row 0 must be Text") };
+        assert_eq!(*insert, 2);
+        // 点击 label 列(< 90)→ 只设焦点,不定位
+        f.on_click_with_measure((10.0, 30.0), 8.0, &measure);
+        assert_eq!(f.focus_row, Some(0));
+        let FormField::Text { insert, .. } = &f.fields[0] else { panic!("row 0 must be Text") };
+        assert_eq!(*insert, 2);
+        // on_click(无度量)→ 保持旧行为:只设焦点,不定位
+        f.on_click(center(f.row_rect(0)));
+        let FormField::Text { insert, .. } = &f.fields[0] else { panic!("row 0 must be Text") };
+        assert_eq!(*insert, 2);
+    }
+
+    #[test]
+    fn realtime_form_text_row_click_positions_caret_in_value_column() {
+        let measure = |s: &str| fake_measure(s);
+        let mut f = RealtimeForm::new(0.0, 0.0, 320.0, "RT", vec![
+            ("name".into(), RTControl::Text { value: "hi界".into(), insert: 0, caret: 0.0 }),
+        ]);
+        // 值列文本起点 = 98;"hi界" 宽度 10,10,20 → 边界 0,10,20,40;点 98+20(界 之前)→ 2
+        f.on_click_with_measure((98.0 + 20.0, 30.0), 8.0, &measure);
+        assert_eq!(f.focus_row, Some(0));
+        let (_, RTControl::Text { insert, .. }) = &f.rows[0] else { panic!("row 0 must be Text") };
+        assert_eq!(*insert, 2);
+        // label 列 → 只设焦点
+        f.on_click_with_measure((5.0, 30.0), 8.0, &measure);
+        let (_, RTControl::Text { insert, .. }) = &f.rows[0] else { panic!("row 0 must be Text") };
+        assert_eq!(*insert, 2);
+        // 值列右缘 → chars 数
+        f.on_click_with_measure((98.0 + 40.0, 30.0), 8.0, &measure);
+        let (_, RTControl::Text { insert, .. }) = &f.rows[0] else { panic!("row 0 must be Text") };
+        assert_eq!(*insert, 3);
+    }
+
+    // ── RadioGroup / CheckboxGroup / SearchableCombo ──
+
+    #[test]
+    fn radiogroup_exclusive_and_default() {
+        let mut rg = RadioGroup::new(0.0, 0.0, 200.0, 24.0, vec!["a".into(), "b".into(), "c".into()], 1);
+        assert_eq!(rg.selected(), 1);
+        assert_eq!(rg.areas().len(), 3);
+        // 点第 3 行 → 选中 2,其余失选
+        rg.on_click(center(rg.row_rect(2)));
+        assert_eq!(rg.selected(), 2);
+        assert!(!rg.rows[1].1);
+        assert!(!rg.rows[0].1);
+        // 点击空白(行外)→ 不变
+        rg.on_click((150.0, -5.0));
+        assert_eq!(rg.selected(), 2);
+        // 命中:行 kind = RadioRow,id = 行索引
+        assert_eq!(rg.hit_area(center(rg.row_rect(0))).unwrap().kind, AreaKind::RadioRow);
+        assert_eq!(rg.hit_area(center(rg.row_rect(0))).unwrap().id, 0);
+        // 默认 selected 越界 → 钳到末行
+        let rg2 = RadioGroup::new(0.0, 0.0, 200.0, 24.0, vec!["a".into()], 99);
+        assert_eq!(rg2.selected(), 0);
+    }
+
+    #[test]
+    fn radiogroup_click_reports_change() {
+        let mut rg = RadioGroup::new(0.0, 0.0, 200.0, 24.0, vec!["a".into(), "b".into()], 0);
+        assert!(!rg.click(center(rg.row_rect(0)))); // 重复点当前项 → 不变
+        assert!(rg.click(center(rg.row_rect(1)))); // 切到 1 → 变更
+        assert_eq!(rg.selected(), 1);
+        assert!(!rg.click((0.0, 100.0))); // 空白 → 不变
+    }
+
+    #[test]
+    fn checkboxgroup_multi_toggle_and_none() {
+        let mut cg = CheckboxGroup::new(0.0, 0.0, 200.0, 24.0, vec!["a".into(), "b".into(), "c".into()], vec![0, 2]);
+        assert_eq!(cg.checked(), vec![0, 2]);
+        cg.on_click(center(cg.row_rect(1)));
+        assert_eq!(cg.checked(), vec![0, 1, 2]);
+        cg.toggle(0);
+        assert_eq!(cg.checked(), vec![1, 2]);
+        // 全不选
+        cg.toggle(1);
+        cg.toggle(2);
+        assert!(cg.checked().is_empty());
+        // 越界 toggle 不 panic
+        cg.toggle(99);
+        assert!(cg.checked().is_empty());
+        // 空白点击不变
+        cg.on_click((0.0, 100.0));
+        assert!(cg.checked().is_empty());
+        // 命中:复用 Checkbox 语义,id = 行索引
+        assert_eq!(cg.hit_area(center(cg.row_rect(0))).unwrap().kind, AreaKind::Checkbox);
+        assert_eq!(cg.hit_area(center(cg.row_rect(0))).unwrap().id, 0);
+    }
+
+    #[test]
+    fn searchablecombo_filter_case_insensitive_substring() {
+        let mut sc = SearchableCombo::new(0.0, 0.0, 200.0, 24.0, vec![
+            "Grayscale".into(), "Vignette".into(), "Chromatic".into(), "Bloom".into(),
+        ]);
+        // 收起:单区域(主按钮),kind = ComboBoxButton
+        assert_eq!(sc.areas().len(), 1);
+        assert_eq!(sc.areas()[0].kind, AreaKind::ComboBoxButton);
+        // 点主按钮展开;展开后搜索行 kind = TextInput(宿主据此给键盘焦点)
+        sc.on_click((100.0, 12.0));
+        assert!(sc.open);
+        assert_eq!(sc.areas()[0].kind, AreaKind::TextInput);
+        // 大小写不敏感子串过滤('G' 同时命中 Grayscale 与 Vignette)
+        sc.on_key(WidgetKey::Char('G'));
+        assert_eq!(sc.visible(), vec![0, 1]);
+        sc.on_key(WidgetKey::Backspace);
+        sc.on_key(WidgetKey::Char('r'));
+        assert_eq!(sc.visible(), vec![0, 2]); // Grayscale, Chromatic
+        // 无匹配 → 空态:选项区为空,Enter 无操作
+        sc.filter = "zzz".into();
+        assert!(sc.visible().is_empty());
+        sc.on_key(WidgetKey::Enter);
+        assert!(sc.open);
+        assert_eq!(sc.selected(), None);
+    }
+
+    #[test]
+    fn searchablecombo_enter_selects_original_index() {
+        let mut sc = SearchableCombo::new(0.0, 0.0, 200.0, 24.0, vec![
+            "Alpha".into(), "Beta".into(), "AlphaMax".into(),
+        ]);
+        // 过滤出 [Alpha(0), AlphaMax(2)],高亮 0 → Enter 选中原始索引 0
+        sc.open_up();
+        sc.on_key(WidgetKey::Char('a'));
+        sc.on_key(WidgetKey::Char('l')); // "al" → [0, 2]
+        assert_eq!(sc.visible(), vec![0, 2]);
+        sc.on_key(WidgetKey::Enter);
+        assert_eq!(sc.selected(), Some(0));
+        assert!(!sc.open);
+        // 重新打开,Down 导航到第 2 项(原始 2)→ Enter 选中
+        sc.open_up();
+        sc.on_key(WidgetKey::Char('a'));
+        sc.on_key(WidgetKey::Char('l'));
+        sc.on_key(WidgetKey::Down);
+        sc.on_key(WidgetKey::Enter);
+        assert_eq!(sc.selected(), Some(2));
+    }
+
+    #[test]
+    fn searchablecombo_arrows_clamp_and_esc() {
+        let mut sc = SearchableCombo::new(0.0, 0.0, 200.0, 24.0, vec!["a".into(), "b".into(), "c".into()]);
+        sc.open_up();
+        sc.on_key(WidgetKey::Down);
+        assert_eq!(sc.highlighted, 1);
+        sc.on_key(WidgetKey::Down);
+        sc.on_key(WidgetKey::Down); // 越界 → 钳到末项
+        assert_eq!(sc.highlighted, 2);
+        sc.on_key(WidgetKey::Up);
+        assert_eq!(sc.highlighted, 1);
+        // 过滤变化后高亮回到 0
+        sc.on_key(WidgetKey::Char('b'));
+        assert_eq!(sc.visible(), vec![1]);
+        assert_eq!(sc.highlighted, 0);
+        // Esc 关闭并清空过滤
+        sc.on_key(WidgetKey::Escape);
+        assert!(!sc.open);
+        assert!(sc.filter.is_empty());
+        // 点选项选中原始索引(过滤 [c] → 唯一项 id=3 → 原始 2)
+        sc.open_up();
+        sc.filter = "c".into();
+        sc.on_click(center(sc.option_rect(0)));
+        assert_eq!(sc.selected(), Some(2));
+        assert!(!sc.open);
+    }
+
+    #[test]
+    fn searchablecombo_blur_and_typing_from_closed() {
+        let mut sc = SearchableCombo::new(0.0, 0.0, 200.0, 24.0, vec!["a".into(), "b".into()]);
+        // 失焦关闭
+        sc.open_up();
+        sc.set_focus(false);
+        assert!(!sc.open);
+        // 关闭态直接打字 → 自动打开并输入
+        sc.on_key(WidgetKey::Char('b'));
+        assert!(sc.open);
+        assert_eq!(sc.visible(), vec![1]);
+        // 未打开也未聚焦 → 非打字键忽略
+        let mut idle = SearchableCombo::new(0.0, 0.0, 200.0, 24.0, vec!["a".into()]);
+        idle.on_key(WidgetKey::Escape);
+        assert!(!idle.open);
+        assert!(idle.filter.is_empty());
     }
 }
 

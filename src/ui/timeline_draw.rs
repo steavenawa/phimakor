@@ -13,11 +13,11 @@ use std::thread::JoinHandle;
 
 use super::model::GameInfo;
 use super::panels::PanelDef;
-use super::panel_ui::{draw_effects_panel, draw_panel_def, draw_quick_panel};
+use super::panel_ui::{draw_panel_def, draw_quick_panel};
 use super::primitives::fill_rect_clipped;
-use super::timeline::{draw_5col_timeline, draw_notes_timeline, PANEL_W, QP_W, TL_W, NT_W};
+use super::timeline::{draw_5col_timeline, draw_notes_timeline, HEADER_H, PANEL_W, QP_W, TL_W, NT_W};
 use super::widgets::{Area, KeyValueGrid, RealtimeForm, ScrollList, Theme, Widget, Canvas as _};
-use super::{bpm_panel, draw_menu};
+use super::{bpm_panel, eff_panel, menu};
 use phimakor::trace_span;
 
 /// 绘制状态快照(从 IcedOverlay 提取,跨线程安全)。
@@ -38,8 +38,8 @@ pub struct TimelineDrawState {
     pub notes_progress: f32,
     pub select_start: Option<(f32, f32)>,
     pub select_end: Option<(f32, f32)>,
-    pub ctx_pos: Option<(f32, f32)>,
-    pub ctx_progress: f32,
+    /// 菜单绘制快照(MenuHost 输出,几何与命中同源;P3)。
+    pub menu: menu::MenuDrawInfo,
     /// 面板定义(tool 0/1 的配置信息)。
     pub panel_defs: Vec<PanelDef>,
     /// 组件库面板实例(每帧由 main.rs 构建)。
@@ -47,6 +47,9 @@ pub struct TimelineDrawState {
     pub bpm_hover: Option<Area>,
     pub settings_form: Option<RealtimeForm>,
     pub settings_hover: Option<Area>,
+    /// Eff 面板组件(tool 3,PMCORE-59)。
+    pub eff_form: Option<RealtimeForm>,
+    pub eff_form_hover: Option<Area>,
     pub chart_grid: Option<KeyValueGrid>,
     pub chart_grid_hover: Option<Area>,
     pub line_list: Option<ScrollList>,
@@ -67,6 +70,9 @@ pub struct TimelineDrawState {
     pub cursor_trail: Vec<(f32, f32)>,
     /// 光标动画时间(秒,顶点呼吸用)。
     pub cursor_time: f32,
+    /// 放置幽灵(start, end, x, kind;mania 批次 1):悬停/拖拽预览块,
+    /// 由 worker 与音符同一映射绘制(命中=绘制)。
+    pub ghost: Option<(f64, f64, f32, u8)>,
 }
 
 impl TimelineDrawState {
@@ -82,10 +88,11 @@ impl TimelineDrawState {
             events_progress: o.events_progress,
             notes_progress: o.notes_progress,
             select_start: o.select_start, select_end: o.select_end,
-            ctx_pos: o.ctx_pos, ctx_progress: o.ctx_progress,
+            menu: o.menu.snapshot(),
             panel_defs: o.panel_defs.clone(),
             bpm_form: o.bpm_form.clone(), bpm_hover: o.bpm_hover,
             settings_form: o.settings_form.clone(), settings_hover: o.settings_hover,
+            eff_form: o.eff_form.clone(), eff_form_hover: o.eff_form_hover,
             chart_grid: o.chart_grid.clone(), chart_grid_hover: o.chart_grid_hover,
             line_list: o.line_list.clone(), line_list_hover: o.line_list_hover,
             perf_hint: o.perf_hint,
@@ -96,6 +103,7 @@ impl TimelineDrawState {
             cursor_click: o.cursor_click,
             cursor_trail: o.cursor_trail.clone(),
             cursor_time: o.cursor_time,
+            ghost: o.ghost,
         }
     }
 }
@@ -150,10 +158,31 @@ impl TimelineDrawState {
                 }
             }
             if info.show_notes {
-                draw_notes_timeline(&mut pm.as_mut(), self.tl_scroll, self.tl_zoom, info, notes_x, vh, s);
+                draw_notes_timeline(&mut pm.as_mut(), self.tl_scroll, self.tl_zoom, info, notes_x, vh, s, self.ghost);
             }
             if info.show_events {
                 draw_5col_timeline(&mut pm.as_mut(), self.tl_scroll, self.tl_zoom, info, events_x, vh, s);
+            }
+            // A-B 循环高亮带(PMCORE-22):A..B 区间半透明带,叠在面板
+            // 背景/网格之上(面板自身的背景填充会盖住画在其下的内容,
+            // 故必须后画),不遮挡交互。
+            if let (Some(a), Some(b)) = (info.loop_a, info.loop_b) {
+                let py = HEADER_H * s + 4.0 * s;
+                let ph = (vh - 56.0 * s - py) as f64;
+                if ph > 0.0 {
+                    let to_y = |beat: f64| py as f64 + ph - (beat - self.tl_scroll as f64) / self.tl_zoom as f64 * ph;
+                    let y0 = to_y(a).clamp(py as f64, py as f64 + ph) as f32;
+                    let y1 = to_y(b).clamp(py as f64, py as f64 + ph) as f32;
+                    let mut lp = Paint::default();
+                    lp.set_color_rgba8(255, 120, 200, if info.loop_on { 50 } else { 32 });
+                    let band = |pm: &mut PixmapMut, x: f32, w: f32| {
+                        if let Some(r) = Rect::from_xywh(x, y0.min(y1), w, (y1 - y0).abs().max(1.0)) {
+                            fill_rect_clipped(pm, r, &lp);
+                        }
+                    };
+                    if info.show_events { band(&mut pm.as_mut(), events_x, ev_w); }
+                    if info.show_notes { band(&mut pm.as_mut(), notes_x, nt_w); }
+                }
             }
         }
         // Selection rect + seek bar + context menu
@@ -172,14 +201,31 @@ impl TimelineDrawState {
                     }
                 }
             }
-            if self.ctx_progress > 0.01 {
-                let (mx, my) = self.ctx_pos.unwrap_or((0.0, 0.0));
-                let mw = 160.0 * s; let mh = 120.0 * s;
-                let alpha = (self.ctx_progress * 230.0) as u8;
-                let mut mp = Paint::default();
-                mp.set_color_rgba8(25, 25, 30, alpha);
-                if let Some(r) = Rect::from_xywh(mx.min(vw - mw), my.min(vh - mh), mw, mh) {
-                    fill_rect_clipped(&mut pm.as_mut(), r, &mp);
+            // 注释编辑输入框(PMCORE-77):标题 + 已输入文本 + 光标竖线。
+            // 位置固定居中于时间轴区域(右键菜单点选后已关闭,无重叠)。
+            if let Some((title, buf)) = &info.comment_edit {
+                let bw = 360.0 * s; let bh = 84.0 * s;
+                let bx = ((vw - bw) * 0.5).max(8.0 * s);
+                let by = (vh * 0.34).clamp(8.0 * s, vh - bh - 8.0 * s);
+                let mut bp = Paint::default();
+                bp.set_color_rgba8(28, 30, 36, 240);
+                if let Some(r) = Rect::from_xywh(bx, by, bw, bh) {
+                    fill_rect_clipped(&mut pm.as_mut(), r, &bp);
+                }
+                if let Some(font) = super::font::get_font() {
+                    super::text::draw_text_on_pixmap(&mut pm.as_mut(), title, bx + 12.0 * s, by + 12.0 * s, 12.0 * s, font);
+                    // 文本 + 光标(块状竖线,追加在文本末尾)。
+                    let tx = bx + 12.0 * s;
+                    let ty = by + 46.0 * s;
+                    let mut ip = Paint::default();
+                    ip.set_color_rgba8(45, 48, 55, 255);
+                    if let Some(r) = Rect::from_xywh(tx, ty - 12.0 * s, bw - 24.0 * s, 22.0 * s) {
+                        fill_rect_clipped(&mut pm.as_mut(), r, &ip);
+                    }
+                    let caret = format!("{}|", buf);
+                    super::text::draw_text_on_pixmap(&mut pm.as_mut(), &caret, tx + 8.0 * s, ty + 2.0 * s, 13.0 * s, font);
+                    // 提示:Enter 提交 / Esc 取消。
+                    super::text::draw_text_on_pixmap(&mut pm.as_mut(), "Enter 提交 · Esc 取消", bx + 12.0 * s, by + 66.0 * s, 10.0 * s, font);
                 }
             }
             if info.show_overlay {
@@ -189,7 +235,14 @@ impl TimelineDrawState {
         // Panel definition matching selected tool
         if info.show_properties && pp > 0.01 {
             if self.selected_tool == 3 {
-                draw_effects_panel(&mut pm.as_mut(), info, props_x, vw, vh, s);
+                // Eff 面板(PMCORE-59):RealtimeForm 组件 + 表单下方的手写
+                // keyframe 展开区(不迁移)。
+                if let Some(form) = &self.eff_form {
+                    bpm_panel::draw_bpm_panel(&mut pm.as_mut(), form, self.eff_form_hover.as_ref(), s);
+                    if info.eff_kf_var.is_some() {
+                        eff_panel::draw_kf_area(&mut pm.as_mut(), info, form, s);
+                    }
+                }
             } else if self.selected_tool == 4 {
                 if let Some(form) = &self.bpm_form {
                     bpm_panel::draw_bpm_panel(&mut pm.as_mut(), form, self.bpm_hover.as_ref(), s);
@@ -223,8 +276,9 @@ impl TimelineDrawState {
                 }
             }
         }
-        if info.show_menu {
-            draw_menu(&mut pm.as_mut(), vw, vh, s);
+        // 菜单(全屏/右键/菜单条)由 MenuHost 快照绘制,盖在面板之上。
+        if self.menu.form != menu::MenuForm::Closed {
+            draw_menu_snap(&mut pm.as_mut(), &self.menu, vw, vh, s);
         }
         // 右上角性能提示(PMCORE-68):perf hint 开关 = 播放中帧延迟过大才显示;
         // fps overlay 开关 = 任何状态恒显示帧时间叠层。两者可共存。
@@ -261,6 +315,74 @@ impl TimelineDrawState {
                 draw_custom_cursor(&mut pm.as_mut(), mx, my, s, self.cursor_move, self.cursor_click, &self.cursor_trail, self.cursor_time);
             }
         }
+        // A-B 循环提示 toast(PMCORE-22):短暂文本,左上角。剩余秒递减,
+        // 过期后 main.rs 置 ui_dirty 触发全量重绘擦除。
+        if let Some((msg, remain)) = &info.loop_toast {
+            if *remain > 0.0 {
+                if let Some(font) = super::font::get_font() {
+                    let alpha = (255.0 * (remain / 2.0).clamp(0.0, 1.0)) as u8;
+                    super::text::draw_text_c(&mut pm.as_mut(), msg, 12.0 * s, 16.0 * s, 14.0 * s, font, [alpha, alpha, alpha]);
+                }
+            }
+        }
+    }
+}
+
+/// 绘制打开的菜单(全屏/右键/菜单条;P3)。几何 = MenuHost 快照
+/// (`MenuDrawInfo.rows` 由 `MenuHost::snapshot` 提供,与 areas 命中同源)。
+pub fn draw_menu_snap(pm: &mut PixmapMut, snap: &menu::MenuDrawInfo, vw: f32, vh: f32, s: f32) {
+    let _s = trace_span!("draw_menu_snap");
+    // 全屏遮罩
+    if snap.mask {
+        let mut bg = Paint::default();
+        bg.set_color_rgba8(0, 0, 0, 160);
+        if let Some(r) = Rect::from_xywh(0.0, 0.0, vw, vh) {
+            fill_rect_clipped(pm, r, &bg);
+        }
+    }
+    // 面板
+    let (px, py, pw, ph) = snap.panel;
+    let mut panel = Paint::default();
+    panel.set_color_rgba8(30, 32, 38, 240);
+    if let Some(r) = Rect::from_xywh(px, py, pw, ph) {
+        fill_rect_clipped(pm, r, &panel);
+    }
+    // 标题(仅全屏形态)
+    if snap.form == menu::MenuForm::Fullscreen && !snap.title.is_empty() {
+        if let Some(font) = super::font::get_font() {
+            super::text::draw_text_on_pixmap(pm, &snap.title, px + 12.0 * s, py + 30.0 * s, 16.0 * s, font);
+        }
+    }
+    draw_menu_rows(pm, &snap.rows, s);
+    if let Some((sp, sub_rows)) = &snap.sub {
+        let (sx, sy, sw, sh) = *sp;
+        // 子菜单面板盖在父面板之上(更实)。
+        let mut sp_p = Paint::default();
+        sp_p.set_color_rgba8(30, 32, 38, 250);
+        if let Some(r) = Rect::from_xywh(sx, sy, sw, sh) {
+            fill_rect_clipped(pm, r, &sp_p);
+        }
+        draw_menu_rows(pm, sub_rows, s);
+    }
+}
+
+fn draw_menu_rows(pm: &mut PixmapMut, rows: &[menu::MenuDrawRow], s: f32) {
+    let Some(font) = super::font::get_font() else { return };
+    for row in rows {
+        let (rx, ry, rw, rh) = row.rect;
+        let mut ip = Paint::default();
+        if row.sel {
+            ip.set_color_rgba8(70, 100, 150, 255);
+        } else if row.disabled {
+            ip.set_color_rgba8(38, 40, 46, 255);
+        } else {
+            ip.set_color_rgba8(45, 48, 55, 255);
+        }
+        if let Some(r) = Rect::from_xywh(rx, ry, rw, rh) {
+            fill_rect_clipped(pm, r, &ip);
+        }
+        let label = if row.has_sub { format!("{} >", row.label) } else { row.label.clone() };
+        super::text::draw_text_on_pixmap(pm, &label, rx + 6.0 * s, ry + rh * 0.62, 13.0 * s, font);
     }
 }
 
@@ -276,6 +398,17 @@ pub fn draw_seek_bar(pm: &mut PixmapMut, info: &GameInfo, qp_w: f32, props_x: f3
     sbg.set_color_rgba8(40, 45, 55, 200);
     if let Some(r) = Rect::from_xywh(sb_x, sb_y, sb_w, sb_h) {
         fill_rect_clipped(pm, r, &sbg);
+    }
+    // A-B 循环高亮带(PMCORE-22):A..B 在整条时间轴上的区间。
+    if let (Some(ta), Some(tb)) = (info.loop_a_time, info.loop_b_time) {
+        let dur = info.duration.max(0.01);
+        let x0 = sb_x + (ta / dur) as f32 * sb_w;
+        let x1 = sb_x + (tb / dur) as f32 * sb_w;
+        let mut lp = Paint::default();
+        lp.set_color_rgba8(255, 120, 200, if info.loop_on { 130 } else { 80 });
+        if let Some(r) = Rect::from_xywh(x0.min(x1), sb_y + 1.0 * s, (x1 - x0).abs().max(2.0), (sb_h - 2.0 * s).max(1.0)) {
+            fill_rect_clipped(pm, r, &lp);
+        }
     }
     let prog = (info.chart_time / info.duration.max(0.01)) as f32;
     if prog > 0.01 {
@@ -294,6 +427,53 @@ pub fn seek_bar_rect(qp_w: f32, props_x: f32, vh: f32, s: f32) -> (f32, f32, f32
     let sb_x = qp_w;
     let sb_w = (props_x - sb_x).max(20.0);
     (sb_x, sb_y, sb_w, sb_h)
+}
+
+/// 绘制 hover 上下文信息浮层(PMCORE-76)。纯函数:文本内容由调用方在
+/// hover 目标变化时重建(`lines` 首行为标题,其余为字段行),本函数只按
+/// 当前光标位置每帧绘制,不分配。返回浮层矩形(屏幕坐标),调用方把它
+/// 并入脏区(旧矩形由 fast path 的 base 恢复 + 上传擦除)。
+pub fn draw_tooltip(pm: &mut PixmapMut, mx: f32, my: f32, lines: &[String], s: f32) -> (f32, f32, f32, f32) {
+    let fs = 12.0 * s;
+    let pad = 6.0 * s;
+    let row_h = 15.0 * s;
+    // 宽度 = 最长行文本宽 + 左右 padding(text_width 与绘制同一度量)。
+    let mut w = 0.0f32;
+    for l in lines {
+        w = w.max(super::text::text_width(l, fs));
+    }
+    let w = w + pad * 2.0;
+    let h = pad * 2.0 + row_h * lines.len() as f32;
+    let vw = pm.width() as f32;
+    let vh = pm.height() as f32;
+    // 光标右下,越界翻转到左上方,再兜底钳进视口。
+    let off = 14.0 * s;
+    let (x, y) = if mx + off + w <= vw && my + off + h <= vh {
+        (mx + off, my + off)
+    } else if mx - off - w >= 0.0 && my - off - h >= 0.0 {
+        (mx - off - w, my - off - h)
+    } else {
+        ((mx + off).min(vw - w).max(0.0), (my + off).min(vh - h).max(0.0))
+    };
+    let mut bg = Paint::default();
+    bg.set_color_rgba8(25, 25, 30, 235);
+    if let Some(r) = Rect::from_xywh(x, y, w, h) {
+        fill_rect_clipped(pm, r, &bg);
+    }
+    // 1px 边框(选中高亮同色系)。
+    let mut bp = Paint::default();
+    bp.set_color_rgba8(90, 120, 180, 200);
+    if let Some(r) = Rect::from_xywh(x, y, w, 1.0) { fill_rect_clipped(pm, r, &bp); }
+    if let Some(r) = Rect::from_xywh(x, y + h - 1.0, w, 1.0) { fill_rect_clipped(pm, r, &bp); }
+    if let Some(r) = Rect::from_xywh(x, y, 1.0, h) { fill_rect_clipped(pm, r, &bp); }
+    if let Some(r) = Rect::from_xywh(x + w - 1.0, y, 1.0, h) { fill_rect_clipped(pm, r, &bp); }
+    if let Some(font) = super::font::get_font() {
+        for (i, l) in lines.iter().enumerate() {
+            let rgb = if i == 0 { [255, 220, 120] } else { [222, 222, 228] };
+            super::text::draw_text_c(pm, l, x + pad, y + pad + i as f32 * row_h + fs, fs, font, rgb);
+        }
+    }
+    (x, y, w, h)
 }
 
 /// 画自定义几何光标:中心菱形 + 4 顶点 + 延迟轨迹。

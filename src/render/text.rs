@@ -458,21 +458,15 @@ fn rasterized_entry(
     let key = (text.to_string(), anchor as u8);
     if let Some(entry) = text_state.cache.get(&key) {
         // Touch LRU: move to the back (most recently used).
-        if let Some(pos) = text_state.access.iter().position(|k| k == &key) {
-            text_state.access.remove(pos);
-            text_state.access.push(key);
-        }
+        lru_touch(&mut text_state.access, &key);
         return Some(entry.clone());
     }
     let (bind_group, size) = rasterize_line(device, queue, tex_bgl, sampler, font, text, px, cjk)?;
     let entry = CachedText { bind_group, size };
     // LRU eviction: drop the least recently used entry when over the cap,
     // instead of wiping the whole cache (which destroyed every GPU texture).
-    if text_state.cache.len() >= TEXT_CACHE_CAP {
-        if let Some(oldest) = text_state.access.first() {
-            text_state.cache.remove(oldest);
-            text_state.access.remove(0);
-        }
+    if let Some(oldest) = lru_evict_oldest(&mut text_state.access, TEXT_CACHE_CAP) {
+        text_state.cache.remove(&oldest);
     }
     text_state.cache.insert(key.clone(), entry.clone());
     text_state.access.push(key);
@@ -481,6 +475,25 @@ fn rasterized_entry(
 
 /// LRU cap for the static text line cache.
 const TEXT_CACHE_CAP: usize = 1024;
+
+/// LRU 命中维护(纯逻辑,单测锁定):把 key 移到 `access` 末尾(最近使用)。
+/// `access` 与 `cache` 保持同长同序(新增/逐出两边同步,命中只动 access)。
+fn lru_touch(access: &mut Vec<(String, u8)>, key: &(String, u8)) {
+    if let Some(pos) = access.iter().position(|k| k == key) {
+        access.remove(pos);
+        access.push(key.clone());
+    }
+}
+
+/// LRU 新增逐出(纯逻辑,单测锁定):缓存已满(≥ cap)时返回应逐出的最旧
+/// key —— 只逐一条,不整清空。调用方逐出后把新 key push 到 `access` 末尾。
+fn lru_evict_oldest(access: &mut Vec<(String, u8)>, cap: usize) -> Option<(String, u8)> {
+    if access.len() >= cap {
+        Some(access.remove(0))
+    } else {
+        None
+    }
+}
 
 /// Field-split version of [`Renderer::draw_text`]: queues an anchored text
 /// line. Callable while `cmds` holds borrows of other renderer fields.
@@ -589,5 +602,48 @@ pub(crate) fn push_text<'a>(
             },
             tex: &pt.entry.bind_group,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_cache_lru_evicts_oldest_only() {
+        // 回归(PMCORE-45):超上限只逐最旧一条,不整清空(旧实现曾摧毁
+        // 全部缓存)。小 cap 模拟 TEXT_CACHE_CAP 的逐出策略。
+        let mut access: Vec<(String, u8)> = (0..4).map(|i| (format!("t{i}"), 0u8)).collect();
+        // 满 4 条再插:逐出 t0,其余保留
+        let evicted = lru_evict_oldest(&mut access, 4);
+        assert_eq!(evicted, Some(("t0".to_string(), 0)));
+        assert_eq!(access.len(), 3);
+        access.push(("new".to_string(), 0));
+        assert_eq!(access, vec![
+            ("t1".to_string(), 0), ("t2".to_string(), 0), ("t3".to_string(), 0), ("new".to_string(), 0),
+        ]);
+        // 命中 new → 移到末尾,逐出轮不到它
+        lru_touch(&mut access, &("new".to_string(), 0));
+        assert_eq!(access.last(), Some(&("new".to_string(), 0)));
+        let evicted = lru_evict_oldest(&mut access, 4);
+        assert_eq!(evicted, Some(("t1".to_string(), 0)));
+        access.push(("new2".to_string(), 0));
+        assert_eq!(access.len(), 4);
+        assert_eq!(access.first(), Some(&("t2".to_string(), 0)));
+    }
+
+    #[test]
+    fn text_cache_cap_holds_1024() {
+        // 真实 cap:插入 > TEXT_CACHE_CAP 条后长度稳定在 1024,仅最旧被逐。
+        // 与 mem_report 的 cache.len() 同源(cache/access 同步逐出)。
+        let mut access: Vec<(String, u8)> = Vec::new();
+        for i in 0..=(TEXT_CACHE_CAP + 7) {
+            if let Some(_evicted) = lru_evict_oldest(&mut access, TEXT_CACHE_CAP) {}
+            access.push((format!("k{i}"), 0));
+        }
+        assert_eq!(access.len(), TEXT_CACHE_CAP);
+        assert_eq!(access[0], ("k8".to_string(), 0)); // 前 8 条被逐,非整清空
+        assert!(access.contains(&("k1024".to_string(), 0)));
+        assert_eq!(access.last(), Some(&("k1031".to_string(), 0)));
     }
 }

@@ -198,6 +198,12 @@ pub struct RPENote {
     /// Optional custom judge area radius; tolerated but ignored in M0.
     #[serde(default)]
     pub judge_area: Option<f32>,
+    /// Optional user comment (Phimakor private extension, PMCORE-77). RPE/
+    /// phira ignore unknown fields, so this round-trips safely. Anchored to
+    /// the note itself: it moves with the note and is lost when the note is
+    /// deleted. Skipped when None so comment-free charts save byte-identically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 /// A single judge line in the RPE chart.
@@ -245,6 +251,10 @@ pub struct RPEJudgeLine {
     /// Y-offset control events.
     #[serde(default)]
     pub y_control: Vec<RPECtrlEvent>,
+    /// Optional user comment (Phimakor private extension, PMCORE-77); same
+    /// semantics as [`RPENote::comment`]. Skipped when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 /// Metadata header for an RPE chart.
@@ -291,6 +301,8 @@ pub enum ChartFormat {
     Pbc,
     /// Phimakor Streamable Sheet — NDJSON format.
     Pss,
+    /// Phimakor Chart — native binary container format.
+    Pmk,
 }
 
 /// Chart-level metadata mirroring `prpr/src/info.rs`.
@@ -301,7 +313,7 @@ pub enum ChartFormat {
 ///
 /// Fields are documented with whether they originate from the RPE export
 /// or are Phimakor extensions.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 #[serde(rename_all = "camelCase")]
 pub struct ChartInfo {
@@ -374,10 +386,26 @@ pub struct ChartInfo {
     pub chart_updated: Option<String>,
 }
 
+impl ChartInfo {
+    /// 面板/HUD/导出/流元数据的共同展示子集
+    /// `(name, composer, charter, illustrator, level, difficulty)`。
+    /// 借用返回,调用方只 clone 需要的字段(render_frame 热路径不白克隆)。
+    pub fn display_fields(&self) -> (&str, &str, &str, &str, &str, f32) {
+        (
+            &self.name,
+            &self.composer,
+            &self.charter,
+            &self.illustrator,
+            &self.level,
+            self.difficulty,
+        )
+    }
+}
+
 /// YAML info file (`info.yml`) adapter — the RPE web-export metadata format.
 /// Field names follow the actual `info.yml` convention (a mix of snake_case
 /// and camelCase), so each is renamed explicitly.
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct InfoYaml {
     pub id: Option<i32>,
@@ -453,6 +481,44 @@ impl InfoYaml {
         info.use_rpe_170_speed = self.use_rpe_170_speed;
         info.use_attach_ui_fix = self.use_attach_ui_fix;
         info
+    }
+}
+
+impl From<&ChartInfo> for InfoYaml {
+    /// Reverse of [`InfoYaml::into_chart_info`]: canonical metadata back to
+    /// the YAML adapter for `info.yml` write-back (PMCORE-23). Straight field
+    /// copy — the read-side conditionals in `into_chart_info` never drop a
+    /// non-default value, so the round-trip is lossless.
+    fn from(info: &ChartInfo) -> Self {
+        Self {
+            id: info.id,
+            uploader: info.uploader,
+            name: info.name.clone(),
+            difficulty: info.difficulty,
+            level: info.level.clone(),
+            charter: info.charter.clone(),
+            composer: info.composer.clone(),
+            illustrator: info.illustrator.clone(),
+            chart: info.chart.clone(),
+            format: info.format.clone(),
+            music: info.music.clone(),
+            illustration: info.illustration.clone(),
+            unlock_video: info.unlock_video.clone(),
+            preview_start: info.preview_start,
+            preview_end: info.preview_end,
+            aspect_ratio: info.aspect_ratio,
+            background_dim: info.background_dim,
+            line_length: info.line_length,
+            offset: info.offset,
+            tip: info.tip.clone(),
+            tags: info.tags.clone(),
+            intro: info.intro.clone(),
+            hold_partial_cover: info.hold_partial_cover,
+            note_uniform_scale: info.note_uniform_scale,
+            force_aspect_ratio: info.force_aspect_ratio,
+            use_rpe_170_speed: info.use_rpe_170_speed,
+            use_attach_ui_fix: info.use_attach_ui_fix,
+        }
     }
 }
 

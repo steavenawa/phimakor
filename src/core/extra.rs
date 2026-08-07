@@ -154,8 +154,8 @@ fn resolve_value(val: &serde_json::Value, beat: f64) -> Vec<f32> {
                 let mut last_val = 0.0f32;
                 for item in arr {
                     if let Some(obj) = item.as_object() {
-                        let sb = obj.get("startTime").and_then(|t| parse_triple_value(t)).unwrap_or(0.0);
-                        let eb = obj.get("endTime").and_then(|t| parse_triple_value(t)).unwrap_or(0.0);
+                        let sb = obj.get("startTime").and_then(|t| crate::core::bpm::triple_to_beats(t)).unwrap_or(0.0);
+                        let eb = obj.get("endTime").and_then(|t| crate::core::bpm::triple_to_beats(t)).unwrap_or(0.0);
                         let end_val = obj.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
                         if beat >= sb && beat <= eb {
                             let start = obj.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
@@ -175,8 +175,8 @@ fn resolve_value(val: &serde_json::Value, beat: f64) -> Vec<f32> {
         }
         serde_json::Value::Object(obj) => {
             // Single keyframe object
-            let sb = obj.get("startTime").and_then(|t| parse_triple_value(t)).unwrap_or(0.0);
-            let eb = obj.get("endTime").and_then(|t| parse_triple_value(t)).unwrap_or(0.0);
+            let sb = obj.get("startTime").and_then(|t| crate::core::bpm::triple_to_beats(t)).unwrap_or(0.0);
+            let eb = obj.get("endTime").and_then(|t| crate::core::bpm::triple_to_beats(t)).unwrap_or(0.0);
             let start = obj.get("start").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             let end = obj.get("end").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
             let easing = obj.get("easingType").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
@@ -185,19 +185,6 @@ fn resolve_value(val: &serde_json::Value, beat: f64) -> Vec<f32> {
             vec![start + (end - start) * t]
         }
         _ => vec![0.0],
-    }
-}
-
-fn parse_triple_value(v: &serde_json::Value) -> Option<f64> {
-    match v {
-        serde_json::Value::Array(arr) if arr.len() >= 2 => {
-            let i = arr[0].as_i64()? as i32;
-            let n = arr[1].as_i64()? as u32;
-            let d = arr.get(2).and_then(|v| v.as_i64()).unwrap_or(1) as u32;
-            Some((i as f64) + (n as f64) / (d as f64).max(1.0))
-        }
-        serde_json::Value::Number(n) => n.as_f64(),
-        _ => None,
     }
 }
 

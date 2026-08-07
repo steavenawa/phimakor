@@ -52,6 +52,8 @@
 //! doc.add_bpm(180.0, 4.0)                   # BPM timeline editing
 //! doc.remove_bpm(1)
 //! doc.replace_bpm(1, 90.0, 2.0)
+//! doc.is_dirty()                            # pending-edit check
+//! doc.save_background(); doc.flush()        # async disk write + wait
 //! ```
 
 use crate::core::{
@@ -633,7 +635,7 @@ impl PyChartDocument {
             "move_y" => EventKind::MoveY, "rotate" => EventKind::Rotate,
             "speed" => EventKind::Speed, _ => return Err(EditError::BadOp(format!("unknown event kind {kind}")).into()),
         };
-        self.inner.add_event(line, layer, ek, event.inner.clone()).map_err(|e| PyErr::from(e))
+self.inner.add_event(line, layer, ek, event.inner.clone()).map(|_| ()).map_err(|e| PyErr::from(e))
     }
 
     /// `kind` is one of: "alpha", "move_x", "move_y", "rotate", "speed".
@@ -760,7 +762,8 @@ impl PyEvalEffect {
     fn __repr__(&self) -> String { format!("EvalEffect({})", self.0.shader_name) }
 }
 
-/// Detect chart format by file content. Returns "rpe", "pec", "pgr", "pss", or "unknown".
+/// Detect chart format by file content. Returns "pmk", "rpe", "pec", "pgr",
+/// "pss", or "unknown".
 #[pyfunction]
 fn detect_format(path: &str) -> PyResult<String> {
     let bytes = std::fs::read(std::path::Path::new(path))
@@ -774,7 +777,7 @@ fn detect_format_bytes(bytes: Vec<u8>) -> String {
     crate::core::chart_format::detect_format(&bytes).to_string()
 }
 
-/// Parse a chart file (raw RPE/PEC/PGR/PSS bytes) into an [`RPEChart`].
+/// Parse a chart file (raw PMK/RPE/PEC/PGR/PSS bytes) into an [`RPEChart`].
 #[pyfunction]
 fn parse_chart(format: &str, path: &str) -> PyResult<PyRPEChart> {
     let bytes = std::fs::read(std::path::Path::new(path))
@@ -786,6 +789,7 @@ fn parse_chart(format: &str, path: &str) -> PyResult<PyRPEChart> {
 }
 
 /// Parse chart bytes into an [`RPEChart`] (no file system needed).
+/// `format` is one of: "pmk", "rpe", "pec", "pgr", "pss".
 #[pyfunction]
 fn parse_chart_bytes(format: &str, bytes: Vec<u8>) -> PyResult<PyRPEChart> {
     let info = ChartInfo::default();

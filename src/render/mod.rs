@@ -24,6 +24,7 @@ use crate::core::FrameState;
 
 mod fx;
 pub mod effects_chain;
+mod pipeline_cache;
 pub mod post;
 pub mod preview;
 pub mod shaders;
@@ -239,6 +240,471 @@ struct TexEntry {
     size: [f32; 2],
 }
 
+/// Immutable per-frame scene-build context shared with worker threads
+/// (PMCORE-73). All wgpu handles are `Send + Sync` (Arc-backed), and
+/// `LineState` is plain data, so a shared `&SceneCtx` moves across
+/// `std::thread::scope` workers safely — the main thread only submits.
+struct SceneCtx<'a> {
+    textures: &'a HashMap<String, TexEntry>,
+    white: &'a wgpu::BindGroup,
+    letterbox: Mat3,
+    kx: f32,
+    ev_x: f32,
+    ev_y: f32,
+    line_length: f32,
+    aggressive: u32,
+}
+
+/// Build the `DrawCmd` list for a z-sorted chunk of judge lines (worker task).
+/// Pure function of the shared context — no `&mut` state. Chunks are
+/// contiguous in z-order, so concatenating their output reproduces the old
+/// single-threaded loop exactly.
+fn build_line_cmds<'a>(lines: &[&'a crate::core::LineState], ctx: &SceneCtx<'a>) -> Vec<DrawCmd<'a>> {
+    let (letterbox, kx, ev_x, ev_y) = (ctx.letterbox, ctx.kx, ctx.ev_x, ctx.ev_y);
+    let mut cmds: Vec<DrawCmd<'a>> = Vec::with_capacity(lines.iter().map(|l| 1 + 3 * l.notes.len()).sum());
+    for line in lines {
+        if line.pe_hide || line.attach_ui.is_some() { continue; }
+        // [E] CtrlObject: ctrl_alpha scales the line's final alpha.
+        let line_alpha = line.alpha * line.ctrl_alpha;
+        // T * R * S: translate to position, rotate around self, scale
+        // [E] CtrlObject: ctrl_pos is a multiplier (phira applies to incline);
+        // ctrl_size scales the line.
+        let ctrl_px = line.position[0] * CANVAS_W * ev_x;
+        let ctrl_py = line.position[1] * CANVAS_H * ev_y;
+        let line_m = mat_mul(
+            &letterbox,
+            &mat_mul(
+                &mat_translate(ctrl_px, ctrl_py),
+                &mat_mul(
+                    &mat_rotate(line.rotation),
+                    &mat_scale(line.scale[0] * line.ctrl_size_x, line.scale[1] * line.ctrl_size_y),
+                ),
+            ),
+        );
+
+        // Line quad.
+        match &line.texture {
+            None => {
+                let c = line.color;
+                cmds.push(DrawCmd {
+                    uniform: DrawUniform {
+                            model: mat_mul(&line_m, &mat_scale(LINE_LEN * ctx.line_length / 6.0, LINE_THICK)),
+                        color: [c[0], c[1], c[2], c[3] * line_alpha],
+                        uv_rect: [0., 0., 1., 1.],
+                    },
+                    tex: ctx.white,
+                });
+            }
+            Some(name) => {
+                let c = line.color;
+                if let Some(t) = ctx.textures.get(name) {
+                    // [Texture] raw_scale = line.scale / (2/1350). For lines without
+                    // scale events, line.scale = 1.0 (identity) but the implicit factor
+                    // 2/RPE_WIDTH must still apply → fall back to 2.0.
+                    let raw_sx = if (line.scale[0] - 1.0).abs() < 1e-6 { 2.0 } else { line.scale[0] * 675.0 };
+                    let raw_sy = if (line.scale[1] - 1.0).abs() < 1e-6 { 2.0 } else { line.scale[1] * 675.0 };
+                    let tw = t.size[0] * raw_sx / kx;
+                    let th = t.size[1] * raw_sy / kx;
+                    let tex_m = mat_mul(
+                        &letterbox,
+                        &mat_mul(
+                            &mat_translate(ctrl_px, ctrl_py),
+                            &mat_mul(&mat_rotate(line.rotation), &mat_scale(tw, th)),
+                        ),
+                    );
+                    cmds.push(DrawCmd {
+                        uniform: DrawUniform {
+                            model: tex_m,
+                            color: [c[0], c[1], c[2], c[3] * line_alpha],
+                            uv_rect: [0., 0., 1., 1.],
+                        },
+                        tex: &t.bind_group,
+                    });
+                } else {
+                    // Fallback: draw default white bar if texture not found
+                    cmds.push(DrawCmd {
+                        uniform: DrawUniform {
+                        model: mat_mul(&line_m, &mat_scale(LINE_LEN * ctx.line_length / 6.0, LINE_THICK)),
+                            color: [c[0], c[1], c[2], c[3] * line_alpha],
+                            uv_rect: [0., 0., 1., 1.],
+                        },
+                        tex: ctx.white,
+                    });
+                }
+            }
+        }
+
+        // Notes follow the line's translation AND rotation, but NOT its
+        // scale or alpha (locked product decision).
+        let note_m = mat_mul(
+            &letterbox,
+            &mat_mul(
+                &mat_translate(ctrl_px, ctrl_py),
+                &mat_rotate(line.rotation),
+            ),
+        );
+        // Notes: below-notes first, above-notes after (contract).
+        // Within each group draw by kind priority (prpr NoteKind::order):
+        // hold at the bottom, then drag, tap, flick on top.
+        for &above in &[false, true] {
+            for kind in [2u8, 4, 1, 3] {
+                for note in line.notes.iter().filter(|n| n.above == above && n.kind == kind) {
+                let rgb = match note.kind {
+                    1 => TAP_COLOR,
+                    2 => HOLD_COLOR,
+                    3 => FLICK_COLOR,
+                    4 => DRAG_COLOR,
+                    _ => continue,
+                };
+                // Multi-press hint: prefer the _mh sprite when flagged and
+                // loaded, else the normal sprite, else colored quads.
+                let (base, mh) = match note.kind {
+                    1 => ("note:click", "note:click_mh"),
+                    2 => ("note:hold", "note:hold_mh"),
+                    3 => ("note:flick", "note:flick_mh"),
+                    4 => ("note:drag", "note:drag_mh"),
+                    _ => continue,
+                };
+                // prpr: _mh sprites render wider by mh_width/normal_width
+                // (note.rs scale factor), e.g. 1089/989 ≈ 1.10 for click.
+                let (sprite, mh_factor, is_mh) = if note.multiple_hint {
+                    match (ctx.textures.get(mh), ctx.textures.get(base)) {
+                        (Some(m), Some(b)) => (Some(m), m.size[0] / b.size[0], true),
+                        (m, b) => (m.or(b), 1.0, false),
+                    }
+                } else {
+                    (ctx.textures.get(base), 1.0, false)
+                };
+                let alpha = note.alpha;
+                // fake notes render at full opacity (character art etc.)
+                if alpha <= 0.0 {
+                    continue;
+                }
+                // [F] Incline: perspective X distortion based on note Y position
+                let incline_factor = 1.0 - line.incline_sin * note.relative[1] * 0.5;
+                // [E] CtrlObject from LineState (evaluated in state_at)
+                let ctrl_y = line.ctrl_y;
+                let x = note.relative[0] * CANVAS_W * ev_x;
+                // [E] ctrl_y scales the note's relative Y position
+                let y = note.relative[1] * CANVAS_H * ev_y * ctrl_y;
+                let note_base = mat_mul(&note_m, &mat_translate(x, y));
+
+                // [C] Canvas-space culling: the quad's bounding circle vs
+                // the playfield box AABB [±CANVAS_W]×[±CANVAS_H]. The
+                // letterbox maps that rectangle to the whole window, so
+                // anything fully outside it is off-screen — skipping it
+                // saves instance upload + rasterization. Conservative
+                // for any line rotation (circle encloses the rotated
+                // quad). Local (lx, ly) is pre-rotation canvas space.
+                let (cxn, cyn) = (line.rotation.cos(), line.rotation.sin());
+                let to_canvas = |lx: f32, ly: f32| -> (f32, f32) {
+                    (ctrl_px + cxn * lx - cyn * ly, ctrl_py + cyn * lx + cxn * ly)
+                };
+                let (cx0, cy0) = to_canvas(x, y);
+                let outside = |qx: f32, qy: f32, r: f32| {
+                    qx + r < -CANVAS_W || qx - r > CANVAS_W || qy + r < -CANVAS_H || qy - r > CANVAS_H
+                };
+
+                match (note.kind, sprite) {
+                    (1 | 3 | 4, Some(t)) => {
+                        let w = NOTE_SPRITE_W * note.scale * mh_factor * incline_factor;
+                        let h = w * t.size[1] / t.size[0];
+                        if !outside(cx0, cy0, (w * w + h * h).sqrt() * 0.5) {
+                            cmds.push(DrawCmd {
+                                uniform: DrawUniform {
+                                    model: mat_mul(&note_base, &mat_scale(w, h)),
+                                    color: [1.0, 1.0, 1.0, alpha],
+                                    uv_rect: [0., 0., 1., 1.],
+                                },
+                                tex: &t.bind_group,
+                            });
+                        }
+                    }
+                    // Textured hold: atlas = TAIL (image top) + stretchable
+                    // body + HEAD (image bottom). _mh atlas has a taller
+                    // head (holdAtlasMH = [50 tail, 95 head]). Textures are
+                    // flipped at upload: head = v0, tail = v1. body→head→tail.
+                    (2, Some(t)) => {
+                        let w = NOTE_SPRITE_W * note.scale * mh_factor * incline_factor;
+                        let (tail_px, head_px) = if is_mh { (50.0, 95.0) } else { (HOLD_CAP_PX, HOLD_CAP_PX) };
+                        let head_uv = head_px / t.size[1]; // v0-fraction for head
+                        let tail_uv = tail_px / t.size[1];
+                        let head_h = w * head_px / t.size[0]; // quad heights
+                        let tail_h = w * tail_px / t.size[0];
+                        let tint = [1.0, 1.0, 1.0, alpha];
+                        // [B] chart.rs negates relative[1] for below notes; mirror UV
+                        // so the hold body gradient (head→tail) stays correct.
+                        let v_at = |v0: f32, len: f32| -> [f32; 4] {
+                            if note.above { [0., v0, 1., len] } else { [0., v0 + len, 1., -len] }
+                        };
+                        // [B] Hold body/head/tail each get below_rot at their position
+                        let hd = |cy: f32| mat_mul(&note_m, &mat_mul(
+                            &mat_translate(x, cy), &mat_scale(w, w),
+                        ));
+                        if let Some(end_y) = note.hold_end_y {
+                            let y1 = end_y as f32 * CANVAS_H * ev_y * ctrl_y;
+                            let (head_y, tail_y) = (y, y1);
+                            // [FIX] 头尾偏移:body 从 head 边缘延伸到 tail 边缘,
+                            // 否则 body 与头尾中心重叠(中段和头尾重叠 bug)。
+                            let (h0, h1) = if tail_y >= head_y {
+                                (head_y + head_h * 0.5, tail_y - tail_h * 0.5)
+                            } else {
+                                (head_y - head_h * 0.5, tail_y + tail_h * 0.5)
+                            };
+                            let bh = (h1 - h0).abs();
+                            if bh > 1e-5 {
+                                if ctx.aggressive & AGGRESSIVE_HOLD_CLIP != 0 {
+                                    // [C] 过激优化(设置里开):hold body 沿
+                                    // 线方向裁剪。线段(head边缘→tail边缘,
+                                    // 含线旋转)与画布矩形求交(Liang-Barsky),
+                                    // 可见长度用勾股定理 sqrt(dx²+dy²);
+                                    // 矩形按半宽膨胀,线在视口外时 body 宽边
+                                    // 仍可见。UV 按沿 body 方向的投影比例映射,
+                                    // head 端渐变在速度事件下仍锚定 head。
+                                    let (ax, ay) = to_canvas(x, h0);
+                                    let (bx, by) = to_canvas(x, h1);
+                                    let (dx, dy) = (bx - ax, by - ay);
+                                    let _len = (dx * dx + dy * dy).sqrt();
+                                    let hw = w * 0.5;
+                                    if let Some((t0, t1)) = clip_segment(
+                                        (ax, ay), (bx, by),
+                                        -CANVAS_W - hw, CANVAS_W + hw,
+                                        -CANVAS_H - hw, CANVAS_H + hw,
+                                    ) {
+                                        if t1 - t0 > 1e-6 {
+                                            let (x0, y0) = (ax + dx * t0, ay + dy * t0);
+                                            let (x1, y1) = (ax + dx * t1, ay + dy * t1);
+                                            let vis_len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+                                            // Visible segment midpoint, rotated
+                                            // back into line-local space (the
+                                            // quad's local Y axis then aligns
+                                            // with the body direction again).
+                                            let rel_x = (x0 + x1) * 0.5 - ctrl_px;
+                                            let rel_y = (y0 + y1) * 0.5 - ctrl_py;
+                                            let lcx = cxn * rel_x + cyn * rel_y;
+                                            let lcy = -cyn * rel_x + cxn * rel_y;
+                                            let body_len = 1.0 - head_uv - tail_uv;
+                                            cmds.push(DrawCmd {
+                                                uniform: DrawUniform {
+                                                    model: mat_mul(&note_m, &mat_mul(
+                                                        &mat_translate(lcx, lcy),
+                                                        &mat_scale(w, vis_len),
+                                                    )),
+                                                    color: tint,
+                                                    uv_rect: v_at(head_uv + body_len * t0, body_len * (t1 - t0)),
+                                                },
+                                                tex: &t.bind_group,
+                                            });
+                                        }
+                                    }
+                                } else {
+                                    cmds.push(DrawCmd {
+                                        uniform: DrawUniform {
+                                            model: mat_mul(&hd((h0 + h1) * 0.5), &mat_scale(1.0, bh / w)),
+                                            color: tint,
+                                            uv_rect: v_at(head_uv, 1. - head_uv - tail_uv),
+                                        },
+                                        tex: &t.bind_group,
+                                    });
+                                }
+                            }
+                            for (cy, v0, len, quad_h) in [
+                                (head_y, 0.0, head_uv, head_h),
+                                (tail_y, 1.0 - tail_uv, tail_uv, tail_h),
+                            ] {
+                                // [C] head/tail: bounding-circle cull.
+                                if !outside(to_canvas(x, cy).0, to_canvas(x, cy).1, (w * w + quad_h * quad_h).sqrt() * 0.5) {
+                                    cmds.push(DrawCmd {
+                                        uniform: DrawUniform {
+                                            model: mat_mul(&hd(cy), &mat_scale(1.0, quad_h / w)),
+                                            color: tint,
+                                            uv_rect: v_at(v0, len),
+                                        },
+                                        tex: &t.bind_group,
+                                    });
+                                }
+                            }
+                        } else {
+                            if !outside(cx0, cy0, (w * w + head_h * head_h).sqrt() * 0.5) {
+                                cmds.push(DrawCmd {
+                                    uniform: DrawUniform {
+                                        model: mat_mul(&hd(y), &mat_scale(1.0, head_h / w)),
+                                        color: tint,
+                                        uv_rect: v_at(0., head_uv),
+                                    },
+                                    tex: &t.bind_group,
+                                });
+                            }
+                        }
+                    }
+                    // Colored-quad fallback (no sprite loaded).
+                    _ => {
+                        // [B] below rotation applies to all fallback quads too
+                        let nb = || mat_mul(&note_m, &mat_translate(x, y));
+                        if note.kind == 2 {
+                            if let Some(end_y) = note.hold_end_y {
+                            let y1 = end_y as f32 * CANVAS_H * ev_y * ctrl_y;
+                                let h = (y1 - y).abs();
+                                let wb = HOLD_BODY_W * note.scale * incline_factor;
+                                if h > 1e-5 && !outside(to_canvas(x, (y + y1) * 0.5).0, to_canvas(x, (y + y1) * 0.5).1, (wb * wb + h * h).sqrt() * 0.5) {
+                                    cmds.push(DrawCmd {
+                                        uniform: DrawUniform {
+                                            model: mat_mul(&nb(), &mat_scale(wb, h)),
+                                            color: [rgb[0], rgb[1], rgb[2], alpha],
+                                            uv_rect: [0., 0., 1., 1.],
+                                        },
+                                        tex: ctx.white,
+                                    });
+                                }
+                            }
+                        }
+                        let wq = NOTE_W * note.scale * incline_factor;
+                        let hq = NOTE_H * note.scale;
+                        if !outside(cx0, cy0, (wq * wq + hq * hq).sqrt() * 0.5) {
+                            cmds.push(DrawCmd {
+                                uniform: DrawUniform {
+                                    model: mat_mul(&nb(), &mat_scale(wq, hq)),
+                                    color: [rgb[0], rgb[1], rgb[2], alpha],
+                                    uv_rect: [0., 0., 1., 1.],
+                                },
+                                tex: ctx.white,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        }
+    }
+    cmds
+}
+
+/// Convert `DrawCmd`s to GPU instances, applying the global rgb `dim` on the
+/// CPU (mirrors the old inline `instances.extend(cmds.iter().map(...))`).
+/// 字段级 HUD 文本缓存:值没变返回上次的 `&str`(零分配),变了才重建。
+fn hud_fmt<T: PartialEq>(cache: &mut (T, String), v: T, f: impl FnOnce(&T) -> String) -> &str {
+    if cache.0 != v {
+        cache.1 = f(&v);
+        cache.0 = v;
+    }
+    &cache.1
+}
+
+fn to_instances(cmds: &[DrawCmd<'_>], dim: f32) -> Vec<Instance> {
+    cmds.iter()
+        .map(|cmd| {
+            let u = &cmd.uniform;
+            Instance {
+                model: instance_model(&u.model),
+                color: [u.color[0] * dim, u.color[1] * dim, u.color[2] * dim, u.color[3]],
+                uv_rect: u.uv_rect,
+            }
+        })
+        .collect()
+}
+
+/// PMCORE-73: one worker's full scene slice — build the chunk's cmds +
+/// instances, upload them to a chunk-local vertex buffer, and record the
+/// scene render pass into `scene_view` as its own command buffer. Only chunk
+/// 0 clears the target (and draws the opaque background quad); later chunks
+/// `Load` on top. Submitting the buffers in order therefore reproduces the
+/// old single-pass output byte-for-byte, and `queue.submit` sees multiple
+/// command buffers in one call.
+#[allow(clippy::too_many_arguments)]
+fn encode_scene_chunk<'a>(
+    chunk: &[&'a crate::core::LineState],
+    ctx: &SceneCtx<'a>,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    pipeline: &wgpu::RenderPipeline,
+    opaque: &wgpu::RenderPipeline,
+    scene_view: &wgpu::TextureView,
+    first: bool,
+    bg: Option<(Mat3, [f32; 4], &'a wgpu::BindGroup)>,
+    bg_instance: Option<Instance>,
+    timers: Option<&GpuTimers>,
+    dim: f32,
+) -> wgpu::CommandBuffer {
+    // Black 30 % overlay sits under every judge line; it is the first scene
+    // cmd (chunk 0 only — the background quad owns instance 0).
+    let mut cmds: Vec<DrawCmd<'a>> = Vec::with_capacity(
+        chunk.iter().map(|l| 1 + 3 * l.notes.len()).sum::<usize>() + usize::from(bg.is_some()),
+    );
+    if let Some((bg_m, _, _)) = &bg {
+        cmds.push(DrawCmd {
+            uniform: DrawUniform { model: *bg_m, color: [0., 0., 0., 0.3], uv_rect: [0., 0., 1., 1.] },
+            tex: ctx.white,
+        });
+    }
+    cmds.extend(build_line_cmds(chunk, ctx));
+    // 单遍构建:先推背景实例再 extend,避免 to_instances 后的 insert(0) 全量移位。
+    let mut instances: Vec<Instance> = Vec::with_capacity(cmds.len() + usize::from(bg_instance.is_some()));
+    if let Some(bgi) = bg_instance {
+        instances.push(bgi);
+    }
+    instances.extend(to_instances(&cmds, dim));
+    // Chunk-local buffer: created per frame on the worker (wgpu drops it once
+    // the submitted command buffer finishes executing). Small (≤ a few 100 KB)
+    // and one-shot, so no pooling bookkeeping is worth it. Size ≥ 1 even for
+    // fully-culled chunks (wgpu rejects zero-size buffers).
+    let buf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("scene-chunk-instances"),
+        size: ((instances.len() as u64) * size_of::<Instance>() as u64).max(1),
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    if !instances.is_empty() {
+        queue.write_buffer(&buf, 0, bytemuck::cast_slice(&instances));
+    }
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("scene-chunk") });
+    // GPU 计时 t0:scene pass 起点(chunk 0 的 cb 最先提交,先于其余 chunk)。
+    if let Some(t) = timers {
+        encoder.write_timestamp(&t.query_set, 0);
+    }
+    let base = usize::from(bg.is_some());
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: scene_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    // Chunk 0 always clears (even without a background image);
+                    // later chunks `Load` the previous chunks' output.
+                    load: if first {
+                        wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                    } else {
+                        wgpu::LoadOp::Load
+                    },
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(pipeline);
+        pass.set_vertex_buffer(0, buf.slice(..));
+        // [C] Background sits at instance 0 (fully opaque, no-blend pass);
+        // cmds follow at offset 1 with the alpha pipeline. The draw loop
+        // keeps cmd ordering (translucent layering stays correct).
+        if base == 1 {
+            pass.set_pipeline(opaque);
+            pass.set_bind_group(0, bg.expect("base==1 implies bg").2, &[]);
+            pass.draw(0..4, 0..1);
+        }
+        pass.set_pipeline(pipeline);
+        let mut start = 0usize;
+        for i in 1..=cmds.len() {
+            if i == cmds.len() || !std::ptr::eq(cmds[i].tex, cmds[start].tex) {
+                pass.set_bind_group(0, cmds[start].tex, &[]);
+                pass.draw(0..4, (start + base) as u32..(i + base) as u32);
+                start = i;
+            }
+        }
+    }
+    encoder.finish()
+}
+
 const SHADER: &str = r#"
 @group(0) @binding(0) var tex: texture_2d<f32>;
 @group(0) @binding(1) var samp: sampler;
@@ -294,6 +760,7 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 pub(crate) fn create_pipeline(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
+    cache: Option<&wgpu::PipelineCache>,
 ) -> (wgpu::RenderPipeline, wgpu::RenderPipeline, wgpu::BindGroupLayout, wgpu::Sampler) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("phimakor-quad"),
@@ -353,7 +820,7 @@ pub(crate) fn create_pipeline(
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache,
         })
     };
     let pipeline = make(Some(wgpu::BlendState::ALPHA_BLENDING));
@@ -449,6 +916,10 @@ pub struct Renderer {
     progress: f32,
     /// Phigros-style HUD (song/difficulty/score/combo/pause) drawn each frame.
     hud: HudData,
+    /// HUD 数字文本字段级缓存:(上次值, 文本)。值没变则复用 String,
+    /// 免去每帧 format! 分配(score/combo 只在命中时变化)。
+    hud_score_txt: (u32, String),
+    hud_combo_txt: (u32, String),
     /// Screen rect of the pause button (window px), for hit-testing.
     pause_rect: PauseHitRect,
     pub vsync: bool,
@@ -472,6 +943,9 @@ pub struct Renderer {
     ui_inst_buf: wgpu::Buffer,
     /// 可选 GPU 计时(env PHIMAKOR_GPU_TIMING=1 启用,默认 None 零开销)。
     gpu_timers: Option<GpuTimers>,
+    /// 管线缓存(PMCORE-68):所有 create_render_pipeline 共享的种子/收集器。
+    /// `None` = 禁用开关或设备不支持;懒加载特效管线经 post 方法带引用。
+    pipeline_cache: Option<wgpu::PipelineCache>,
 }
 
 /// GPU 渲染耗时计时:每帧两个 timestamp(scene pass 起止),resolve 后读回。
@@ -636,6 +1110,12 @@ impl Renderer {
                     if adapter.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
                         f |= wgpu::Features::TEXTURE_COMPRESSION_BC;
                     }
+                    // 管线缓存(PMCORE-68):支持才请求;禁用开关时与现状完全一致。
+                    if pipeline_cache::enabled()
+                        && adapter.features().contains(wgpu::Features::PIPELINE_CACHE)
+                    {
+                        f |= wgpu::Features::PIPELINE_CACHE;
+                    }
                     f
                 },
                 required_limits: wgpu::Limits::default(),
@@ -654,7 +1134,31 @@ impl Renderer {
             None => (None, None),
         };
 
-        let (pipeline, opaque_pipeline, tex_bgl, sampler) = create_pipeline(&device, format);
+        // PMCORE-68:管线缓存持久化。种子只来自本进程上次 get_data() 的
+        // 写盘输出;wgpu 内部校验 magic/version/backend/adapter/validation
+        // key,不匹配由 fallback:true 静默回退为空缓存,不崩溃。
+        let pipeline_cache = if pipeline_cache::enabled()
+            && device.features().contains(wgpu::Features::PIPELINE_CACHE)
+        {
+            let seed = pipeline_cache::load_seed();
+            // SAFETY: data 仅来自上一次 PipelineCache::get_data() 的产物
+            // (本进程或本应用先前运行的写盘输出),满足
+            // create_pipeline_cache 的 safety 条件;外部篡改/换 GPU/换驱动
+            // 由 wgpu 头校验 + fallback:true 兜底,无效数据不会被执行。
+            let cache = unsafe {
+                device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                    label: Some("phimakor-pipeline-cache"),
+                    data: seed.as_deref(),
+                    fallback: true,
+                })
+            };
+            Some(cache)
+        } else {
+            None
+        };
+
+        let (pipeline, opaque_pipeline, tex_bgl, sampler) =
+            create_pipeline(&device, format, pipeline_cache.as_ref());
 
         let instance_bufs = [
             Self::make_instance_buf(&device, INITIAL_DRAW_CAPACITY),
@@ -708,7 +1212,7 @@ impl Renderer {
             Self::texture_bind_group(&device, &tex_bgl, &sampler, &tex)
         };
 
-        let post = post::PostPipe::new(&device, width, height, format);
+        let post = post::PostPipe::new(&device, width, height, format, pipeline_cache.as_ref());
         let bc_supported = device.features().contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
         let scene_tex = Some(post::PostPipe::make_target2(&device, width, height, "scene", format));
         let scene_view = Some(scene_tex.as_ref().unwrap().create_view(&wgpu::TextureViewDescriptor::default()));
@@ -723,6 +1227,10 @@ impl Renderer {
         } else {
             None
         };
+        // 启动期管线(quad×2 + blit)已建完:立即写回缓存,首次启动落盘。
+        if let Some(c) = &pipeline_cache {
+            pipeline_cache::save(c);
+        }
         Ok(Self {
             instance,
             surface,
@@ -743,6 +1251,7 @@ impl Renderer {
             texture_compress: true,
             bc_supported,
             textures: HashMap::new(),
+            pipeline_cache,
             gpu_timers,
             background: None,
             background_dim: 1.0,
@@ -750,6 +1259,8 @@ impl Renderer {
             line_length: 6.0,
             progress: 0.0,
             hud: HudData::default(),
+            hud_score_txt: (0, String::new()),
+            hud_combo_txt: (0, String::new()),
             pause_rect: PauseHitRect::default(),
             post,
             scene_tex,
@@ -806,8 +1317,10 @@ impl Renderer {
         } else {
             rgba.to_vec()
         };
-        let texture = if compress {
+        let texture = if compress && nw >= 4 && nh >= 4 {
             // BC3(DXT5):RGBA 块压缩,4:1。API:Format::compress(texpresso 2.x)。
+            // 子 4px 纹理(如 1x1 PNG)压缩对齐后尺寸 < 块宽,wgpu 会以
+            // Validation Error panic——回退 RGBA8(PMCORE-71 实测发现)。
             let mut blocks = vec![0u8; texpresso::Format::Bc3.compressed_size(nw as usize, nh as usize)];
             texpresso::Format::Bc3.compress(&data, nw as usize, nh as usize, texpresso::Params::default(), &mut blocks);
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -946,14 +1459,24 @@ impl Renderer {
     /// 消除"特效首次出现时惰性编译卡帧"。
     pub fn warmup_effects(&mut self) {
         self.post.start_warmup();
-        let _ = self.post.tick_warmup(&self.device, 4096);
+        let _ = self.post.tick_warmup(&self.device, 4096, self.pipeline_cache.as_ref());
+        self.save_pipeline_cache();
     }
 
     /// 预热当前谱目录的全部自定义 WGSL shader(切谱加载完成后调用)。
     /// 自定义特效首次激活时的同步编译(磁盘 I/O + pipeline 编译 tens of
     /// ms)是运行时尖峰源——编译挪到切谱瞬间一次性完成。
     pub fn warmup_custom_effects(&mut self) {
-        self.post.warmup_custom(&self.device);
+        self.post.warmup_custom(&self.device, self.pipeline_cache.as_ref());
+        self.save_pipeline_cache();
+    }
+
+    /// 写回管线缓存(get_data → 原子写 tmp+rename)。失败只告警不阻塞;
+    /// 由 init/预热/析构调用,永不在稳态帧循环里触发磁盘写。
+    fn save_pipeline_cache(&self) {
+        if let Some(cache) = &self.pipeline_cache {
+            pipeline_cache::save(cache);
+        }
     }
 
     /// Enable or disable V-sync (reconfigures the surface present mode).
@@ -995,17 +1518,33 @@ impl Renderer {
         }
     }
 
-    pub fn set_background(&mut self, img_bytes: &[u8], dim: f32) -> anyhow::Result<()> {
-        // Static Gaussian blur at load time.
+    /// 背景高斯模糊 σ(PMCORE-66:所有背景模糊路径共用,单点定义)。
+    pub const BACKGROUND_BLUR_SIGMA: f32 = 8.0;
+
+    /// 解码 + fastblur 高斯模糊 → RGBA(alpha=255),输出尺寸与源图一致。
+    /// 背景不翻转(原 set_background 无 flip,与 upload_image 不同)。
+    /// 主加载路径(load_chart_async)与 set_background 共用
+    /// (fastblur SIMD 替代 image::imageops::blur,σ=8,PMCORE-66)。
+    pub fn blur_background_rgba(img_bytes: &[u8]) -> anyhow::Result<(Vec<u8>, u32, u32)> {
         let img = image::load_from_memory(img_bytes)
             .context("background decode")?
-            .to_rgba8();
-        let img = image::imageops::blur(&img, 8.0); // σ = 8 px, returns new image
+            .to_rgb8();
         let (w, h) = (img.width().max(1), img.height().max(1));
-        let texture = Self::create_texture(&self.device, &self.queue, img.as_raw(), w, h);
-        let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
-        self.background = Some((bind_group, [w as f32, h as f32]));
-        self.background_dim = dim;
+        let mut raw: Vec<[u8; 3]> = img
+            .as_raw()
+            .chunks_exact(3)
+            .map(|c| [c[0], c[1], c[2]])
+            .collect();
+        fastblur::gaussian_blur(&mut raw, w as usize, h as usize, Self::BACKGROUND_BLUR_SIGMA);
+        // RGB → RGBA(alpha=255)
+        let rgba: Vec<u8> = raw.into_iter().flat_map(|[r, g, b]| [r, g, b, 255]).collect();
+        Ok((rgba, w, h))
+    }
+
+    pub fn set_background(&mut self, img_bytes: &[u8], dim: f32) -> anyhow::Result<()> {
+        // Static Gaussian blur at load time(fastblur SIMD,PMCORE-66)。
+        let (rgba, w, h) = Self::blur_background_rgba(img_bytes)?;
+        self.set_background_rgba(&rgba, w, h, dim);
         Ok(())
     }
 
@@ -1060,12 +1599,6 @@ impl Renderer {
         ))
     }
 
-    /// Window-px rect of the pause button from the last drawn frame.
-    #[allow(dead_code)] // 备用 API(窗口侧用 hit_test_pause)
-    pub fn pause_rect(&self) -> PauseHitRect {
-        self.pause_rect
-    }
-
     /// Hit-test a window-px click against the last frame's pause button.
     pub fn hit_test_pause(&self, x: f32, y: f32) -> bool {
         let r = self.pause_rect;
@@ -1096,33 +1629,6 @@ impl Renderer {
         let (bind_group, _) = self.upload_texture_rgba(rgba, w, h);
         self.background = Some((bind_group, [w as f32, h as f32]));
         self.background_dim = dim;
-    }
-
-    /// Draw one frame. wgpu 30 removed `wgpu::SurfaceError`; acquisition
-    /// failures are reported via `wgpu::CurrentSurfaceTexture`. Lost/Outdated
-    /// are handled here by reconfiguring with the stored size (frame skipped);
-    /// Timeout/Occluded skip silently; only Validation is returned as `Err`.
-    #[allow(dead_code)] // 备用 API(窗口路径用 draw_to_view)
-    pub fn render(
-        &mut self,
-        frame: &FrameState,
-        window_aspect: f32,
-        dim: f32,
-    ) -> Result<(), wgpu::CurrentSurfaceTexture> {
-        let surface = self.surface.as_ref().expect("render() requires a window surface");
-        let st = match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(st) | wgpu::CurrentSurfaceTexture::Suboptimal(st) => st,
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.reconfigure();
-                return Ok(());
-            }
-            other => return Err(other), // Validation
-        };
-        let view = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw_to_view(&view, frame, window_aspect, dim, None, None);
-        self.queue.present(st);
-        Ok(())
     }
 
     /// Build this frame's draw list and execute the render pass into `view`
@@ -1186,7 +1692,6 @@ impl Renderer {
             .iter()
             .map(|l| 1 + 3 * l.notes.len())
             .sum::<usize>();
-        let mut cmds: Vec<DrawCmd> = Vec::with_capacity(needed);
 
         // Background: cover-fill with Gaussian-blurred illustration + 30 % black
         // overlay so judge lines / notes pop against any image.
@@ -1208,334 +1713,109 @@ impl Renderer {
             let bg_m = mat_mul(&letterbox, &mat_scale(1350.0, 1350.0 / aspect));
             (bg_m, uv, bg)
         });
-        if let Some((bg_m, _, _)) = &bg_quad {
-            // 30 % black overlay
-            cmds.push(DrawCmd {
-                uniform: DrawUniform { model: *bg_m, color: [0., 0., 0., 0.3], uv_rect: [0., 0., 1., 1.] },
-                tex: &self.white,
-            });
-        }
+        // Background instance: fully opaque quad at instance 0. It keeps the
+        // stored `background_dim` (the frame `dim` applies to cmds only).
+        let bg_instance: Option<Instance> = bg_quad.as_ref().map(|(bg_m, uv, _)| Instance {
+            model: instance_model(bg_m),
+            color: [self.background_dim, self.background_dim, self.background_dim, 1.0],
+            uv_rect: *uv,
+        });
 
         // Track original index before z-sort for selection highlight
         let mut lines: Vec<(usize, &crate::core::LineState)> = frame.lines.iter().enumerate().collect();
         lines.sort_by_key(|(_, l)| l.z_order);
+        let line_refs: Vec<&crate::core::LineState> = lines.into_iter().map(|(_, l)| l).collect();
 
-        for (_orig_i, line) in &lines {
-            if line.pe_hide || line.attach_ui.is_some() { continue; }
-            // [E] CtrlObject: ctrl_alpha scales the line's final alpha.
-            let line_alpha = line.alpha * line.ctrl_alpha;
-            // T * R * S: translate to position, rotate around self, scale
-            // [E] CtrlObject: ctrl_pos is a multiplier (phira applies to incline);
-            // ctrl_size scales the line.
-            let ctrl_px = line.position[0] * CANVAS_W * ev_x;
-            let ctrl_py = line.position[1] * CANVAS_H * ev_y;
-            let line_m = mat_mul(
-                &letterbox,
-                &mat_mul(
-                    &mat_translate(ctrl_px, ctrl_py),
-                    &mat_mul(
-                        &mat_rotate(line.rotation),
-                        &mat_scale(line.scale[0] * line.ctrl_size_x, line.scale[1] * line.ctrl_size_y),
-                    ),
-                ),
-            );
-
-            // Line quad.
-            match &line.texture {
-                None => {
-                    let c = line.color;
-                    cmds.push(DrawCmd {
-                        uniform: DrawUniform {
-                                model: mat_mul(&line_m, &mat_scale(LINE_LEN * self.line_length / 6.0, LINE_THICK)),
-                            color: [c[0], c[1], c[2], c[3] * line_alpha],
-                            uv_rect: [0., 0., 1., 1.],
-                        },
-                        tex: &self.white,
+        // ── PMCORE-73: parallel scene build + encode ─────────────────────
+        // Per-line DrawCmd generation / matrix math / instance recording runs
+        // on worker threads; each worker additionally records its own scene
+        // render pass into `scene_view` (chunk-local vertex buffer). Chunk 0
+        // clears the target and draws the opaque background quad; later
+        // chunks `Load` on top — submitting the buffers in order reproduces
+        // the old single-pass output byte-for-byte. The main thread keeps the
+        // render_frame contract: it only builds the HUD/progress/fx/text
+        // extras, then submits ALL command buffers in one `queue.submit`.
+        let has_effects = { let p = &self.post; !p.active.is_empty() };
+        let scene_view: &wgpu::TextureView = if has_effects {
+            self.scene_view.as_ref().unwrap()
+        } else {
+            &view
+        };
+        let ctx = SceneCtx {
+            textures: &self.textures,
+            white: &self.white,
+            letterbox,
+            kx,
+            ev_x,
+            ev_y,
+            line_length: self.line_length,
+            aggressive: self.aggressive,
+        };
+        let n_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .clamp(1, line_refs.len().max(1));
+        // Spawning threads costs tens of µs each — only parallelize when the
+        // estimated cmd count makes it pay off (single-core machines / tiny
+        // charts / 0..1 lines fall back to the single-threaded path below).
+        // `PHIMAKOR_MT_SCENE=0` forces the single-thread path (hash/ab test
+        // hook — both paths must produce byte-identical frames).
+        let mt_scene = std::env::var_os("PHIMAKOR_MT_SCENE").is_none_or(|v| v != "0");
+        let parallel = mt_scene && n_workers > 1 && needed >= 256;
+        let mut submit: Vec<wgpu::CommandBuffer> = Vec::new();
+        if parallel {
+            let _s1 = crate::trace_span!("draw_cmds_build");
+            // Hoist shared refs into Copy locals so the closures capture only
+            // those — never `self` / `ctx` themselves. rayon::scope borrows
+            // them safely while running jobs on the PERSISTENT global pool
+            // (per-frame `std::thread::scope` spawning measured ~4 ms/frame
+            // for 20 threads on Windows — a net regression, hence rayon).
+            let ctx_ref = &ctx;
+            let device = &self.device;
+            let queue = &self.queue;
+            let pipeline = &self.pipeline;
+            let opaque = &self.opaque_pipeline;
+            let timers0 = self.gpu_timers.as_ref();
+            let per = line_refs.len().div_ceil(n_workers);
+            let n_chunks = line_refs.chunks(per).count();
+            // One slot per chunk; command buffers must end up in z-order, so
+            // each job writes its own slot (rayon completes jobs out of order).
+            let slots: Vec<std::sync::Mutex<Option<wgpu::CommandBuffer>>> =
+                (0..n_chunks).map(|_| std::sync::Mutex::new(None)).collect();
+            rayon::scope(|s| {
+                for (i, chunk) in line_refs.chunks(per).enumerate() {
+                    let first = i == 0;
+                    let bg = if first { bg_quad } else { None };
+                    let bg_inst = if first { bg_instance } else { None };
+                    let timers = if first { timers0 } else { None };
+                    let slot = &slots[i];
+                    s.spawn(move |_| {
+                        *slot.lock().expect("scene chunk slot") = Some(encode_scene_chunk(
+                            chunk,
+                            ctx_ref,
+                            device,
+                            queue,
+                            pipeline,
+                            opaque,
+                            scene_view,
+                            first,
+                            bg,
+                            bg_inst,
+                            timers,
+                            dim,
+                        ));
                     });
                 }
-                Some(name) => {
-                    let c = line.color;
-                    if let Some(t) = self.textures.get(name) {
-                        // [Texture] raw_scale = line.scale / (2/1350). For lines without
-                        // scale events, line.scale = 1.0 (identity) but the implicit factor
-                        // 2/RPE_WIDTH must still apply → fall back to 2.0.
-                        let raw_sx = if (line.scale[0] - 1.0).abs() < 1e-6 { 2.0 } else { line.scale[0] * 675.0 };
-                        let raw_sy = if (line.scale[1] - 1.0).abs() < 1e-6 { 2.0 } else { line.scale[1] * 675.0 };
-                        let tw = t.size[0] * raw_sx / kx;
-                        let th = t.size[1] * raw_sy / kx;
-                        let tex_m = mat_mul(
-                            &letterbox,
-                            &mat_mul(
-                                &mat_translate(ctrl_px, ctrl_py),
-                                &mat_mul(&mat_rotate(line.rotation), &mat_scale(tw, th)),
-                            ),
-                        );
-                        cmds.push(DrawCmd {
-                            uniform: DrawUniform {
-                                model: tex_m,
-                                color: [c[0], c[1], c[2], c[3] * line_alpha],
-                                uv_rect: [0., 0., 1., 1.],
-                            },
-                            tex: &t.bind_group,
-                        });
-                    } else {
-                        // Fallback: draw default white bar if texture not found
-                        cmds.push(DrawCmd {
-                            uniform: DrawUniform {
-                            model: mat_mul(&line_m, &mat_scale(LINE_LEN * self.line_length / 6.0, LINE_THICK)),
-                                color: [c[0], c[1], c[2], c[3] * line_alpha],
-                                uv_rect: [0., 0., 1., 1.],
-                            },
-                            tex: &self.white,
-                        });
-                    }
-                }
-            }
-
-
-
-            // Notes follow the line's translation AND rotation, but NOT its
-            // scale or alpha (locked product decision).
-            let note_m = mat_mul(
-                &letterbox,
-                &mat_mul(
-                    &mat_translate(ctrl_px, ctrl_py),
-                    &mat_rotate(line.rotation),
-                ),
-            );
-            // Notes: below-notes first, above-notes after (contract).
-            // Within each group draw by kind priority (prpr NoteKind::order):
-            // hold at the bottom, then drag, tap, flick on top.
-            for &above in &[false, true] {
-                for kind in [2u8, 4, 1, 3] {
-                    for note in line.notes.iter().filter(|n| n.above == above && n.kind == kind) {
-                    let rgb = match note.kind {
-                        1 => TAP_COLOR,
-                        2 => HOLD_COLOR,
-                        3 => FLICK_COLOR,
-                        4 => DRAG_COLOR,
-                        _ => continue,
-                    };
-                    // Multi-press hint: prefer the _mh sprite when flagged and
-                    // loaded, else the normal sprite, else colored quads.
-                    let (base, mh) = match note.kind {
-                        1 => ("note:click", "note:click_mh"),
-                        2 => ("note:hold", "note:hold_mh"),
-                        3 => ("note:flick", "note:flick_mh"),
-                        4 => ("note:drag", "note:drag_mh"),
-                        _ => continue,
-                    };
-                    // prpr: _mh sprites render wider by mh_width/normal_width
-                    // (note.rs scale factor), e.g. 1089/989 ≈ 1.10 for click.
-                    let (sprite, mh_factor, is_mh) = if note.multiple_hint {
-                        match (self.textures.get(mh), self.textures.get(base)) {
-                            (Some(m), Some(b)) => (Some(m), m.size[0] / b.size[0], true),
-                            (m, b) => (m.or(b), 1.0, false),
-                        }
-                    } else {
-                        (self.textures.get(base), 1.0, false)
-                    };
-                    let alpha = note.alpha;
-                    // fake notes render at full opacity (character art etc.)
-                    if alpha <= 0.0 {
-                        continue;
-                    }
-                    // [F] Incline: perspective X distortion based on note Y position
-                    let incline_factor = 1.0 - line.incline_sin * note.relative[1] * 0.5;
-                    // [E] CtrlObject from LineState (evaluated in state_at)
-                    let ctrl_y = line.ctrl_y;
-                    let x = note.relative[0] * CANVAS_W * ev_x;
-                    // [E] ctrl_y scales the note's relative Y position
-                    let y = note.relative[1] * CANVAS_H * ev_y * ctrl_y;
-                    let note_base = mat_mul(&note_m, &mat_translate(x, y));
-
-                    // [C] Canvas-space culling: the quad's bounding circle vs
-                    // the playfield box AABB [±CANVAS_W]×[±CANVAS_H]. The
-                    // letterbox maps that rectangle to the whole window, so
-                    // anything fully outside it is off-screen — skipping it
-                    // saves instance upload + rasterization. Conservative
-                    // for any line rotation (circle encloses the rotated
-                    // quad). Local (lx, ly) is pre-rotation canvas space.
-                    let (cxn, cyn) = (line.rotation.cos(), line.rotation.sin());
-                    let to_canvas = |lx: f32, ly: f32| -> (f32, f32) {
-                        (ctrl_px + cxn * lx - cyn * ly, ctrl_py + cyn * lx + cxn * ly)
-                    };
-                    let (cx0, cy0) = to_canvas(x, y);
-                    let outside = |qx: f32, qy: f32, r: f32| {
-                        qx + r < -CANVAS_W || qx - r > CANVAS_W || qy + r < -CANVAS_H || qy - r > CANVAS_H
-                    };
-
-                    match (note.kind, sprite) {
-                        (1 | 3 | 4, Some(t)) => {
-                            let w = NOTE_SPRITE_W * note.scale * mh_factor * incline_factor;
-                            let h = w * t.size[1] / t.size[0];
-                            if !outside(cx0, cy0, (w * w + h * h).sqrt() * 0.5) {
-                                cmds.push(DrawCmd {
-                                    uniform: DrawUniform {
-                                        model: mat_mul(&note_base, &mat_scale(w, h)),
-                                        color: [1.0, 1.0, 1.0, alpha],
-                                        uv_rect: [0., 0., 1., 1.],
-                                    },
-                                    tex: &t.bind_group,
-                                });
-                            }
-                        }
-                        // Textured hold: atlas = TAIL (image top) + stretchable
-                        // body + HEAD (image bottom). _mh atlas has a taller
-                        // head (holdAtlasMH = [50 tail, 95 head]). Textures are
-                        // flipped at upload: head = v0, tail = v1. body→head→tail.
-                        (2, Some(t)) => {
-                            let w = NOTE_SPRITE_W * note.scale * mh_factor * incline_factor;
-                            let (tail_px, head_px) = if is_mh { (50.0, 95.0) } else { (HOLD_CAP_PX, HOLD_CAP_PX) };
-                            let head_uv = head_px / t.size[1]; // v0-fraction for head
-                            let tail_uv = tail_px / t.size[1];
-                            let head_h = w * head_px / t.size[0]; // quad heights
-                            let tail_h = w * tail_px / t.size[0];
-                            let tint = [1.0, 1.0, 1.0, alpha];
-                            // [B] chart.rs negates relative[1] for below notes; mirror UV
-                            // so the hold body gradient (head→tail) stays correct.
-                            let v_at = |v0: f32, len: f32| -> [f32; 4] {
-                                if note.above { [0., v0, 1., len] } else { [0., v0 + len, 1., -len] }
-                            };
-                            // [B] Hold body/head/tail each get below_rot at their position
-                            let hd = |cy: f32| mat_mul(&note_m, &mat_mul(
-                                &mat_translate(x, cy), &mat_scale(w, w),
-                            ));
-                            if let Some(end_y) = note.hold_end_y {
-                                let y1 = end_y as f32 * CANVAS_H * ev_y * ctrl_y;
-                                let (head_y, tail_y) = (y, y1);
-                                // [FIX] 头尾偏移:body 从 head 边缘延伸到 tail 边缘,
-                                // 否则 body 与头尾中心重叠(中段和头尾重叠 bug)。
-                                let (h0, h1) = if tail_y >= head_y {
-                                    (head_y + head_h * 0.5, tail_y - tail_h * 0.5)
-                                } else {
-                                    (head_y - head_h * 0.5, tail_y + tail_h * 0.5)
-                                };
-                                let bh = (h1 - h0).abs();
-                                if bh > 1e-5 {
-                                    if self.aggressive & AGGRESSIVE_HOLD_CLIP != 0 {
-                                        // [C] 过激优化(设置里开):hold body 沿
-                                        // 线方向裁剪。线段(head边缘→tail边缘,
-                                        // 含线旋转)与画布矩形求交(Liang-Barsky),
-                                        // 可见长度用勾股定理 sqrt(dx²+dy²);
-                                        // 矩形按半宽膨胀,线在视口外时 body 宽边
-                                        // 仍可见。UV 按沿 body 方向的投影比例映射,
-                                        // head 端渐变在速度事件下仍锚定 head。
-                                        let (ax, ay) = to_canvas(x, h0);
-                                        let (bx, by) = to_canvas(x, h1);
-                                        let (dx, dy) = (bx - ax, by - ay);
-                                        let _len = (dx * dx + dy * dy).sqrt();
-                                        let hw = w * 0.5;
-                                        if let Some((t0, t1)) = clip_segment(
-                                            (ax, ay), (bx, by),
-                                            -CANVAS_W - hw, CANVAS_W + hw,
-                                            -CANVAS_H - hw, CANVAS_H + hw,
-                                        ) {
-                                            if t1 - t0 > 1e-6 {
-                                                let (x0, y0) = (ax + dx * t0, ay + dy * t0);
-                                                let (x1, y1) = (ax + dx * t1, ay + dy * t1);
-                                                let vis_len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
-                                                // Visible segment midpoint, rotated
-                                                // back into line-local space (the
-                                                // quad's local Y axis then aligns
-                                                // with the body direction again).
-                                                let rel_x = (x0 + x1) * 0.5 - ctrl_px;
-                                                let rel_y = (y0 + y1) * 0.5 - ctrl_py;
-                                                let lcx = cxn * rel_x + cyn * rel_y;
-                                                let lcy = -cyn * rel_x + cxn * rel_y;
-                                                let body_len = 1.0 - head_uv - tail_uv;
-                                                cmds.push(DrawCmd {
-                                                    uniform: DrawUniform {
-                                                        model: mat_mul(&note_m, &mat_mul(
-                                                            &mat_translate(lcx, lcy),
-                                                            &mat_scale(w, vis_len),
-                                                        )),
-                                                        color: tint,
-                                                        uv_rect: v_at(head_uv + body_len * t0, body_len * (t1 - t0)),
-                                                    },
-                                                    tex: &t.bind_group,
-                                                });
-                                            }
-                                        }
-                                    } else {
-                                        cmds.push(DrawCmd {
-                                            uniform: DrawUniform {
-                                                model: mat_mul(&hd((h0 + h1) * 0.5), &mat_scale(1.0, bh / w)),
-                                                color: tint,
-                                                uv_rect: v_at(head_uv, 1. - head_uv - tail_uv),
-                                            },
-                                            tex: &t.bind_group,
-                                        });
-                                    }
-                                }
-                                for (cy, v0, len, quad_h) in [
-                                    (head_y, 0.0, head_uv, head_h),
-                                    (tail_y, 1.0 - tail_uv, tail_uv, tail_h),
-                                ] {
-                                    // [C] head/tail: bounding-circle cull.
-                                    if !outside(to_canvas(x, cy).0, to_canvas(x, cy).1, (w * w + quad_h * quad_h).sqrt() * 0.5) {
-                                        cmds.push(DrawCmd {
-                                            uniform: DrawUniform {
-                                                model: mat_mul(&hd(cy), &mat_scale(1.0, quad_h / w)),
-                                                color: tint,
-                                                uv_rect: v_at(v0, len),
-                                            },
-                                            tex: &t.bind_group,
-                                        });
-                                    }
-                                }
-                            } else {
-                                if !outside(cx0, cy0, (w * w + head_h * head_h).sqrt() * 0.5) {
-                                    cmds.push(DrawCmd {
-                                        uniform: DrawUniform {
-                                            model: mat_mul(&hd(y), &mat_scale(1.0, head_h / w)),
-                                            color: tint,
-                                            uv_rect: v_at(0., head_uv),
-                                        },
-                                        tex: &t.bind_group,
-                                    });
-                                }
-                            }
-                        }
-                        // Colored-quad fallback (no sprite loaded).
-                        _ => {
-                            // [B] below rotation applies to all fallback quads too
-                            let nb = || mat_mul(&note_m, &mat_translate(x, y));
-                            if note.kind == 2 {
-                                if let Some(end_y) = note.hold_end_y {
-                                let y1 = end_y as f32 * CANVAS_H * ev_y * ctrl_y;
-                                    let h = (y1 - y).abs();
-                                    let wb = HOLD_BODY_W * note.scale * incline_factor;
-                                    if h > 1e-5 && !outside(to_canvas(x, (y + y1) * 0.5).0, to_canvas(x, (y + y1) * 0.5).1, (wb * wb + h * h).sqrt() * 0.5) {
-                                        cmds.push(DrawCmd {
-                                            uniform: DrawUniform {
-                                                model: mat_mul(&nb(), &mat_scale(wb, h)),
-                                                color: [rgb[0], rgb[1], rgb[2], alpha],
-                                                uv_rect: [0., 0., 1., 1.],
-                                            },
-                                            tex: &self.white,
-                                        });
-                                    }
-                                }
-                            }
-                            let wq = NOTE_W * note.scale * incline_factor;
-                            let hq = NOTE_H * note.scale;
-                            if !outside(cx0, cy0, (wq * wq + hq * hq).sqrt() * 0.5) {
-                                cmds.push(DrawCmd {
-                                    uniform: DrawUniform {
-                                        model: mat_mul(&nb(), &mat_scale(wq, hq)),
-                                        color: [rgb[0], rgb[1], rgb[2], alpha],
-                                        uv_rect: [0., 0., 1., 1.],
-                                    },
-                                    tex: &self.white,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
+            });
+            submit.extend(slots.into_iter().map(|m| {
+                m.into_inner().expect("slot mutex").expect("scene chunk result")
+            }));
+            drop(_s1);
         }
-        }
+
+        // HUD/progress/fx/text extras are always main-thread (they touch
+        // `&mut self.text` / `pause_rect`), drawn ON TOP of the line scene.
+        let mut extra: Vec<DrawCmd> = Vec::new();
         // ── Phigros-style HUD ───────────────────────────────────────────
         // Score (top-left), combo number (top-center) with "COMBO" caption
         // below it, song name (bottom-left), difficulty (bottom-right), the
@@ -1584,12 +1864,13 @@ impl Renderer {
             };
 
             // Score (top-left): fixed 7-digit zero-padded, so it starts at
-            // "0000000" and counts up without shifting.
-            el("score", &format!("{:07}", hud.score), TextAnchor::TopLeft);
+            // "0000000" and counts up without shifting. Text cached per value
+            // (score only changes on hits — zero per-frame alloc otherwise).
+            el("score", hud_fmt(&mut self.hud_score_txt, hud.score, |v| format!("{:07}", v)), TextAnchor::TopLeft);
             // Combo: number top-center + "COMBO" caption below, only >= 3
             // (RPE/Phigros behavior: combo hidden until the 3rd).
             if hud.combo >= 3 {
-                el("combonumber", &format!("{}", hud.combo), TextAnchor::TopCenter);
+                el("combonumber", hud_fmt(&mut self.hud_combo_txt, hud.combo, |v| format!("{}", v)), TextAnchor::TopCenter);
                 el("combo", "COMBO", TextAnchor::ComboLabel);
             }
             // Song name (bottom-left)
@@ -1638,7 +1919,7 @@ impl Renderer {
                         &mat_mul(&mat_rotate(rot), &mat_scale(btn_size, btn_size)),
                     ),
                 );
-                cmds.push(DrawCmd {
+                extra.push(DrawCmd {
                     uniform: DrawUniform { model: bg_m, color: [0.05, 0.05, 0.08, 0.55 * a], uv_rect: [0., 0., 1., 1.] },
                     tex: &self.disc,
                 });
@@ -1655,7 +1936,7 @@ impl Renderer {
                             ),
                         ),
                     );
-                    cmds.push(DrawCmd {
+                    extra.push(DrawCmd {
                         uniform: DrawUniform { model: tri_m, color: col, uv_rect: [0., 0., 1., 1.] },
                         tex: &self.play_tri,
                     });
@@ -1673,7 +1954,7 @@ impl Renderer {
                             ),
                         );
                         let bar_m = mat_mul(&bar_m, &mat_scale(pause_w, pause_h));
-                        cmds.push(DrawCmd {
+                        extra.push(DrawCmd {
                             uniform: DrawUniform { model: bar_m, color: col, uv_rect: [0., 0., 1., 1.] },
                             tex: &self.white,
                         });
@@ -1736,7 +2017,7 @@ impl Renderer {
                             ),
                         ),
                     );
-                    cmds.push(DrawCmd {
+                    extra.push(DrawCmd {
                         uniform: DrawUniform {
                             model: bar_m,
                             color: [1.0, 1.0, 1.0, 0.9 * bl_alpha],
@@ -1746,7 +2027,7 @@ impl Renderer {
                     });
                 }
             } else {
-                cmds.push(DrawCmd {
+                extra.push(DrawCmd {
                     uniform: DrawUniform {
                         model: mat_mul(
                             &letterbox,
@@ -1766,123 +2047,167 @@ impl Renderer {
         // Field-split call: `cmds` already borrows `self.textures`/`self.white`.
         // fx 纯时间函数:host 查询的 frame_fx + 当前谱面时间(frame.time)
         // 渲染——倒退/跳转时 age = now - t0 自然对齐。
-        Self::push_hit_fx(&self.frame_fx, &self.textures, &self.white, &mut cmds, &letterbox, ev_x, ev_y, frame.time);
+        Self::push_hit_fx(&self.frame_fx, &self.textures, &self.white, &mut extra, &letterbox, ev_x, ev_y, frame.time);
 
         // Text overlay (Phaser UI), on top of everything; queue is per-frame.
         text::push_text(
             &mut self.text.pending,
-            &mut cmds,
+            &mut extra,
             &letterbox,
             [self.size[0] as f32, self.size[1] as f32],
         );
 
-        // Convert cmds to instances (applying the global rgb dim on the CPU),
-        // growing both instance buffers together when capacity falls short.
-        // The opaque background quad (if any) occupies instance 0.
-        let total_instances = cmds.len() + usize::from(bg_quad.is_some());
-        if total_instances > self.instance_capacity {
-            // Smooth growth: 1.5× current, minimum +512. Avoids the double-
-            // capacity burst that causes visible frame spikes on D3D12.
-            self.instance_capacity = (total_instances as f64 * 1.5) as usize + 512;
-            self.instance_bufs = [
-                Self::make_instance_buf(&self.device, self.instance_capacity),
-                Self::make_instance_buf(&self.device, self.instance_capacity),
-            ];
-        }
-        // UI overlay is NOT pushed to cmds here — it's drawn on the surface
-        // AFTER effects, so that post-processing doesn't affect the UI.
-        // The overlay is drawn in a separate render pass on the surface view
-        // (see Step 4 below).
-
-        let _s1 = crate::trace_span!("draw_cmds_build");
-        let mut instances: Vec<Instance> = Vec::with_capacity(total_instances);
-        if let Some((bg_m, uv, _)) = &bg_quad {
-            instances.push(Instance {
-                model: instance_model(bg_m),
-                color: [self.background_dim, self.background_dim, self.background_dim, 1.0],
-                uv_rect: *uv,
-            });
-        }
-        instances.extend(cmds.iter().map(|cmd| {
-            let u = &cmd.uniform;
-            Instance {
-                model: instance_model(&u.model),
-                color: [u.color[0] * dim, u.color[1] * dim, u.color[2] * dim, u.color[3]],
-                uv_rect: u.uv_rect,
-            }
-        }));
-        drop(_s1);
-
-        let _s2 = crate::trace_span!("draw_upload_submit");
-        if !instances.is_empty() {
-            self.queue.write_buffer(
-                &self.instance_bufs[self.frame_idx],
-                0,
-                bytemuck::cast_slice(&instances),
-            );
-        }
-
+        // ── Scene encode ────────────────────────────────────────────────
+        // Parallel path: the worker chunks already recorded their scene
+        // passes; the main encoder here carries only the extras scene pass
+        // (`Load` — chunk 0 cleared, workers drew the lines) + post + blit +
+        // ui. Single-threaded fallback: everything in one buffer + one
+        // encoder, identical to the pre-PMCORE-73 flow.
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        // GPU 计时(可选):t0 = 场景 pass 开始前。
-        if let Some(t) = &self.gpu_timers {
-            encoder.write_timestamp(&t.query_set, 0);
-        }
-        // Render 3D scene to intermediate (if effects active) or directly to surface
-        let has_effects = { let p = &self.post; !p.active.is_empty() };
-        let scene_view: &wgpu::TextureView = if has_effects {
-            self.scene_view.as_ref().unwrap()
-        } else {
-            &view
-        };
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("scene"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: scene_view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_vertex_buffer(0, self.instance_bufs[self.frame_idx].slice(..));
-            // [C] Background sits at instance 0 (fully opaque, no-blend pass);
-            // cmds follow at offset 1 with the alpha pipeline. The draw loop
-            // keeps cmd ordering (translucent layering stays correct).
-            // NOTE: the offset must track whether a background exists — with
-            // no background the cmds start at instance 0.
-            let base = usize::from(bg_quad.is_some());
-            if base == 1 {
-                pass.set_pipeline(&self.opaque_pipeline);
-                pass.set_bind_group(0, bg_quad.as_ref().unwrap().2, &[]);
-                pass.draw(0..4, 0..1);
+        if !parallel {
+            // GPU 计时(可选):t0 = 场景 pass 开始前(并行路径由 chunk 0 写)。
+            if let Some(t) = &self.gpu_timers {
+                encoder.write_timestamp(&t.query_set, 0);
             }
-            pass.set_pipeline(&self.pipeline);
-            let mut start = 0usize;
-            for i in 1..=cmds.len() {
-                if i == cmds.len() || !std::ptr::eq(cmds[i].tex, cmds[start].tex) {
-                    pass.set_bind_group(0, cmds[start].tex, &[]);
-                    pass.draw(0..4, (start + base) as u32..(i + base) as u32);
-                    start = i;
+            // Convert cmds to instances (applying the global rgb dim on the
+            // CPU), growing both instance buffers together when capacity
+            // falls short. The opaque background quad (if any) occupies
+            // instance 0.
+            let mut cmds: Vec<DrawCmd> = Vec::with_capacity(needed);
+            if let Some((bg_m, _, _)) = &bg_quad {
+                // 30 % black overlay
+                cmds.push(DrawCmd {
+                    uniform: DrawUniform { model: *bg_m, color: [0., 0., 0., 0.3], uv_rect: [0., 0., 1., 1.] },
+                    tex: &self.white,
+                });
+            }
+            cmds.extend(build_line_cmds(&line_refs, &ctx));
+            cmds.extend(extra);
+            let total_instances = cmds.len() + usize::from(bg_quad.is_some());
+            if total_instances > self.instance_capacity {
+                // Smooth growth: 1.5× current, minimum +512. Avoids the double-
+                // capacity burst that causes visible frame spikes on D3D12.
+                self.instance_capacity = (total_instances as f64 * 1.5) as usize + 512;
+                self.instance_bufs = [
+                    Self::make_instance_buf(&self.device, self.instance_capacity),
+                    Self::make_instance_buf(&self.device, self.instance_capacity),
+                ];
+            }
+            let _s1 = crate::trace_span!("draw_cmds_build");
+            let mut instances: Vec<Instance> = Vec::with_capacity(total_instances);
+            if let Some(bgi) = bg_instance {
+                instances.push(bgi);
+            }
+            instances.extend(to_instances(&cmds, dim));
+            drop(_s1);
+            if !instances.is_empty() {
+                self.queue.write_buffer(
+                    &self.instance_bufs[self.frame_idx],
+                    0,
+                    bytemuck::cast_slice(&instances),
+                );
+            }
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: scene_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_vertex_buffer(0, self.instance_bufs[self.frame_idx].slice(..));
+                // [C] Background sits at instance 0 (fully opaque, no-blend pass);
+                // cmds follow at offset 1 with the alpha pipeline. The draw loop
+                // keeps cmd ordering (translucent layering stays correct).
+                // NOTE: the offset must track whether a background exists — with
+                // no background the cmds start at instance 0.
+                let base = usize::from(bg_quad.is_some());
+                if base == 1 {
+                    pass.set_pipeline(&self.opaque_pipeline);
+                    pass.set_bind_group(0, bg_quad.as_ref().unwrap().2, &[]);
+                    pass.draw(0..4, 0..1);
+                }
+                pass.set_pipeline(&self.pipeline);
+                let mut start = 0usize;
+                for i in 1..=cmds.len() {
+                    if i == cmds.len() || !std::ptr::eq(cmds[i].tex, cmds[start].tex) {
+                        pass.set_bind_group(0, cmds[start].tex, &[]);
+                        pass.draw(0..4, (start + base) as u32..(i + base) as u32);
+                        start = i;
+                    }
+                }
+            }
+        } else {
+            // Parallel path: the persistent instance buffer holds just the
+            // extras; the scene pass `Load`s on top of the workers' output.
+            let main_instances = to_instances(&extra, dim);
+            if main_instances.len() > self.instance_capacity {
+                // Smooth growth: 1.5× current, minimum +512. Avoids the double-
+                // capacity burst that causes visible frame spikes on D3D12.
+                self.instance_capacity = (main_instances.len() as f64 * 1.5) as usize + 512;
+                self.instance_bufs = [
+                    Self::make_instance_buf(&self.device, self.instance_capacity),
+                    Self::make_instance_buf(&self.device, self.instance_capacity),
+                ];
+            }
+            if !main_instances.is_empty() {
+                self.queue.write_buffer(
+                    &self.instance_bufs[self.frame_idx],
+                    0,
+                    bytemuck::cast_slice(&main_instances),
+                );
+            }
+            if !extra.is_empty() {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("scene-extras"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: scene_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.pipeline);
+                pass.set_vertex_buffer(0, self.instance_bufs[self.frame_idx].slice(..));
+                let mut start = 0usize;
+                for i in 1..=extra.len() {
+                    if i == extra.len() || !std::ptr::eq(extra[i].tex, extra[start].tex) {
+                        pass.set_bind_group(0, extra[start].tex, &[]);
+                        pass.draw(0..4, start as u32..i as u32);
+                        start = i;
+                    }
                 }
             }
         }
         // Step 2: Run post-processing effects (if any)
         if has_effects {
-            self.post.apply(&mut encoder, &self.device, &self.queue, scene_view);
+            self.post.apply(
+                &mut encoder,
+                &self.device,
+                &self.queue,
+                scene_view,
+                self.pipeline_cache.as_ref(),
+            );
         }
         // Step 3: Blit final to surface (only when using intermediate texture)
         if has_effects {
-            let (blit_pipe, screen_bgl, sampler, final_view) = {
-                let p = &self.post;
-                (p.blit_pipeline.as_ref().unwrap(), &p.screen_bgl, &p.sampler, p.last_view())
-            };
+            let blit_pipe = self.post.blit_pipeline.as_ref().unwrap().clone();
+            // Bind group cached per ping-pong target (post.rs, keyed by
+            // SrcTag::Full(last_output)); built once, reused every frame.
+            let blit_bg = self.post.surface_blit_bg(&self.device);
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("blit"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1896,16 +2221,7 @@ impl Renderer {
                 })],
                 ..Default::default()
             });
-            pass.set_pipeline(blit_pipe);
-            // Blit bind group built fresh (no caching — see post.rs).
-            let blit_bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("blit-bg"),
-                layout: screen_bgl,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(final_view) },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
-                ],
-            });
+            pass.set_pipeline(&blit_pipe);
             pass.set_bind_group(0, &blit_bg, &[]);
             pass.draw(0..3, 0..1);
         }
@@ -1947,8 +2263,13 @@ impl Renderer {
             encoder.resolve_query_set(&t.query_set, 0..2, &t.resolve_buf, 0);
             encoder.copy_buffer_to_buffer(&t.resolve_buf, 0, &t.readback_buf, 0, 16);
         }
-        self.queue.submit([encoder.finish()]);
+        let _s2 = crate::trace_span!("draw_upload_submit");
+        submit.push(encoder.finish());
+        // PMCORE-73: multiple command buffers (scene chunks + main) in ONE
+        // submit — wgpu executes them in order, so draw order is unchanged.
+        self.queue.submit(submit);
         self.frame_idx ^= 1;
+        drop(_s2);
     }
 
     /// 读回上一帧 GPU 渲染耗时(ms)。仅 PHIMAKOR_GPU_TIMING=1 时有效;
@@ -1957,6 +2278,16 @@ impl Renderer {
         match &mut self.gpu_timers {
             Some(t) => t.poll(&self.device, &self.queue),
             None => 0.0,
+        }
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        // 兑底写回:运行期 apply 懒加载创建的特效管线也进缓存。设备字段在
+        // drop 体之后才销毁,get_data 是同步 CPU 查询,此处安全。
+        if let Some(cache) = &self.pipeline_cache {
+            pipeline_cache::save(cache);
         }
     }
 }

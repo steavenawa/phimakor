@@ -16,10 +16,22 @@ pub struct ChartEntry {
     pub charter: String,
     pub level: String,
     pub difficulty: f32,
+    /// PMCORE-26:同曲多难度子目录列表(显示名, 目录),按难度升序。
+    /// 单 chart 目录为空;非空时 `path` 是首个难度子目录(点击直接打开)。
+    pub difficulties: Vec<(String, std::path::PathBuf)>,
     /// Last-modified time (unix seconds), for "Newest" sorting.
     pub modified: u64,
     /// Downscaled illustration thumbnail (fits a 200px box).
     pub thumb: Option<image::RgbaImage>,
+}
+
+/// PMCORE-36:新建谱面命名对话框状态(由 main 持有;绘制与命中共享几何)。
+#[derive(Clone, Debug, Default)]
+pub struct NewChartDlg {
+    /// 用户输入的谱名(也是文件夹名的来源)。
+    pub name: String,
+    /// 创建失败提示(留在对话框显示,不崩溃)。
+    pub err: Option<String>,
 }
 
 /// What the splash cursor is currently over. Indexes are positions in the
@@ -33,6 +45,12 @@ pub enum SplashHover {
     Sort,
     Refresh,
     OpenFolder,
+    /// PMCORE-36:新建谱面按钮(顶部工具栏最左)。
+    New,
+    // 新建谱面对话框内的目标
+    NewInput,
+    NewCreate,
+    NewCancel,
     Settings,
     // Settings page rows
     Vsync,
@@ -56,6 +74,14 @@ pub struct SplashData<'a> {
     pub lib_path: &'a str,
     /// List scroll offset in px (clamped to the content height).
     pub scroll: f32,
+    /// PMCORE-24:上次异常退出检测提示(.bak 比主文件新/主文件缺失的谱面),
+    /// 显示在列表顶部。None = 一切正常。
+    pub recover_hint: Option<&'a str>,
+    /// PMCORE-21:加载失败的可读错误(目录+原因+位置),顶部红色横幅。
+    /// None = 无错误。
+    pub error: Option<&'a str>,
+    /// PMCORE-36:新建谱面命名对话框(None = 未打开)。
+    pub new_dlg: Option<&'a NewChartDlg>,
 }
 
 /// Filter (case-insensitive name match) and sort (0 = name, 1 = newest)
@@ -91,13 +117,42 @@ const SPLASH_BTN_H: f32 = 28.0;      // bottom buttons
 const SPLASH_HDR_BTN_Y: f32 = 10.0;  // header buttons top
 const SPLASH_HDR_BTN_H: f32 = 28.0;  // header buttons height
 
+// ── New Chart dialog (PMCORE-36) ──
+const NEW_DLG_W: f32 = 440.0;       // dialog width
+const NEW_DLG_H: f32 = 200.0;       // dialog height
+const NEW_INPUT_H: f32 = 32.0;      // name input box height
+const NEW_BTN_H: f32 = 28.0;        // Create / Cancel buttons
+
+/// New Chart 对话框面板矩形(已乘 `s`)。垂直居中偏上。
+pub fn splash_new_dlg_rect(vw: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
+    let w = NEW_DLG_W * s;
+    let h = NEW_DLG_H * s;
+    ((vw - w) * 0.5, (vh - h) * 0.4, w, h)
+}
+
+/// 对话框内谱名输入框矩形(已乘 `s`);绘制与 IME 候选窗定位共用
+/// (PMCORE-8:set_ime_cursor_area 收物理像素)。
+pub fn splash_new_input_rect(vw: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
+    let (dx, dy, dw, _) = splash_new_dlg_rect(vw, vh, s);
+    (dx + 20.0 * s, dy + 76.0 * s, dw - 40.0 * s, NEW_INPUT_H * s)
+}
+
 pub fn splash_detail_x(vw: f32, s: f32) -> f32 { vw - SPLASH_M * s - SPLASH_DETAIL_W * s }
 pub fn splash_list_right(vw: f32, s: f32) -> f32 { splash_detail_x(vw, s) - SPLASH_DETAIL_GAP * s }
 
+/// Splash 搜索框矩形 (x, y, w, h),已乘 `s`(gui_scale 含 DPI)。
+/// 绘制与 IME 候选窗定位共用(PMCORE-8:set_ime_cursor_area 收物理像素)。
+pub fn splash_search_rect(vw: f32, s: f32) -> (f32, f32, f32, f32) {
+    let sx = SPLASH_M * s;
+    let sw = (splash_list_right(vw, s) - sx).max(20.0);
+    (sx, SPLASH_CTRL_Y * s, sw, SPLASH_CTRL_H * s)
+}
+
 /// Resolve the splash cursor to a [`SplashHover`]. `filtered_len` is the
 /// number of currently visible chart rows (used to clamp row indices),
-/// `scroll` the list scroll offset in px.
-pub fn splash_hit_test(mx: f32, my: f32, vw: f32, vh: f32, s: f32, filtered_len: usize, settings: bool, scroll: f32) -> SplashHover {
+/// `scroll` the list scroll offset in px. `new_dlg` = 新建对话框打开中
+/// (PMCORE-36):此时只命中对话框内目标,列表/工具栏全部屏蔽。
+pub fn splash_hit_test(mx: f32, my: f32, vw: f32, vh: f32, s: f32, filtered_len: usize, settings: bool, new_dlg: bool, scroll: f32) -> SplashHover {
     if settings {
         let row_h = 34.0 * s;
         let lx = 60.0 * s;
@@ -126,13 +181,29 @@ pub fn splash_hit_test(mx: f32, my: f32, vw: f32, vh: f32, s: f32, filtered_len:
         if hit(my, by) && mx <= lx + 100.0 * s { return SplashHover::Back; }
         return SplashHover::None;
     }
-    // Header buttons (top-right: sort / refresh / open folder)
+    if new_dlg {
+        // 对话框为模态:框外点击不落到任何目标,框内只认输入框与两个按钮。
+        let (dx, dy, dw, dh) = splash_new_dlg_rect(vw, vh, s);
+        if mx < dx || mx > dx + dw || my < dy || my > dy + dh { return SplashHover::None; }
+        let (ix, iy, iw, ih) = splash_new_input_rect(vw, vh, s);
+        if mx >= ix && mx <= ix + iw && my >= iy && my <= iy + ih { return SplashHover::NewInput; }
+        let btn_w = 100.0 * s;
+        let by = dy + dh - 14.0 * s - NEW_BTN_H * s;
+        let right = dx + dw - 16.0 * s;
+        // Create 在 Cancel 左侧(与绘制端一致)。
+        if mx >= right - btn_w && mx <= right && my >= by && my <= by + NEW_BTN_H * s { return SplashHover::NewCancel; }
+        if mx >= right - btn_w * 2.0 - 8.0 * s && mx <= right - btn_w - 8.0 * s && my >= by && my <= by + NEW_BTN_H * s { return SplashHover::NewCreate; }
+        return SplashHover::None;
+    }
+    // Header buttons (top-right: new chart / sort / refresh / open folder)
     let ty = SPLASH_HDR_BTN_Y * s;
     if my >= ty && my <= ty + SPLASH_HDR_BTN_H * s {
         let right = vw - SPLASH_M * s;
         let x_dir = right - 104.0 * s;
         let x_ref = x_dir - 8.0 * s - 88.0 * s;
         let x_sort = x_ref - 8.0 * s - 100.0 * s;
+        let x_new = x_sort - 8.0 * s - 90.0 * s;
+        if mx >= x_new && mx <= x_new + 90.0 * s { return SplashHover::New; }
         if mx >= x_sort && mx <= x_sort + 100.0 * s { return SplashHover::Sort; }
         if mx >= x_ref && mx <= x_ref + 88.0 * s { return SplashHover::Refresh; }
         if mx >= x_dir && mx <= x_dir + 104.0 * s { return SplashHover::OpenFolder; }
@@ -169,12 +240,40 @@ pub fn draw_splash(pm: &mut tiny_skia::PixmapMut, data: &SplashData, vw: f32, vh
     if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, vw, vh) {
         fill_rect_clipped(pm, r, &bg);
     }
-    // Header buttons
-    if settings.is_none() {
+    // Header buttons (dialog 打开时为模态,隐藏工具栏)
+    if settings.is_none() && data.new_dlg.is_none() {
         draw_splash_header_buttons(pm, data.hover, data.sort, vw, s);
     }
     if let Some(font) = font {
         draw_text_on_pixmap(pm, "PhiMakor", SPLASH_M * s, 32.0 * s, 20.0 * s, font);
+        // PMCORE-24:顶部提示条——上次异常退出时显示待恢复的 .bak 路径。
+        if let Some(bak) = data.recover_hint {
+            let full = format!("检测到上次未正常保存的谱面(见 {bak})");
+            let full_len = full.len();
+            let max_w = (splash_list_right(vw, s) - SPLASH_M * s).max(60.0);
+            let mut txt = full;
+            while text_width(&txt, 12.0 * s) > max_w && txt.chars().count() > 12 {
+                txt.pop();
+            }
+            if txt.len() < full_len {
+                txt.push('…');
+            }
+            draw_text_c(pm, &txt, SPLASH_M * s, 52.0 * s, 12.0 * s, font, [255, 180, 60]);
+        }
+        // PMCORE-21:加载失败错误横幅(目录 + 原因 + 位置),红色。
+        if let Some(err) = data.error {
+            let full = format!("加载失败: {err}");
+            let full_len = full.chars().count();
+            let max_w = (splash_list_right(vw, s) - SPLASH_M * s).max(60.0);
+            let mut txt = full.clone();
+            while text_width(&txt, 12.0 * s) > max_w && txt.chars().count() > 16 {
+                txt.pop();
+            }
+            if txt.chars().count() < full_len {
+                txt.push('…');
+            }
+            draw_text_c(pm, &txt, SPLASH_M * s, 66.0 * s, 12.0 * s, font, [255, 90, 90]);
+        }
     }
     if let Some(cfg) = settings {
         if let Some(font) = font {
@@ -183,11 +282,15 @@ pub fn draw_splash(pm: &mut tiny_skia::PixmapMut, data: &SplashData, vw: f32, vh
         draw_splash_settings(pm, cfg, data.lib_path, data.hover, vw, vh, s);
         return;
     }
+    // PMCORE-36:新建谱面命名对话框(模态,盖在列表之上)。
+    if let Some(dlg) = data.new_dlg {
+        draw_new_chart_dlg(pm, dlg, data.hover, vw, vh, s);
+        return;
+    }
     let detail_x = splash_detail_x(vw, s);
     let list_right = splash_list_right(vw, s);
-    // Search box
-    let sx = SPLASH_M * s;
-    let sw = (list_right - sx).max(20.0);
+    // Search box(矩形与 IME 候选窗定位共用,splash_search_rect)
+    let (sx, _, sw, _) = splash_search_rect(vw, s);
     let mut sbp = tiny_skia::Paint::default();
     let searching = !data.filter.is_empty();
     sbp.set_color_rgba8(if searching { 38 } else { 26 }, if searching { 44 } else { 29 }, if searching { 58 } else { 34 }, 230);
@@ -286,7 +389,7 @@ pub fn draw_splash(pm: &mut tiny_skia::PixmapMut, data: &SplashData, vw: f32, vh
     draw_splash_detail(pm, data, preview, detail_x, vh, s);
 }
 
-/// Top-right utility buttons: sort toggle / refresh / open folder.
+/// Top-right utility buttons: new chart / sort toggle / refresh / open folder.
 fn draw_splash_header_buttons(pm: &mut tiny_skia::PixmapMut, hover: SplashHover, sort: u8, vw: f32, s: f32) {
     let ty = SPLASH_HDR_BTN_Y * s;
     let bh = SPLASH_HDR_BTN_H * s;
@@ -300,7 +403,11 @@ fn draw_splash_header_buttons(pm: &mut tiny_skia::PixmapMut, hover: SplashHover,
     x -= 8.0 * s;
     x -= 100.0 * s;
     let sort_b = (x, 100.0 * s);
+    x -= 8.0 * s;
+    x -= 90.0 * s;
+    let new_b = (x, 90.0 * s);
     let sort_label = if sort == 1 { "Sort: Newest" } else { "Sort: Name" };
+    draw_splash_btn(pm, new_b.0, ty, new_b.1, bh, hover == SplashHover::New, "New Chart", 11.0, s);
     draw_splash_btn(pm, sort_b.0, ty, sort_b.1, bh, hover == SplashHover::Sort, sort_label, 11.0, s);
     draw_splash_btn(pm, refresh.0, ty, refresh.1, bh, hover == SplashHover::Refresh, "Refresh", 11.0, s);
     draw_splash_btn(pm, dir.0, ty, dir.1, bh, hover == SplashHover::OpenFolder, "Open Folder", 11.0, s);
@@ -316,6 +423,67 @@ fn draw_splash_btn(pm: &mut tiny_skia::PixmapMut, x: f32, y: f32, w: f32, h: f32
     if let Some(font) = get_font() {
         let tw = text_width(label, size * s);
         draw_text_c(pm, label, x + (w - tw) * 0.5, y + h * 0.5 + 4.0 * s, size * s, font, [225, 225, 230]);
+    }
+}
+
+/// PMCORE-36:新建谱面命名对话框(全屏遮罩 + 标题 + 输入框 + 错误提示 +
+/// Create/Cancel)。命中在 [`splash_hit_test`] 的 `new_dlg` 分支,几何共用
+/// [`splash_new_dlg_rect`] / [`splash_new_input_rect`]。
+fn draw_new_chart_dlg(pm: &mut tiny_skia::PixmapMut, dlg: &NewChartDlg, hover: SplashHover, vw: f32, vh: f32, s: f32) {
+    let (dx, dy, dw, dh) = splash_new_dlg_rect(vw, vh, s);
+    // 全屏遮罩
+    let mut mask = tiny_skia::Paint::default();
+    mask.set_color_rgba8(0, 0, 0, 140);
+    if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, vw, vh) {
+        fill_rect_clipped(pm, r, &mask);
+    }
+    // 面板
+    let mut bp = tiny_skia::Paint::default();
+    bp.set_color_rgba8(24, 26, 34, 245);
+    if let Some(r) = tiny_skia::Rect::from_xywh(dx, dy, dw, dh) {
+        fill_rect_clipped(pm, r, &bp);
+    }
+    // 输入框
+    let (ix, iy, iw, ih) = splash_new_input_rect(vw, vh, s);
+    let mut ip = tiny_skia::Paint::default();
+    ip.set_color_rgba8(40, 44, 56, 240);
+    if let Some(r) = tiny_skia::Rect::from_xywh(ix, iy, iw, ih) {
+        fill_rect_clipped(pm, r, &ip);
+    }
+    // 按钮行:Create(右)、Cancel(其左)。
+    let btn_w = 100.0 * s;
+    let by = dy + dh - 14.0 * s - NEW_BTN_H * s;
+    let right = dx + dw - 16.0 * s;
+    draw_splash_btn(pm, right - btn_w * 2.0 - 8.0 * s, by, btn_w, NEW_BTN_H * s, hover == SplashHover::NewCreate, "Create", 12.0, s);
+    draw_splash_btn(pm, right - btn_w, by, btn_w, NEW_BTN_H * s, hover == SplashHover::NewCancel, "Cancel", 12.0, s);
+    if let Some(font) = get_font() {
+        draw_text_on_pixmap(pm, "New Chart", dx + 20.0 * s, dy + 24.0 * s, 15.0 * s, font);
+        draw_text_on_pixmap(pm, "Chart name", dx + 20.0 * s, dy + 62.0 * s, 12.0 * s, font);
+        // 输入文本(超宽截断)+ 光标
+        let draw_x = ix + 10.0 * s;
+        let txt_y = iy + ih * 0.5 + 4.0 * s;
+        if dlg.name.is_empty() {
+            draw_text_c(pm, "chart name…", draw_x, txt_y, 13.0 * s, font, [130, 130, 140]);
+        } else {
+            let mut t = dlg.name.clone();
+            while text_width(&t, 13.0 * s) > iw - 20.0 * s && t.chars().count() > 1 {
+                t.pop();
+            }
+            draw_text_on_pixmap(pm, &t, draw_x, txt_y, 13.0 * s, font);
+            let tw = text_width(&t, 13.0 * s);
+            draw_text_on_pixmap(pm, "|", draw_x + tw + 2.0 * s, txt_y, 13.0 * s, font);
+        }
+        // 错误提示(创建失败/重名等,留在对话框)
+        if let Some(err) = &dlg.err {
+            let mut e = err.clone();
+            while text_width(&e, 11.0 * s) > dw - 40.0 * s && e.chars().count() > 12 {
+                e.pop();
+            }
+            if e.len() < err.len() {
+                e.push('…');
+            }
+            draw_text_c(pm, &e, dx + 20.0 * s, dy + 122.0 * s, 11.0 * s, font, [255, 110, 110]);
+        }
     }
 }
 
@@ -349,8 +517,15 @@ fn draw_splash_row(pm: &mut tiny_skia::PixmapMut, ch: &ChartEntry, hover: Splash
         let meta = fit_text(&meta, text_w, 11.0 * s);
         draw_text_c(pm, &meta, SPLASH_M * s + 8.0 * s, y + 27.0 * s, 11.0 * s, font, [140, 140, 152]);
     }
-    // Level badge
-    if !ch.level.is_empty() || ch.difficulty > 0.0 {
+    // 难度徽章:多难度聚合条目画全部难度标签,单条目画原有 level badge。
+    if !ch.difficulties.is_empty() {
+        let mut right = if is_hover { list_right - 30.0 * s } else { list_right - 8.0 * s };
+        for (label, _) in ch.difficulties.iter().rev() {
+            let w = text_width(label, 11.0 * s) + 2.4 * 11.0 * s;
+            draw_badge(pm, label, right, y + 9.0 * s, 11.0 * s, level_color(label));
+            right -= w + 4.0 * s;
+        }
+    } else if !ch.level.is_empty() || ch.difficulty > 0.0 {
         let label = if ch.level.is_empty() { format!("{:.1}", ch.difficulty) } else { ch.level.clone() };
         let badge_right = if is_hover { list_right - 30.0 * s } else { list_right - 8.0 * s };
         draw_badge(pm, &label, badge_right, y + 9.0 * s, 11.0 * s, level_color(&ch.level));
@@ -409,8 +584,16 @@ fn draw_splash_detail(pm: &mut tiny_skia::PixmapMut, data: &SplashData, preview:
         draw_text_c(pm, &val, x + 100.0 * s, my, 12.0 * s, font, [215, 215, 220]);
         my += 18.0 * s;
     }
-    // Level / difficulty badge
-    if !ch.level.is_empty() || ch.difficulty > 0.0 {
+    // 难度徽章:多难度条目画全部难度标签(替代单个 level 徽章)。
+    if !ch.difficulties.is_empty() {
+        draw_text_c(pm, "Difficulty", x + 16.0 * s, my, 11.0 * s, font, [130, 130, 142]);
+        let mut bx = x + w - 16.0 * s;
+        for (label, _) in ch.difficulties.iter().rev() {
+            let lw = text_width(label, 12.0 * s) + 2.4 * 12.0 * s;
+            draw_badge(pm, label, bx, my - 13.0 * s, 12.0 * s, level_color(label));
+            bx -= lw + 6.0 * s;
+        }
+    } else if !ch.level.is_empty() || ch.difficulty > 0.0 {
         let label = if ch.level.is_empty() { format!("Lv. {:.1}", ch.difficulty) } else { ch.level.clone() };
         draw_text_c(pm, "Level", x + 16.0 * s, my, 11.0 * s, font, [130, 130, 142]);
         draw_badge(pm, &label, x + w - 16.0 * s, my - 13.0 * s, 12.0 * s, level_color(&ch.level));

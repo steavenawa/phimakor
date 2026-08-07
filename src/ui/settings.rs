@@ -31,6 +31,17 @@ pub struct SettingsData {
     /// + BC3 块压缩,显存/带宽 4:1。有损(视觉上通常不可察觉);
     /// 关闭后 RGBA8 原样上传。
     pub texture_compress: bool,
+    /// PMCORE-24:自动保存开关(默认开)。编辑后经后台 saver 线程防抖落盘,
+    /// 写主文件前旧版本保留为 <name>.bak。
+    pub autosave: bool,
+    /// PMCORE-24:自动保存防抖间隔(秒,默认 1.0)。
+    pub autosave_interval: f32,
+    /// PMCORE-6:frame lock —— 窗口失焦时停止渲染(省 GPU/CPU)。默认关,
+    /// 保持现状(失焦仍渲染,可边看谱边切窗口)。
+    pub frame_lock: bool,
+    /// PMCORE-76:鼠标 hover 上下文信息浮层(时间轴 note/事件块)。默认开;
+    /// 关掉后浮层完全不绘制(命中与渲染均跳过)。
+    pub hover_tooltip: bool,
 }
 
 /// 过激优化:hold 身体按视口裁剪(线段求交+勾股长度),长 hold 省大量
@@ -39,7 +50,7 @@ pub use phimakor::render::AGGRESSIVE_HOLD_CLIP;
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, fps_overlay: true, custom_cursor: false, aggressive: 0, half_res_fx: true, texture_compress: true }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, fps_overlay: true, custom_cursor: false, aggressive: 0, half_res_fx: true, texture_compress: true, autosave: true, autosave_interval: 1.0, frame_lock: false, hover_tooltip: true }
     }
 }
 
@@ -65,7 +76,8 @@ pub fn backend_cycle(backend: &Option<String>) -> Option<String> {
 
 // ── 设置面板(widgets 组件库,挂在 tool 2)──
 
-use super::widgets::{RTControl, RealtimeForm};
+use super::flow;
+use super::widgets::{RTControl, RealtimeForm, Widget};
 
 /// GUI scale 的滑条映射范围。
 const SCALE_MIN: f32 = 0.5;
@@ -91,10 +103,31 @@ pub fn build_settings_form(x: f32, y: f32, w: f32, s: f32, settings: &SettingsDa
         ("aggressive cull".into(), RTControl::Toggle { on: settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0, anim: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { 0.0 }, dir: if settings.aggressive & AGGRESSIVE_HOLD_CLIP != 0 { 1.0 } else { -1.0 } }),
         ("half-res fx".into(), RTControl::Toggle { on: settings.half_res_fx, anim: if settings.half_res_fx { 1.0 } else { 0.0 }, dir: if settings.half_res_fx { 1.0 } else { -1.0 } }),
         ("tex compress".into(), RTControl::Toggle { on: settings.texture_compress, anim: if settings.texture_compress { 1.0 } else { 0.0 }, dir: if settings.texture_compress { 1.0 } else { -1.0 } }),
+        ("autosave".into(), RTControl::Toggle { on: settings.autosave, anim: if settings.autosave { 1.0 } else { 0.0 }, dir: if settings.autosave { 1.0 } else { -1.0 } }),
+        ("autosave interval".into(), RTControl::Number { value: settings.autosave_interval as f64, step: 0.1, min: 0.1, max: 60.0, last_x: 0.0, buf: None }),
+        ("frame lock".into(), RTControl::Toggle { on: settings.frame_lock, anim: if settings.frame_lock { 1.0 } else { 0.0 }, dir: if settings.frame_lock { 1.0 } else { -1.0 } }),
+        ("hover tooltip".into(), RTControl::Toggle { on: settings.hover_tooltip, anim: if settings.hover_tooltip { 1.0 } else { 0.0 }, dir: if settings.hover_tooltip { 1.0 } else { -1.0 } }),
     ]);
     form.row_h = 24.0 * s;
     form.gap = 4.0 * s;
     form
+}
+
+/// 设置表单流控区域(命中 = 绘制,单一真源):行 id = 索引+1,Add 按钮
+/// id = rows+1。几何委托组件库 [`Widget::areas`](RealtimeForm::areas)
+/// (widgets.rs 为 DevMenuBase 领地,只读,这里仅做 Area → HotArea 转换)。
+pub fn form_areas(form: &RealtimeForm) -> Vec<flow::HotArea> {
+    use flow::{AreaId, AreaKind, HotArea};
+    form.areas()
+        .into_iter()
+        .filter(|a| a.id != 0) // 标题(id=0)不可交互,不注册
+        .map(|a| HotArea {
+            id: AreaId(a.id),
+            rect: (a.rect.x(), a.rect.y(), a.rect.width(), a.rect.height()),
+            kind: AreaKind::Widget(a.kind),
+            disabled: false,
+        })
+        .collect()
 }
 
 /// 把设置表单的当前值应用到 SettingsData(返回是否有变化)。
@@ -171,8 +204,108 @@ pub fn apply_settings_form(form: &RealtimeForm, settings: &mut SettingsData) -> 
                     changed = true;
                 }
             }
+            ("autosave", RTControl::Toggle { on, .. }) => {
+                if *on != settings.autosave {
+                    settings.autosave = *on;
+                    changed = true;
+                }
+            }
+            ("autosave interval", RTControl::Number { value, .. }) => {
+                let v = (*value as f32).clamp(0.1, 60.0);
+                if (v - settings.autosave_interval).abs() > 0.01 {
+                    settings.autosave_interval = v;
+                    changed = true;
+                }
+            }
+            ("frame lock", RTControl::Toggle { on, .. }) => {
+                if *on != settings.frame_lock {
+                    settings.frame_lock = *on;
+                    changed = true;
+                }
+            }
+            ("hover tooltip", RTControl::Toggle { on, .. }) => {
+                if *on != settings.hover_tooltip {
+                    settings.hover_tooltip = *on;
+                    changed = true;
+                }
+            }
             _ => {}
         }
     }
     changed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// PMCORE-6:frame_lock 默认 false;旧 config.json 缺该字段回退默认;
+    /// 开启后序列化→反序列化保持(持久化契约)。
+    #[test]
+    fn frame_lock_defaults_false_and_roundtrips() {
+        assert!(!SettingsData::default().frame_lock);
+        let old: SettingsData = serde_json::from_str(r#"{"vsync":true}"#).unwrap();
+        assert!(!old.frame_lock, "旧配置无 frame_lock 字段应回退默认 false");
+        let mut on = SettingsData::default();
+        on.frame_lock = true;
+        let back: SettingsData = serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(back.frame_lock, "开启后写回 config.json 再读回应为 true");
+    }
+
+    /// PMCORE-6:build_settings_form 含 frame lock 行,apply_settings_form 写回。
+    #[test]
+    fn frame_lock_form_row_writes_back() {
+        let mut s = SettingsData::default();
+        let mut form = build_settings_form(0.0, 0.0, 300.0, 1.0, &s);
+        let row = form.rows.iter_mut().find(|(l, _)| l == "frame lock").expect("表单应有 frame lock 行");
+        if let RTControl::Toggle { on, .. } = &mut row.1 {
+            *on = true;
+        } else {
+            panic!("frame lock 行应为 Toggle");
+        }
+        assert!(apply_settings_form(&form, &mut s));
+        assert!(s.frame_lock);
+    }
+
+    /// PMCORE-76:hover tooltip 默认 true;旧 config.json 缺该字段回退默认;
+    /// 关闭后序列化→反序列化保持(持久化契约)。
+    #[test]
+    fn hover_tooltip_defaults_true_and_roundtrips() {
+        assert!(SettingsData::default().hover_tooltip);
+        let old: SettingsData = serde_json::from_str(r#"{"vsync":true}"#).unwrap();
+        assert!(old.hover_tooltip, "旧配置无 hover_tooltip 字段应回退默认 true");
+        let mut off = SettingsData::default();
+        off.hover_tooltip = false;
+        let back: SettingsData = serde_json::from_str(&serde_json::to_string(&off).unwrap()).unwrap();
+        assert!(!back.hover_tooltip, "关闭后写回 config.json 再读回应为 false");
+    }
+
+    /// 流控区域(命中 = 绘制):设置表单每行注册为 Widget 区域(id = 行索引+1),
+    /// 标题(0)与 Add 按钮语义与 BPM/Eff 同源(组件库 areas 转换)。
+    #[test]
+    fn form_areas_registers_all_rows() {
+        let form = build_settings_form(0.0, 0.0, 300.0, 1.0, &SettingsData::default());
+        let areas = form_areas(&form);
+        assert!(!areas.iter().any(|a| a.id.0 == 0)); // 标题不注册
+        assert_eq!(areas.len(), form.rows.len() + 1); // 行 + Add 按钮
+        for i in 0..form.rows.len() {
+            assert!(areas.iter().any(|a| a.id.0 == i as u32 + 1));
+        }
+        assert!(areas.iter().any(|a| a.id.0 == form.rows.len() as u32 + 1)); // Add
+    }
+
+    /// PMCORE-76:build_settings_form 含 hover tooltip 行,apply_settings_form 写回。
+    #[test]
+    fn hover_tooltip_form_row_writes_back() {
+        let mut s = SettingsData::default();
+        let mut form = build_settings_form(0.0, 0.0, 300.0, 1.0, &s);
+        let row = form.rows.iter_mut().find(|(l, _)| l == "hover tooltip").expect("表单应有 hover tooltip 行");
+        if let RTControl::Toggle { on, .. } = &mut row.1 {
+            *on = false;
+        } else {
+            panic!("hover tooltip 行应为 Toggle");
+        }
+        assert!(apply_settings_form(&form, &mut s));
+        assert!(!s.hover_tooltip);
+    }
 }

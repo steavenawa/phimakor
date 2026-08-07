@@ -7,6 +7,7 @@
 //! 本模块只依赖组件库与 ui 绘制原语,**不依赖 core 类型**(数据以
 //! `(beat, bpm)` 元组进出),因此 measure/ui_kit 的 `#[path]` 副本也能编译。
 
+use super::flow;
 use super::widgets::{Canvas, RealtimeForm, RTControl, Theme, Widget};
 use super::primitives::fill_rect_clipped;
 use super::text::draw_text_on_pixmap;
@@ -53,6 +54,23 @@ pub fn rows_of(form: &RealtimeForm) -> Vec<(f64, f64)> {
     }).collect()
 }
 
+/// BPM 表单流控区域(命中 = 绘制,单一真源):行 id = 索引+1,Add 按钮
+/// id = rows+1。几何委托组件库 [`Widget::areas`](RealtimeForm::areas)
+/// (widgets.rs 为 DevMenuBase 领地,只读,这里仅做 Area → HotArea 转换)。
+pub fn form_areas(form: &RealtimeForm) -> Vec<flow::HotArea> {
+    use flow::{AreaId, AreaKind, HotArea};
+    form.areas()
+        .into_iter()
+        .filter(|a| a.id != 0) // 标题(id=0)不可交互,不注册
+        .map(|a| HotArea {
+            id: AreaId(a.id),
+            rect: (a.rect.x(), a.rect.y(), a.rect.width(), a.rect.height()),
+            kind: AreaKind::Widget(a.kind),
+            disabled: false,
+        })
+        .collect()
+}
+
 /// tiny_skia Canvas 适配(主程序绘制后端)。
 pub(crate) struct SkiaCanvas<'a> {
     pub pm: &'a mut tiny_skia::PixmapMut<'a>,
@@ -91,5 +109,29 @@ pub(crate) fn draw_bpm_panel<'a>(
     let mut cv = SkiaCanvas { pm: pixmap };
     form.draw(&mut cv, &theme, hover);
     form.draw_overlay(&mut cv, &theme, hover);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 流控区域(命中 = 绘制):BPM 行 id = 索引+1、Add = rows+1;标题(0)不注册。
+    #[test]
+    fn form_areas_registers_rows_and_add() {
+        let rows = vec![(0.0, 120.0), (4.0, 90.0), (8.0, 150.0)];
+        let form = build_form(0.0, 0.0, 300.0, &rows, None, 1.0);
+        let areas = form_areas(&form);
+        assert!(!areas.iter().any(|a| a.id.0 == 0));
+        assert_eq!(areas.len(), 3 + 1); // 3 行 + Add
+        for i in 0..3 {
+            let a = areas.iter().find(|a| a.id.0 == i as u32 + 1).unwrap();
+            assert_eq!(a.rect.0, 0.0);
+            assert_eq!(a.rect.2, 300.0);
+            // 行几何与组件库 row_rect 一致(命中 = 绘制)。
+            let expect_y = 0.0 + 24.0 + i as f32 * (24.0 + 4.0);
+            assert!((a.rect.1 - expect_y).abs() < 1e-4);
+        }
+        assert!(areas.iter().any(|a| a.id.0 == 4)); // Add
+    }
 }
 

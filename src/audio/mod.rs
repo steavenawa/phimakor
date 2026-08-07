@@ -7,7 +7,8 @@
 //! [`AudioClock`] manages the rodio device and player directly on the audio thread.
 //! [`AudioHandle`] mirrors the same API to the main thread via atomics + command channel.
 //! [`spawn_audio_thread`] owns the clock plus a precomputed hitsound schedule
-//! (`(hit time, note kind)` pairs built by `Chart::fire_events_from_rpe`, see
+//! (`(hit time, note kind)` pairs derived from the unified trigger table —
+//! `Chart::fire_events` / its pre-Chart entry `Chart::fire_events_from_rpe`, see
 //! `crate::core::chart`) on a dedicated trigger thread, so hitsound timing is
 //! decoupled from the winit event loop (an occluded window stops
 //! `RedrawRequested` but never the hitsounds).
@@ -169,12 +170,6 @@ impl AudioClock {
             self.playing.set(true);
             self.player.play();
         }
-    }
-
-    /// Whether playback is currently paused.
-    #[allow(dead_code)] // AudioClock 内部状态;触发线程直接读 playing
-    pub fn is_paused(&self) -> bool {
-        !self.playing.get()
     }
 
     /// Seek to `t` seconds from the start, clamped at 0. If the previous
@@ -365,8 +360,8 @@ impl FireCursor {
 
 /// Start the audio trigger thread: it builds its own `AudioClock` (music +
 /// hitsounds) and fires hitsounds from the precomputed schedule `events`
-/// (`(hit time, kind)` pairs on the chart clock, see
-/// `Chart::fire_events_from_rpe`), ticked by the clock's reported position
+/// (`(hit time, kind)` pairs on the chart clock, see `Chart::fire_events`),
+/// ticked by the clock's reported position
 /// minus `total_offset`. Blocks until the thread reports the clock is up, so
 /// a missing/undecodable music file still fails here (caller falls back to
 /// the silent `Instant` clock).

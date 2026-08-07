@@ -251,7 +251,13 @@ struct EffPipe {
 impl PostPipe {
     /// Create a new post-processing pipeline. Builds the blit pipeline, sampler,
     /// screen bind-group layout, and initial ping-pong targets at the given size.
-    pub fn new(device: &wgpu::Device, width: u32, height: u32, tex_fmt: wgpu::TextureFormat) -> Self {
+    pub fn new(
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        tex_fmt: wgpu::TextureFormat,
+        cache: Option<&wgpu::PipelineCache>,
+    ) -> Self {
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("post-sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -335,7 +341,7 @@ impl PostPipe {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache,
         }));
         let mut pipe = PostPipe {
             targets: [None, None],
@@ -406,10 +412,16 @@ impl PostPipe {
     ///
     /// 失败(编译/校验错误)返回 `None` 并报错——wgpu 默认把校验错误当
     /// fatal panic,这里用 error scope 捕获后优雅跳过。
-    fn build_eff_pipe(&self, device: &wgpu::Device, name: &str, body: &str) -> Option<EffPipe> {
+    fn build_eff_pipe(
+        &self,
+        device: &wgpu::Device,
+        name: &str,
+        body: &str,
+        cache: Option<&wgpu::PipelineCache>,
+    ) -> Option<EffPipe> {
         let is_glsl = is_glsl_source(body);
         if is_glsl {
-            return self.build_eff_pipe_glsl(device, name, body);
+            return self.build_eff_pipe_glsl(device, name, body, cache);
         }
         let shader_src = String::from(crate::render::shaders::VERT) + body;
         // 编译/校验失败优雅降级:error scope 捕获,不 panic。
@@ -468,7 +480,7 @@ impl PostPipe {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache,
         });
 
         let uniform_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -492,7 +504,13 @@ impl PostPipe {
     /// 含 sampler 采样;naga glsl-in 的 texture 内建残缺不可用)。绑定:
     ///   group 0: binding0 = screen 纹理, binding1 = sampler,
     ///            binding 2.. = 每个 uniform 变量一个 buffer(256B)
-    fn build_eff_pipe_glsl(&self, device: &wgpu::Device, name: &str, body: &str) -> Option<EffPipe> {
+    fn build_eff_pipe_glsl(
+        &self,
+        device: &wgpu::Device,
+        name: &str,
+        body: &str,
+        cache: Option<&wgpu::PipelineCache>,
+    ) -> Option<EffPipe> {
         let (frag, uniform_count, uniform_layout) = glsl_for_glslang(body);
         // glslang 纯 CPU 编译(完整 GLSL 支持,含 sampler 采样)。
         let compiler = glslang::Compiler::acquire()?;
@@ -601,7 +619,7 @@ impl PostPipe {
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache,
         });
         let mut uniform_bufs = Vec::with_capacity(uniform_count);
         for i in 0..uniform_count {
@@ -621,9 +639,14 @@ impl PostPipe {
     }
 
     /// Ensure the pipeline + resources exist for a given effect.
-    pub fn ensure_effect(&mut self, device: &wgpu::Device, def: &EffectDef) {
+    pub fn ensure_effect(
+        &mut self,
+        device: &wgpu::Device,
+        def: &EffectDef,
+        cache: Option<&wgpu::PipelineCache>,
+    ) {
         if self.pipelines.contains_key(def.name) { return; }
-        if let Some(pipe) = self.build_eff_pipe(device, def.name, def.frag) {
+        if let Some(pipe) = self.build_eff_pipe(device, def.name, def.frag, cache) {
             self.pipelines.insert(def.name.to_string(), pipe);
         }
     }
@@ -641,11 +664,16 @@ impl PostPipe {
     /// A pipeline compile is a blocking GPU call (~tens of ms each) — call
     /// this only in contexts where a stall is acceptable (startup, loading
     /// screen), never in the steady-state frame.
-    pub fn tick_warmup(&mut self, device: &wgpu::Device, budget: usize) -> bool {
+    pub fn tick_warmup(
+        &mut self,
+        device: &wgpu::Device,
+        budget: usize,
+        cache: Option<&wgpu::PipelineCache>,
+    ) -> bool {
         for _ in 0..budget {
             let Some(name) = self.warmup_pending.pop() else { return true };
             if let Some(def) = EFFECTS.iter().find(|d| d.name == name.as_str()) {
-                self.ensure_effect(device, def);
+                self.ensure_effect(device, def, cache);
             }
         }
         self.warmup_pending.is_empty()
@@ -655,7 +683,12 @@ impl PostPipe {
     /// Failures are reported (stderr) instead of silently dropping the effect.
     /// Failed names are cached: retried only by a later `warmup_custom` scan
     /// (otherwise every frame re-reads the disk and re-prints the warning).
-    fn ensure_custom_effect(&mut self, device: &wgpu::Device, name: String) {
+    fn ensure_custom_effect(
+        &mut self,
+        device: &wgpu::Device,
+        name: String,
+        cache: Option<&wgpu::PipelineCache>,
+    ) {
         if self.pipelines.contains_key(&name) || self.failed_custom.contains(&name) {
             return;
         }
@@ -672,7 +705,7 @@ impl PostPipe {
                 return;
             }
         };
-        let pipe = self.build_eff_pipe(device, &name, &wgsl);
+        let pipe = self.build_eff_pipe(device, &name, &wgsl, cache);
         match pipe {
             Some(pipe) => { self.pipelines.insert(name, pipe); }
             None => { self.failed_custom.insert(name); }
@@ -682,7 +715,7 @@ impl PostPipe {
     /// 预热当前谱目录下的全部自定义 shader(切谱加载完成时调用,
     /// 一次性编译——运行中首次使用某个自定义特效不再阻塞卡帧)。
     /// 覆盖 .wgsl(WGSL 特效)与 .glsl/.frag(GLSL 特效)。
-    pub fn warmup_custom(&mut self, device: &wgpu::Device) {
+    pub fn warmup_custom(&mut self, device: &wgpu::Device, cache: Option<&wgpu::PipelineCache>) {
         let Some(ref chart_dir) = self.chart_dir else { return };
         let Ok(entries) = std::fs::read_dir(chart_dir) else { return };
         for entry in entries.flatten() {
@@ -704,7 +737,7 @@ impl PostPipe {
                         continue;
                     }
                 };
-                let pipe = self.build_eff_pipe(device, &name, &src);
+                let pipe = self.build_eff_pipe(device, &name, &src, cache);
                 match pipe {
                     Some(pipe) => {
                         self.pipelines.insert(name.clone(), pipe);
@@ -724,6 +757,7 @@ impl PostPipe {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         src: &wgpu::TextureView,
+        cache: Option<&wgpu::PipelineCache>,
     ) {
         let _s = crate::trace_span!("post_apply");
         if self.active.is_empty() { return; }
@@ -760,9 +794,9 @@ impl PostPipe {
         }).collect();
         for (key, _, _) in &descriptors {
             if let Some(def) = EFFECTS.iter().find(|d| d.name == key.as_str()) {
-                self.ensure_effect(device, def);
+                self.ensure_effect(device, def, cache);
             } else if !key.is_empty() {
-                self.ensure_custom_effect(device, key.clone());
+                self.ensure_custom_effect(device, key.clone(), cache);
             }
         }
 
@@ -849,12 +883,6 @@ impl PostPipe {
         let chart_time = self.chart_time;
         // Write uniform buffer (256 bytes, stack array — no per-frame alloc)
         let mut uniform_data = [0u8; 256];
-        for (i, &val) in uv.iter().enumerate() {
-            let offset = i * 4;
-            if offset + 4 <= uniform_data.len() {
-                uniform_data[offset..offset+4].copy_from_slice(&val.to_le_bytes());
-            }
-        }
         if ep.glsl {
             // GLSL 路径:按变量名匹配写入,优先级:
             //   1. 面板/extra 传入值
@@ -880,6 +908,21 @@ impl PostPipe {
                 queue.write_buffer(&ep.uniform_bufs[0], *off as u64, &v[..n]);
             }
         } else {
+            // WGSL 路径:按 defaults 声明的 WGSL 类型自动计算 std140 偏移
+            // (替代旧手工 _pad 占位成员 + i*4 顺序写入,PMCORE-45)。
+            // 自定义 .wgsl 无 defaults → 维持顺序写入(i*4)。
+            let mut offsets = [0u32; 64];
+            let n = EFFECTS
+                .iter()
+                .find(|d| d.name == key)
+                .map(|def| crate::render::shaders::wgsl_uniform_offsets(&def.defaults, &mut offsets))
+                .unwrap_or(0);
+            for (i, &val) in uv.iter().enumerate() {
+                let offset = if i < n { offsets[i] } else { i as u32 * 4 };
+                if offset as usize + 4 <= uniform_data.len() {
+                    uniform_data[offset as usize..offset as usize + 4].copy_from_slice(&val.to_le_bytes());
+                }
+            }
             queue.write_buffer(&ep.uniform_bufs[0], 0, &uniform_data);
         }
         let use_half = matches!(src_tag, SrcTag::Half(_));
@@ -916,25 +959,21 @@ impl PostPipe {
         } else {
             // Reuse the uniform bind group — the buffer is stable, only its
             // contents change per frame.
-            let uniform_bg = match &ep.uniform_bg {
-                Some(bg) => bg,
-                None => {
-                    let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some(&format!("ubg-{key}")),
-                        layout: &ep.bgl,
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &ep.uniform_bufs[0],
-                                offset: 0,
-                                size: wgpu::BufferSize::new(ep.uniform_size),
-                            }),
-                        }],
-                    });
-                    ep.uniform_bg = Some(bg);
-                    ep.uniform_bg.as_ref().unwrap()
-                }
-            };
+            if ep.uniform_bg.is_none() {
+                let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some(&format!("ubg-{key}")),
+                    layout: &ep.bgl,
+                    entries: &[wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: &ep.uniform_bufs[0],
+                            offset: 0,
+                            size: wgpu::BufferSize::new(ep.uniform_size),
+                        }),
+                    }],
+                });
+                ep.uniform_bg = Some(bg);
+            }
             // Screen bind group: cached by (SrcTag, half-sampler). SrcTag is a
             // stable role (Scene/Full0/1/Half0/1), so the cache is safe — the
             // same stack local may carry different textures, but the TAG changes
@@ -1027,6 +1066,28 @@ impl PostPipe {
     /// After `apply()`, returns the texture view containing the final result.
     pub fn last_view(&self) -> &wgpu::TextureView {
         self.target_views[self.last_output].as_ref().unwrap()
+    }
+
+    /// Bind group for the final surface blit (reads the current `last_output`
+    /// ping-pong target with the shared full-res sampler). Cached in
+    /// `blit_bgs` under `(SrcTag::Full(idx), false)` — the same map `blit()`
+    /// uses, so one cache serves both and `resize()` clears both together.
+    pub fn surface_blit_bg(&mut self, device: &wgpu::Device) -> wgpu::BindGroup {
+        let tag = SrcTag::Full(self.last_output as u8);
+        if let Some(bg) = self.blit_bgs.get(&(tag, false)) {
+            return bg.clone();
+        }
+        let view = self.target_views[self.last_output].as_ref().expect("post target view").clone();
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("blit-bg"),
+            layout: &self.screen_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        self.blit_bgs.insert((tag, false), bg.clone());
+        bg
     }
 }
 
@@ -1166,6 +1227,40 @@ void main() {
         assert!(converted.contains("    float power;"));
         assert!(converted.contains("texture(sampler2D(u_tex, u_tex_smp), v_uv)"));
         let _ = compile(converted, glslang::ShaderStage::Fragment);
+    }
+
+    #[test]
+    fn wgsl_uniform_offsets_auto_align() {
+        // 重构(PMCORE-45):defaults 无 _pad 占位,offset 按 WGSL 类型自动计算。
+        // shockwave: progress@0, center(vec2f)@8, width@16, distortion@20,
+        //            expand@24, screen_size(vec2f)@32
+        let shockwave = EFFECTS.iter().find(|d| d.name == "shockwave").unwrap();
+        assert!(shockwave.defaults.iter().all(|(n, _, _)| !n.starts_with('_')), "shockwave 无 _pad 残留");
+        let mut offs = [0u32; 64];
+        let n = crate::render::shaders::wgsl_uniform_offsets(&shockwave.defaults, &mut offs);
+        assert_eq!(n, shockwave.defaults.len());
+        let cx = shockwave.defaults.iter().position(|(n, _, _)| *n == "center_x").unwrap();
+        let sx = shockwave.defaults.iter().position(|(n, _, _)| *n == "screen_size_x").unwrap();
+        assert_eq!(offs[cx], 8, "shockwave center 落在 offset 8");
+        assert_eq!(offs[sx], 32, "shockwave screen_size 落在 offset 32");
+        // circleBlur: size@0, screen_size(vec2f)@8
+        let circle = EFFECTS.iter().find(|d| d.name == "circleBlur").unwrap();
+        assert!(circle.defaults.iter().all(|(n, _, _)| !n.starts_with('_')), "circleBlur 无 _pad 残留");
+        let mut offs2 = [0u32; 64];
+        let n2 = crate::render::shaders::wgsl_uniform_offsets(&circle.defaults, &mut offs2);
+        assert_eq!(n2, circle.defaults.len());
+        let sz = circle.defaults.iter().position(|(n, _, _)| *n == "screen_size_x").unwrap();
+        assert_eq!(offs2[sz], 8, "circleBlur screen_size 落在 offset 8");
+        // 全部内置特效:无 _pad,offset 均落在 256B uniform 缓冲内
+        for def in EFFECTS {
+            assert!(def.defaults.iter().all(|(n, _, _)| !n.starts_with('_')), "{} 无 _pad 残留", def.name);
+            let mut o = [0u32; 64];
+            let nn = crate::render::shaders::wgsl_uniform_offsets(&def.defaults, &mut o);
+            assert_eq!(nn, def.defaults.len(), "{} offset 数 = defaults 数", def.name);
+            for &off in &o[..nn] {
+                assert!(off as usize + 4 <= 256, "{} offset {off} 越界 256B", def.name);
+            }
+        }
     }
 }
 

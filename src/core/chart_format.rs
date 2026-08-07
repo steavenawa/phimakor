@@ -25,9 +25,10 @@ pub trait ChartParser {
 // ── Format registry ──
 
 /// Probe the bytes against all registered parsers and return the format tag
-/// (`"rpe"`, `"pec"`, `"pgr"`, `"pss"`, or `"unknown"`).
+/// (`"pmk"`, `"rpe"`, `"pec"`, `"pgr"`, `"pss"`, or `"unknown"`).
 pub fn detect_format(bytes: &[u8]) -> &'static str {
-    if RpeParser::detect(bytes) { "rpe" }
+    if PmkParser::detect(bytes) { "pmk" }
+    else if RpeParser::detect(bytes) { "rpe" }
     else if PecParser::detect(bytes) { "pec" }
     else if PgrParser::detect(bytes) { "pgr" }
     else if PssParser::detect(bytes) { "pss" }
@@ -37,11 +38,30 @@ pub fn detect_format(bytes: &[u8]) -> &'static str {
 /// Dispatch to the appropriate parser by format tag and return the parsed chart.
 pub fn parse_chart(format: &str, bytes: &[u8], info: &ChartInfo) -> Result<RPEChart> {
     match format {
+        "pmk" => PmkParser::parse_chart(bytes, info),
         "rpe" => RpeParser::parse_chart(bytes, info),
         "pec" => PecParser::parse_chart(bytes, info),
         "pgr" => PgrParser::parse_chart(bytes, info),
         "pss" => PssParser::parse_chart(bytes, info),
         _ => bail!("unsupported chart format: {format}"),
+    }
+}
+
+// ── PMK parser (Phimakor Chart, binary container) ──
+
+/// PMK (Phimakor Chart v1) format parser. Detects the `"PMK1"` magic and
+/// delegates to [`crate::core::pmk::from_bytes`]. The full round-trip API
+/// (including unknown-chunk preservation) lives in `crate::core::pmk`.
+pub struct PmkParser;
+
+impl ChartParser for PmkParser {
+    fn detect(bytes: &[u8]) -> bool {
+        bytes.len() >= 4 && bytes[..4] == crate::core::pmk::MAGIC
+    }
+    fn parse_chart(bytes: &[u8], _info: &ChartInfo) -> Result<RPEChart> {
+        // INFO chunk merge happens on the native save path via
+        // `pmk::from_bytes` (spec §6); the parser interface returns the chart.
+        Ok(crate::core::pmk::from_bytes(bytes)?.chart)
     }
 }
 
@@ -292,7 +312,7 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
                     y_offset: 0.0,
                     alpha: 255, hitsound: None,
                     size, speed, is_fake: fake, visible_time: 999999.,
-                    tint: None, tint_hit_effects: None, judge_area: None,
+                    tint: None, tint_hit_effects: None, judge_area: None, comment: None,
                 });
             }
             "cv" | "ca" | "cp" | "cd" | "cm" | "cr" | "cf" => {
@@ -406,7 +426,7 @@ fn parse_pec_text(source: &str) -> Result<RPEChart> {
             extended: None,
             notes: if pec.notes.is_empty() { None } else { Some(pec.notes) },
             is_cover: 0, z_order: 0, attach_ui: None,
-            pos_control: vec![], size_control: vec![], alpha_control: vec![], y_control: vec![],
+            pos_control: vec![], size_control: vec![], alpha_control: vec![], y_control: vec![], comment: None,
         });
     }
 
@@ -550,7 +570,7 @@ impl ChartParser for PgrParser {
                             position_x: n.position_x, y_offset: 0.0, alpha: 255,
                             hitsound: None, size: 1.0, speed: n.speed.unwrap_or(1.0),
                             is_fake: 0, visible_time: 999999.,
-                            tint: None, tint_hit_effects: None, judge_area: None,
+                            tint: None, tint_hit_effects: None, judge_area: None, comment: None,
                         });
                     }
                 }
@@ -569,7 +589,7 @@ impl ChartParser for PgrParser {
                 extended: None,
                 notes: if notes.is_empty() { None } else { Some(notes) },
                 is_cover: 0, z_order: 0, attach_ui: None,
-                pos_control: vec![], size_control: vec![], alpha_control: vec![], y_control: vec![],
+                pos_control: vec![], size_control: vec![], alpha_control: vec![], y_control: vec![], comment: None,
             });
         }
 
@@ -617,6 +637,50 @@ impl ChartParser for PssParser {
 mod tests {
     use super::*;
     use crate::core::chart::Chart;
+
+    #[test]
+    fn pmk_detect_and_pipeline() {
+        use crate::core::bpm::Triple;
+        use crate::core::pmk::{PmkDoc, PmkUnknown};
+        use crate::core::model::{RPEMetadata, RPEChart, RPEJudgeLine, RPENote};
+
+        let chart = RPEChart {
+            meta: RPEMetadata { offset: 0, rpe_version: 160 },
+            bpm_list: vec![crate::core::model::RPEBpmItem { bpm: 120.0, start_time: Triple::default() }],
+            judge_line_list: vec![RPEJudgeLine {
+                name: "Main".into(),
+                texture: "line.png".into(),
+                parent: None,
+                rotate_with_father: None,
+                event_layers: vec![None],
+                extended: None,
+                notes: Some(vec![RPENote {
+                    kind: 1, above: 1,
+                    start_time: Triple::from_beats(1.0),
+                    end_time: Triple::from_beats(1.0),
+                    position_x: 675.0, y_offset: 0.0, alpha: 255,
+                    hitsound: None, size: 1.0, speed: 1.0, is_fake: 0,
+                    visible_time: 999999.0,
+                    tint: None, tint_hit_effects: None, judge_area: None, comment: None,
+                }]),
+                is_cover: 0, z_order: 0, attach_ui: None,
+                pos_control: vec![], size_control: vec![], alpha_control: vec![], y_control: vec![], comment: None,
+            }],
+        };
+        let doc = PmkDoc { chart: chart.clone(), info: ChartInfo::default(), unknown: PmkUnknown::default() };
+        let bytes = crate::core::pmk::to_bytes(&doc).unwrap();
+
+        assert_eq!(detect_format(&bytes), "pmk");
+        assert!(!RpeParser::detect(&bytes));
+
+        let back = parse_chart("pmk", &bytes, &ChartInfo::default()).unwrap();
+        assert_eq!(back.judge_line_list.len(), chart.judge_line_list.len());
+
+        // The parsed chart must evaluate through the main pipeline.
+        let mut c = Chart::from_rpe_chart(&back, false).unwrap();
+        let frame = c.state_at(0.5);
+        assert_eq!(frame.lines.len(), back.judge_line_list.len());
+    }
 
     const PEC_SAMPLE: &str = r#"1000
 bp 120 0

@@ -285,9 +285,9 @@ impl PreviewEngine {
                 (e.uniforms.clone(), e.uniforms.len())
             } else {
                 let def = &EFFECTS[si];
-                let mut uv: Vec<f32> = def.defaults.iter().map(|(_, v)| *v).collect();
+                let mut uv: Vec<f32> = def.defaults.iter().map(|(_, _, v)| *v).collect();
                 let norm = |s: &str| s.to_lowercase().replace("_", "").replace("-", "");
-                for (i, (dname, _)) in def.defaults.iter().enumerate() {
+                for (i, (dname, _, _)) in def.defaults.iter().enumerate() {
                     let base = dname.trim_end_matches("_r").trim_end_matches("_g")
                         .trim_end_matches("_b").trim_end_matches("_a")
                         .trim_end_matches("_x").trim_end_matches("_y");

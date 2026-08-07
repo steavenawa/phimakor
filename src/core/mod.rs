@@ -15,8 +15,10 @@ pub mod easing;
 pub mod edit;
 pub mod extra;
 pub mod model;
+pub mod pmk;
 pub mod stream;
 
+#[allow(unused_imports)] // bins(measure 等)以 #[path] 引入 core 而无 render 模块时该重导出未用
 pub use chart::{FrameState, LineState};
 
 /// RGBA color, components in 0..=1. Stand-in for prpr's `macroquad::Color`
@@ -49,13 +51,3 @@ pub const RPE_HEIGHT: f32 = 900.;
 /// prpr: `10. / 45. / HEIGHT_RATIO`
 pub const SPEED_RATIO: f64 = 10. / 45. / HEIGHT_RATIO;
 
-/// One frame of evaluated chart state, produced by [`crate::core::chart::Chart::state_at`].
-/// Renderer draws this verbatim: for each line, apply line transform
-/// (translate → rotate → scale), draw line quad, then draw each note at
-/// its relative offset under the same transform.
-/// 视图适配器(renderer 用,当前主程序未直接构造)。
-#[allow(dead_code)]
-pub struct FrameStateView<'a> {
-    pub time: f64,
-    pub frame: &'a FrameState,
-}

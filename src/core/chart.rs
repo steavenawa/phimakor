@@ -1,5 +1,3 @@
-#![allow(dead_code)] // 库 API: Python 绑定/embedding/备用接口,主程序未全部使用
-
 // Derived from TeamFlos/phira prpr, GPL-3.0.
 //! RPE chart loading and per-frame state evaluation.
 //! Lowering ported from `prpr/src/parse/rpe.rs` (`parse_rpe`); note/line
@@ -35,6 +33,7 @@ pub struct FrameState {
 }
 
 /// A note whose hit time was crossed since the last [`Chart::state_at`] call.
+#[allow(dead_code)] // line/kind/x: engine::ChartSession 与 python bindings 消费,editor 只用 tick/fake/hold_tail
 pub struct FiredNote {
     /// Index into `judgeLineList`.
     pub line: usize,
@@ -99,6 +98,7 @@ pub struct LineState {
 
 /// Evaluated per-note state for one frame.
 /// See also [`LineState`].
+#[allow(dead_code)] // time/fake: python bindings(PyNoteState)消费,editor 渲染路径不用
 pub struct NoteState {
     /// 1 tap, 2 hold, 3 flick, 4 drag.
     pub kind: u8,
@@ -735,6 +735,24 @@ pub struct Chart {
     /// `order` scan order, index-tagged so they can be restored to draw
     /// order before publishing.
     visible_scratch: Vec<(usize, NoteState)>,
+    /// [PMCORE-72] Reused buffers for parent-transform propagation in
+    /// `state_at` (resolved rotations / own transforms / chain walks), so
+    /// steady forward playback performs zero heap allocations per frame.
+    /// `scratch_own_rot`/`scratch_own` hold the line's OWN transform from the
+    /// track loop (retained across frames when the track is frozen) — the
+    /// parent block reads them as the composition starting point instead of
+    /// the output slots, which hold the RESOLVED value.
+    scratch_rot: Vec<f32>,
+    scratch_own_rot: Vec<f32>,
+    scratch_own: Vec<[f32; 2]>,
+    scratch_chain: Vec<usize>,
+    scratch_visited: Vec<usize>,
+    /// [PMCORE-72] Forces full track re-evaluation on the next `state_at`:
+    /// set by `reposition` (a backward jump there produces no seek-back
+    /// signal for `state_at`) and initially true so the first frame
+    /// populates every output value before the frozen-track fast path may
+    /// skip re-interpolation.
+    eval_dirty: bool,
 }
 
 /// Reads `info.json` in `dir` (falling back to an RPE web-export `info.yml`,
@@ -786,20 +804,77 @@ pub struct TriggerEvent {
 pub const TRIGGER_TICK: u8 = 5;
 pub const TRIGGER_TAIL: u8 = 6;
 
+/// 统一触发事件表构建(单一口径):非 fake note 头/尾/半拍 tick,按 t 排序。
+/// [`from_rpe`](Chart::from_rpe) 用它填充 `Chart.triggers`;音频预加载路径
+/// ([`Chart::fire_events_from_rpe`]) 也走它再过滤头事件,保证与
+/// [`Chart::fire_events`] 逐项一致——三套触发判定(音频/fx/fired)共用同一
+/// 份构建逻辑。beat→秒换算用调用方已建的 `r`(与 note 解析同一 `BpmList`),
+/// 半拍 tick 反向解算(秒→拍→半拍→秒),tick 严格早于 hold 尾(恰落在
+/// end_time 的半拍不产生 tick)。
+fn build_triggers(rpe: &RPEChart, r: &mut BpmList) -> Vec<TriggerEvent> {
+    let mut trig_bpm = BpmList::new(r.elements().iter().map(|&(b, _, v)| (b, v)).collect());
+    let mut triggers: Vec<TriggerEvent> = Vec::new();
+    for (line_idx, line) in rpe.judge_line_list.iter().enumerate() {
+        for note in line.notes.iter().flatten() {
+            if note.is_fake != 0 {
+                continue;
+            }
+            let t = r.time(&note.start_time);
+            let x = note.position_x / (RPE_WIDTH / 2.);
+            triggers.push(TriggerEvent { t, line: line_idx, x, kind: note.kind });
+            if note.kind == 2 {
+                let end_time = r.time(&note.end_time);
+                if end_time > t {
+                    let b_lo = trig_bpm.beat(t);
+                    let b_end = trig_bpm.beat(end_time);
+                    let mut tb = (b_lo * 2.0).floor() / 2.0 + 0.5;
+                    while tb < b_end {
+                        let tt = trig_bpm.time_beats(tb);
+                        if tt < end_time {
+                            triggers.push(TriggerEvent { t: tt, line: line_idx, x, kind: TRIGGER_TICK });
+                        }
+                        tb += 0.5;
+                    }
+                    triggers.push(TriggerEvent { t: end_time, line: line_idx, x, kind: TRIGGER_TAIL });
+                }
+            }
+        }
+    }
+    triggers.sort_by(|a, b| a.t.total_cmp(&b.t));
+    triggers
+}
+
 impl Chart {
     /// Fast-forward the fired-note cursors to `time` without reporting the
-    /// notes that were jumped over. The editor calls this after a **forward**
-    /// seek: notes in the skipped window must neither fire again (double
-    /// count on top of `hits_before`) nor spawn hit FX / hitsounds (a dense
-    /// jump would flood the audio mixer). `time` must be >= the previous
-    /// call; backward seeks keep the replay-on-rewind semantics, which
-    /// `state_at` already handles via its seek-back detection.
+    /// notes that were jumped over. The editor calls this after a **seek**
+    /// (forward and backward alike): notes in a skipped window must neither
+    /// fire again (double count on top of `hits_before`) nor spawn hit FX /
+    /// hitsounds (a dense jump would flood the audio mixer). On a backward
+    /// seek the cursor sync makes the replay-on-rewind start **exactly** at
+    /// the seek target (the next `state_at` sees `time == last_state_time`,
+    /// not a seek-back), so the `(target, target+δ]` predict-offset window is
+    /// neither lost nor re-fired. Combo precision: locked by the invariant
+    /// tests in `mod tests` (`combo_invariant_*`, PMCORE combo 精度).
     pub fn reposition(&mut self, time: f64) {
+        if time < self.last_state_time {
+            // 后向 seek:state_at 因 last_state_time 被吃而看不到 seek-back
+            // (见下方注释),可见性游标必须在这里自己重置——否则过点即消的
+            // note 后退时永远不显示(PMCORE 回归:combo 修复 B 引入)。
+            for line in self.lines.iter_mut() {
+                line.cursor = 0;
+            }
+        }
         self.last_state_time = time;
+        // [PMCORE-72] `time` may jump backward here (e.g. reposition(0.0)
+        // after playback) without a seek-back signal for `state_at`, which
+        // would let the frozen-track fast path reuse stale values. Force a
+        // full re-evaluation on the next `state_at`.
+        self.eval_dirty = true;
     }
 
     /// Reads `info.json` in `dir` (falling back to an RPE-export `info.txt`
     /// when absent), then the chart file it names. Supports RPE, PEC, and PGR (官谱) formats.
+    #[allow(dead_code)] // embedding API: python bindings / engine / bench bins 使用
     pub fn load(dir: &std::path::Path) -> Result<(ChartInfo, Chart)> {
         let info = load_info(dir)?;
         let chart_path = dir.join(&info.chart);
@@ -816,31 +891,32 @@ impl Chart {
         Self::from_rpe(&json, use_rpe_170_speed)
     }
 
-    /// Compressed hitsound schedule: `(hit time in seconds on the chart
-    /// clock, note kind)` for every non-fake note, sorted by time.
-    ///
-    /// The audio trigger thread needs nothing else — no line/event state, no
-    /// easing curves, no visibility logic — so this replaces the second full
-    /// `Chart` it used to build (which re-read and re-parsed the chart files
-    /// from disk and kept a full animation-state graph alive on that thread).
-    /// Only beat→second conversion happens here (same `BpmList` math as
-    /// [`parse_notes`]); kinds pass through unchanged (1 tap, 2 hold,
-    /// 3 flick, 4 drag — all fire a hitsound at their hit time).
+    /// Compressed hitsound schedule derived from the unified trigger table:
+    /// `(hit time in seconds on the chart clock, note kind)` for every
+    /// non-fake note head, sorted by time. Head kinds pass through unchanged
+    /// (1 tap, 2 hold, 3 flick, 4 drag — all fire a hitsound at their hit
+    /// time); hold tick (5) / hold tail (6) 与 fake note 不产生音频事件。
+    /// 过滤条件 kind∈1..=4 必须保留:tick/tail 混在统一表里,不过滤会把
+    /// hold 中部/结尾误触发为 hitsound。
+    pub fn fire_events(&self) -> Vec<(f64, u8)> {
+        self.triggers
+            .iter()
+            .filter(|e| (1..=4).contains(&e.kind))
+            .map(|e| (e.t, e.kind))
+            .collect()
+    }
+
+    /// 音频触发线程在 Chart 构建前(后台加载线程)使用的入口:与
+    /// [`Chart::fire_events`] 同一构建口径——共用 [`build_triggers`] 统一
+    /// 触发事件表(唯一扫描点),再过滤头事件(kind∈1..=4)。音频调度路径
+    /// 不再单独遍历 judge_line_list/note 列表。
     pub fn fire_events_from_rpe(rpe: &RPEChart) -> Vec<(f64, u8)> {
-        let mut bpm = BpmList::new(rpe.bpm_list.iter().map(|it| (it.start_time.beats(), it.bpm)).collect());
-        let mut events = Vec::new();
-        for line in &rpe.judge_line_list {
-            if let Some(notes) = &line.notes {
-                for note in notes {
-                    if note.is_fake != 0 {
-                        continue;
-                    }
-                    events.push((bpm.time(&note.start_time), note.kind));
-                }
-            }
-        }
-        events.sort_by(|a, b| a.0.total_cmp(&b.0));
-        events
+        let mut r = BpmList::new(rpe.bpm_list.iter().map(|it| (it.start_time.beats(), it.bpm)).collect());
+        build_triggers(rpe, &mut r)
+            .into_iter()
+            .filter(|e| (1..=4).contains(&e.kind))
+            .map(|e| (e.t, e.kind))
+            .collect()
     }
 
     fn from_rpe(source: &str, use_rpe_170_speed: bool) -> Result<Chart> {
@@ -907,6 +983,10 @@ impl Chart {
             max_time = max_time.max(notes_max).max(events_max).max(ext_max);
         }
         let max_time = max_time + 1.;
+        // 统一触发事件表(单一口径,见 [`build_triggers`]):音频预加载路径
+        // (fire_events_from_rpe) 也走同一 builder,保证三套触发判定一致。
+        // 需在 rpe.judge_line_list 被消费(下方 into_iter)前借 rpe 构建。
+        let triggers = build_triggers(&rpe, &mut r);
 
         let mut lines = Vec::new();
         for (id, line) in rpe.judge_line_list.into_iter().enumerate() {
@@ -986,33 +1066,7 @@ impl Chart {
                 attach_ui: None,
             })
             .collect();
-        // 统一触发事件表:头/尾/半拍 tick(非 fake),按时间排序。
-        // 半拍 tick 反向解算(秒→拍→半拍→秒),与旧 fx_in_window 同语义;
-        // tick 严格早于 hold 尾(恰落在 end_time 的半拍不产生 tick)。
-        let mut trig_bpm = BpmList::new(r.elements().iter().map(|&(b, _, v)| (b, v)).collect());
-        let mut triggers: Vec<TriggerEvent> = Vec::new();
-        for (line_idx, line) in lines.iter().enumerate() {
-            for n in &line.notes {
-                if n.fake {
-                    continue;
-                }
-                triggers.push(TriggerEvent { t: n.time, line: line_idx, x: n.x, kind: n.kind });
-                if n.kind == 2 && n.end_time > n.time {
-                    let b_lo = trig_bpm.beat(n.time);
-                    let b_end = trig_bpm.beat(n.end_time);
-                    let mut tb = (b_lo * 2.0).floor() / 2.0 + 0.5;
-                    while tb < b_end {
-                        let tt = trig_bpm.time_beats(tb);
-                        if tt < n.end_time {
-                            triggers.push(TriggerEvent { t: tt, line: line_idx, x: n.x, kind: TRIGGER_TICK });
-                        }
-                        tb += 0.5;
-                    }
-                    triggers.push(TriggerEvent { t: n.end_time, line: line_idx, x: n.x, kind: TRIGGER_TAIL });
-                }
-            }
-        }
-        triggers.sort_by(|a, b| a.t.total_cmp(&b.t));
+        let line_count = lines.len();
         Ok(Chart {
             offset,
             duration: max_time,
@@ -1022,6 +1076,12 @@ impl Chart {
             frame: FrameState { time: 0., lines: frame_lines, fired: Vec::new() },
             visible_scratch: Vec::new(),
             triggers,
+            scratch_rot: vec![0.0; line_count],
+            scratch_own_rot: vec![0.0; line_count],
+            scratch_own: vec![[0.0; 2]; line_count],
+            scratch_chain: Vec::with_capacity(line_count),
+            scratch_visited: Vec::with_capacity(line_count),
+            eval_dirty: true,
         })
     }
 
@@ -1031,6 +1091,11 @@ impl Chart {
     /// Backward seeks (`time < previous call`) report nothing this call;
     /// the next call replays events after the seek target (same semantics
     /// as the old cursor-based implementation).
+    ///
+    /// 口径与 `hits_before` 互补(窗口 `(last, time]`,`<=` 边界),组合起来
+    /// 即 combo 不变量 `累计 fired == hits_before(chart_time)`——由 `mod tests`
+    /// 的 `combo_invariant_*` 系列逐帧锁定(暂停 predict 归零回跳、seek、
+    /// A-B 回跳均不双计/不漏计)。
     pub fn advance_fired(&mut self, time: f64) -> &[FiredNote] {
         let last = self.last_state_time;
         self.last_state_time = time;
@@ -1074,6 +1139,11 @@ impl Chart {
     pub fn state_at(&mut self, time: f64) -> &FrameState {
         let _s = crate::trace_span!("state_at");
         let seek_back = time < self.last_state_time;
+        // [PMCORE-72] Full track re-evaluation whenever time may have moved
+        // out of band: backward seek (track cursors must walk back) or
+        // `reposition`. In steady forward playback frozen tracks skip it.
+        let force_tracks = seek_back || self.eval_dirty;
+        self.eval_dirty = false;
         self.advance_fired(time);
         if seek_back {
             // backward seek — the visibility cursor restarts from the top
@@ -1087,24 +1157,88 @@ impl Chart {
             frame,
             visible_scratch,
             bpm_list,
+            scratch_rot,
+            scratch_own_rot,
+            scratch_own,
+            scratch_chain,
+            scratch_visited,
             ..
         } = self;
-        for (line, out) in lines.iter_mut().zip(frame.lines.iter_mut()) {
-            line.alpha.set_time(time);
-            line.pe_alpha.set_time(time);
-            line.rotation.set_time(time);
-            line.move_x.set_time(time);
-            line.move_y.set_time(time);
-            line.scale_x.set_time(time);
-            line.scale_y.set_time(time);
-            line.color.set_time(time);
-            line.height.set_time(time);
-            // [E] CtrlObject evaluation
-            line.ctrl_pos_x.set_time(time);
-            line.ctrl_pos_y.set_time(time);
-            line.ctrl_alpha.set_time(time);
-            line.ctrl_y.set_time(time);
-            line.incline.set_time(time);
+        // Own-transform caches are indexed by line; grow them once if the
+        // line count ever exceeded the build-time sizing (no-op normally).
+        scratch_own_rot.resize(lines.len(), 0.0);
+        scratch_own.resize(lines.len(), [0.0; 2]);
+        for (li, (line, out)) in lines.iter_mut().zip(frame.lines.iter_mut()).enumerate() {
+            // [PMCORE-72] Frozen-track fast path: a track whose value no
+            // longer depends on time (no keyframes, or the cursor already
+            // past the last one, across the whole chain) keeps the previous
+            // frame's output — `out` persists across calls, so skipping the
+            // set_time/now_opt pair is value-exact. `force_tracks` (seek /
+            // reposition) recomputes every track.
+            //
+            // rotation/position write the OWN transform into the scratch
+            // caches (retained when frozen); the parent block below composes
+            // from those and writes the RESOLVED value to `out`.
+            let full = force_tracks;
+            if full || !line.alpha.frozen() {
+                line.alpha.set_time(time);
+                let raw_alpha = line.alpha.now_opt().unwrap_or(1.0);
+                out.alpha = raw_alpha.max(0.);
+            }
+            if full || !line.pe_alpha.frozen() {
+                line.pe_alpha.set_time(time);
+                // PE alpha extension (phira `Chart::render` line.rs:365-384).
+                // The `w` decode uses the RAW (unscaled) alpha value — the
+                // 1/255-scaled rendering alpha would turn -255 into -1 and
+                // misdecode every extended value as `w == 1` (hide everything).
+                let pe_w = line.pe_alpha.now_opt().unwrap_or(1.0);
+                let w = (-pe_w).floor() as i64;
+                out.pe_hide = w == 1;
+                out.draw_below = !(w == 2);
+                // appear_before = (w-100)/100 BEATS. NOTE: phira implements
+                // (w-100)/10 (10× longer, 15.5 beats for -255); the /100 form
+                // matches charting convention (~1.55 beats for -255, i.e. 0.458s
+                // at 203 BPM) and actual chart behavior — the /10 value makes
+                // notes activate far too early in play.
+                out.appear_before = if (100..1000).contains(&w) {
+                    (w as f64 - 100.0) / 100.0
+                } else {
+                    0.0
+                };
+            }
+            if full || !line.rotation.frozen() {
+                line.rotation.set_time(time);
+                scratch_own_rot[li] = line.rotation.now().to_radians();
+            }
+            if full || !(line.move_x.frozen() && line.move_y.frozen()) {
+                line.move_x.set_time(time);
+                line.move_y.set_time(time);
+                scratch_own[li] = [line.move_x.now(), line.move_y.now()];
+            }
+            if full || !(line.scale_x.frozen() && line.scale_y.frozen()) {
+                line.scale_x.set_time(time);
+                line.scale_y.set_time(time);
+                out.scale = [line.scale_x.now_opt().unwrap_or(1.0), line.scale_y.now_opt().unwrap_or(1.0)];
+            }
+            if full || !line.color.frozen() {
+                line.color.set_time(time);
+                out.color = line.color.now_opt().map(|c| [c.r, c.g, c.b, c.a]).unwrap_or([1.; 4]);
+            }
+            // height feeds the note loop below via `line.height.now()`; when
+            // frozen that read already returns the constant value.
+            if full || !line.height.frozen() {
+                line.height.set_time(time);
+            }
+            // [E] CtrlObject evaluation (tracks are usually empty → frozen).
+            // now_opt below stays unconditional: on frozen/empty tracks it is
+            // a constant read, not an interpolation.
+            if full || !line.ctrl_pos_x.frozen() { line.ctrl_pos_x.set_time(time); }
+            if full || !line.ctrl_pos_y.frozen() { line.ctrl_pos_y.set_time(time); }
+            if full || !line.ctrl_size_x.frozen() { line.ctrl_size_x.set_time(time); }
+            if full || !line.ctrl_size_y.frozen() { line.ctrl_size_y.set_time(time); }
+            if full || !line.ctrl_alpha.frozen() { line.ctrl_alpha.set_time(time); }
+            if full || !line.ctrl_y.frozen() { line.ctrl_y.set_time(time); }
+            if full || !line.incline.frozen() { line.incline.set_time(time); }
             // phira: CtrlObject values are multipliers with default 1.0.
             out.ctrl_pos_x = line.ctrl_pos_x.now_opt().unwrap_or(1.0);
             out.ctrl_pos_y = line.ctrl_pos_y.now_opt().unwrap_or(1.0);
@@ -1114,30 +1248,6 @@ impl Chart {
             out.ctrl_y = line.ctrl_y.now_opt().unwrap_or(1.0);
             let incline_deg = line.incline.now_opt().unwrap_or(0.0);
             out.incline_sin = incline_deg.to_radians().sin();
-            let raw_alpha = line.alpha.now_opt().unwrap_or(1.0);
-            out.alpha = raw_alpha.max(0.);
-            // PE alpha extension (phira `Chart::render` line.rs:365-384).
-            // The `w` decode uses the RAW (unscaled) alpha value — the
-            // 1/255-scaled rendering alpha would turn -255 into -1 and
-            // misdecode every extended value as `w == 1` (hide everything).
-            let pe_w = line.pe_alpha.now_opt().unwrap_or(1.0);
-            let w = (-pe_w).floor() as i64;
-            out.pe_hide = w == 1;
-            out.draw_below = !(w == 2);
-            // appear_before = (w-100)/100 BEATS. NOTE: phira implements
-            // (w-100)/10 (10× longer, 15.5 beats for -255); the /100 form
-            // matches charting convention (~1.55 beats for -255, i.e. 0.458s
-            // at 203 BPM) and actual chart behavior — the /10 value makes
-            // notes activate far too early in play.
-            out.appear_before = if (100..1000).contains(&w) {
-                (w as f64 - 100.0) / 100.0
-            } else {
-                0.0
-            };
-            out.rotation = line.rotation.now().to_radians();
-            out.position = [line.move_x.now(), line.move_y.now()];
-            out.scale = [line.scale_x.now_opt().unwrap_or(1.0), line.scale_y.now_opt().unwrap_or(1.0)];
-            out.color = line.color.now_opt().map(|c| [c.r, c.g, c.b, c.a]).unwrap_or([1.; 4]);
             if out.texture != line.texture {
                 out.texture.clone_from(&line.texture);
             }
@@ -1162,47 +1272,57 @@ impl Chart {
             // phira: fetch_rot(i) = rot_i + (i.rot_with_parent ? fetch_rot(parent) : 0),
             // 递归展开 = 逐级检查"当前节点"自己的 rot_with_parent,为 true 则累加
             // 父线旋转并上移。注意:检查的是当前节点(首层为 i),不是父线!
-            let mut rot_resolved = vec![0.0f32; frame.lines.len()];
-            for i in 0..frame.lines.len() {
-                let mut rot = frame.lines[i].rotation;
+            // [PMCORE-72] All temporaries are Chart-owned scratch buffers
+            // (resized once, reused every frame — zero steady-state allocs);
+            // own transforms come from the track loop's scratch caches.
+            let n = frame.lines.len();
+            scratch_rot.resize(n, 0.0);
+            scratch_own_rot.resize(n, 0.0);
+            scratch_own.resize(n, [0.0; 2]);
+            for i in 0..n {
+                let mut rot = scratch_own_rot[i];
                 let mut node = i;
                 let mut cur = frame.lines[i].parent;
-                let mut visited: Vec<usize> = Vec::new();
+                scratch_chain.clear();
                 while let Some(pidx) = cur {
-                    if pidx >= frame.lines.len() || visited.contains(&pidx) || pidx == i {
+                    if pidx >= n || scratch_chain.contains(&pidx) || pidx == i {
                         break;
                     }
-                    visited.push(pidx);
+                    scratch_chain.push(pidx);
                     if !frame.lines[node].rot_with_parent {
                         break;
                     }
-                    rot += frame.lines[pidx].rotation;
+                    // Parent's OWN rotation (its output slot holds the
+                    // previous frame's RESOLVED value — the copy-out to
+                    // `out` happens after this loop).
+                    rot += scratch_own_rot[pidx];
                     node = pidx;
                     cur = frame.lines[pidx].parent;
                 }
-                rot_resolved[i] = rot;
+                scratch_rot[i] = rot;
             }
-            for i in 0..frame.lines.len() {
-                frame.lines[i].rotation = rot_resolved[i];
+            for i in 0..n {
+                frame.lines[i].rotation = scratch_rot[i];
             }
             // Then positions (phira fetch_pos, recursive): walk the parent
             // chain from root to leaf, composing R(parent_rot) × own_offset.
-            let own_pos: Vec<[f32; 2]> = frame.lines.iter().map(|l| l.position).collect();
-            for i in 0..frame.lines.len() {
-                let mut acc = own_pos[i];
+            // `scratch_own` already holds each line's OWN position (written
+            // by the track loop above, retained when the tracks are frozen).
+            for i in 0..n {
+                let mut acc = scratch_own[i];
                 let mut cur = frame.lines[i].parent;
-                let mut stack: Vec<usize> = Vec::new();
-                let mut visited: Vec<usize> = Vec::new();
+                scratch_chain.clear();
+                scratch_visited.clear();
                 while let Some(pidx) = cur {
-                    if pidx >= frame.lines.len() || visited.contains(&pidx) || pidx == i {
+                    if pidx >= n || scratch_visited.contains(&pidx) || pidx == i {
                         break;
                     }
-                    visited.push(pidx);
-                    stack.push(pidx);
+                    scratch_visited.push(pidx);
+                    scratch_chain.push(pidx);
                     cur = frame.lines[pidx].parent;
                 }
                 // Root first (last pushed) → direct parent (first pushed).
-                for &pidx in stack.iter().rev() {
+                for &pidx in scratch_chain.iter().rev() {
                     let p = &frame.lines[pidx];
                     let pr = p.rotation; // phira: parent's fetch_rot
                     let cos = pr.cos();
@@ -1338,14 +1458,6 @@ impl Chart {
             .collect()
     }
 
-    /// 统一触发事件表区间查询 `(t_lo, t_hi]`(开左闭右,与
-    /// advance_fired 的游标语义一致)。
-    pub fn triggers_in(&self, t_lo: f64, t_hi: f64) -> &[TriggerEvent] {
-        let start = self.triggers.partition_point(|e| e.t <= t_lo);
-        let end = self.triggers.partition_point(|e| e.t <= t_hi);
-        &self.triggers[start..end]
-    }
-
     /// 求线在 `time` 时刻的位姿 `(position, rotation 弧度, [scale_x, scale_y])`,
     /// 含 parent 继承(与 state_at 的 fetch_rot/fetch_pos 等价)。hit-fx 用:
     /// 特效位置在 **触发瞬间 t0** 的线变换下计算,不绑定当前帧线状态——
@@ -1402,11 +1514,13 @@ impl Chart {
         // chain = [self, parent, ..., root];rev 后 = [root, ..., parent, self]。
         // 从 root 到 parent 组合,**跳过 self**(否则用自己的 own 组合自己,
         // 父线平移/旋转全部丢失——父线有 move 事件时 fx 落在未组合坐标)。
-        for &pidx in chain.iter().rev() {
+        // rev 枚举自带链内下标:第 k 个 rev 元素 = chain[len-1-k],免去每步
+        // 线性查找(深链 O(depth²) → O(depth),零分配)。
+        for (k, &pidx) in chain.iter().rev().enumerate() {
             if pidx == line_idx {
                 continue;
             }
-            let ci = chain.iter().position(|&c| c == pidx).unwrap();
+            let ci = chain.len() - 1 - k;
             let pr = rot_resolved[ci];
             let (cos, sin) = (pr.cos(), pr.sin());
             let (lx, ly) = (acc[0], acc[1]);
@@ -1414,6 +1528,31 @@ impl Chart {
             acc[1] = self.lines[pidx].move_y.now() + sin * lx + cos * ly;
         }
 (acc, rot_resolved[0])
+    }
+
+    /// 批量求多个 fx 触发点在各自 **t0 时刻** 的线位姿(PMCORE-79 聚合)。
+    ///
+    /// 按 `(line, t0)` 去重:同一键(和弦/多 note 同拍)只做一次链 set_time
+    /// 与位姿组合,结果按输入顺序映射回每个触发点(输出与 `triggers` 等长)。
+    /// 密集段落一帧上百触发点时消掉重复的链遍历与四个临时 Vec 分配;每个键
+    /// 的求值就是一次 [`line_pose_at`],位姿语义逐像素一致。幂等性同
+    /// `line_pose_at`:只对事件轨道 set_time,不扰动 notes 可见性游标或
+    /// fired 状态。
+    pub fn fx_poses(&mut self, triggers: &[FxTrigger]) -> Vec<([f32; 2], f32)> {
+        // ponytail: 线性扫键去重(键数 ≤ 窗口内触发点数),无需 f64 位哈希;
+        // 单帧触发点上万时才值得换 HashMap,真到那天再换。
+        let mut keys: Vec<(usize, f64)> = Vec::new();
+        let mut poses: Vec<([f32; 2], f32)> = Vec::with_capacity(triggers.len());
+        for tr in triggers {
+            match keys.iter().position(|&k| k == (tr.line, tr.t0)) {
+                Some(i) => poses.push(poses[i]),
+                None => {
+                    keys.push((tr.line, tr.t0));
+                    poses.push(self.line_pose_at(tr.line, tr.t0));
+                }
+            }
+        }
+        poses
     }
 
     /// Total chart duration in seconds.
@@ -1435,18 +1574,23 @@ impl Chart {
     }
 
     /// Total number of non-fake notes (combo/score denominator).
+    #[allow(dead_code)] // python bindings / measure bin 使用
     pub fn note_count(&self) -> usize {
         self.lines.iter().map(|line| line.notes.iter().filter(|note| !note.fake).count()).sum()
     }
 
-    /// Combo 口径：非 fake 音符 note.time <= `time` 各计 1（hold 头），
-    /// 外加非 fake hold 中 end_time <= `time` 各再计 1（hold 尾）。
+    /// Combo 口径:非 fake 音符 note.time <= `time` 各计 1(hold 头),
+    /// 外加非 fake hold 中 end_time <= `time` 各再计 1(hold 尾)。
     /// O(n) full scan — intended for seek handling only.
     ///
     /// Boundary: `<=` is the exact complement of the fired condition
     /// (`last < note.time <= time`) — after a seek to `time`, notes at exactly
     /// `time` can never fire again (last = time), so they must be counted
     /// here or they would be lost from combo/score restoration.
+    ///
+    /// 已由不变量测试锁定:`combo == hits_before(chart_time)` 在正常播放
+    /// (含 predict 注入)、暂停/恢复、前后向 seek、A-B 循环回跳、边界精确
+    /// 停留场景下逐帧成立(`mod tests` 的 `combo_invariant_*` 系列)。
     pub fn hits_before(&self, time: f64) -> usize {
         self.lines
             .iter()
@@ -1477,6 +1621,12 @@ impl Chart {
         self.bpm_list.beat(time)
     }
 
+    /// Convert beats to chart seconds (inverse of [`time_to_beat`]; used by
+    /// the A-B loop seek conversion, PMCORE-22).
+    pub fn beat_to_time(&mut self, beats: f64) -> f64 {
+        self.bpm_list.time_beats(beats)
+    }
+
     /// Name of line `i`.
     pub fn line_name(&self, i: usize) -> &str { &self.lines[i].name }
 
@@ -1488,6 +1638,241 @@ impl Chart {
             .filter_map(|it| it.texture.clone())
             .filter(|it| seen.insert(it.clone()))
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chart content validation (PMCORE-21)
+// ---------------------------------------------------------------------------
+
+/// 校验检出的一类问题(按类别区分;测试/UI 按 `kind` 机器匹配)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IssueKind {
+    /// 音符/事件起始拍为负。
+    NegativeBeat,
+    /// hold(end_time) < start_time。
+    HoldEndBeforeStart,
+    /// 事件 start_time > end_time(零长事件合法,不报)。
+    EventStartAfterEnd,
+    /// |position_x| > 675。
+    PositionXOutOfRange,
+    /// alpha > 255。
+    AlphaOutOfRange,
+    /// BPM ≤ 0。
+    BpmNonPositive,
+    /// 同线同拍同 x 重复音符(叠键仅告警;fake 不参与)。
+    DuplicateNote,
+}
+
+/// 谱面内容校验问题(加载后收集)。内容级问题默认放行+告警,不阻断加载;
+/// 结构级问题(解析失败)由解析层 `Err` 硬失败,不进入此列表。
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChartIssue {
+    pub kind: IssueKind,
+    /// 判定线索引(`judge_line_list` 下标);None = 全局问题(BPM 等)。
+    pub line: Option<usize>,
+    /// 音符/事件在所属列表内的下标;None = 线级问题。
+    pub index: Option<usize>,
+    /// 拍号定位:问题项的起始拍(反序问题时为 end 拍)。
+    pub beat: Option<f64>,
+    /// 人类可读描述(含定位,可直接展示)。
+    pub message: String,
+}
+
+/// 事件时间合法性(负拍 / start>end),所有事件类型共用。零长事件
+/// (start == end,如 PEC speed 步进,chart_format.rs:397-413)合法,不报。
+fn check_event_times<T>(
+    issues: &mut Vec<ChartIssue>,
+    li: usize,
+    path: &str,
+    ei: usize,
+    ev: &RPEEvent<T>,
+) {
+    let s = ev.start_time.beats();
+    let e = ev.end_time.beats();
+    if s < 0.0 {
+        issues.push(ChartIssue {
+            kind: IssueKind::NegativeBeat,
+            line: Some(li),
+            index: Some(ei),
+            beat: Some(s),
+            message: format!("line {li} {path}[{ei}] start beat {s} < 0"),
+        });
+    }
+    if s > e {
+        issues.push(ChartIssue {
+            kind: IssueKind::EventStartAfterEnd,
+            line: Some(li),
+            index: Some(ei),
+            beat: Some(e),
+            message: format!("line {li} {path}[{ei}] start {s} > end {e}"),
+        });
+    }
+}
+
+impl RPEChart {
+    /// 内容级校验(纯函数,不改任何状态):返回全部问题列表(含定位字段:
+    /// 线索引/音符或事件索引/拍号)。
+    ///
+    /// 复杂度 O(n log n)(重复检测按 (拍, x) 排序后线性扫描),万级音符
+    /// <100ms。结构级问题(解析失败)由 parse 层 `Err` 承担,不在返回值里;
+    /// 内容级问题默认放行+告警,不阻断加载。
+    pub fn validate(&self) -> Vec<ChartIssue> {
+        let mut issues = Vec::new();
+
+        // ── BPM(全局,无线索引)──
+        for (bi, bpm) in self.bpm_list.iter().enumerate() {
+            if bpm.bpm <= 0.0 {
+                issues.push(ChartIssue {
+                    kind: IssueKind::BpmNonPositive,
+                    line: None,
+                    index: Some(bi),
+                    beat: Some(bpm.start_time.beats()),
+                    message: format!(
+                        "BPMList[{bi}] bpm={} ≤ 0 (start beat {})",
+                        bpm.bpm,
+                        bpm.start_time.beats()
+                    ),
+                });
+            }
+        }
+
+        const MAX_X: f32 = RPE_WIDTH / 2.0; // ±675
+        for (li, line) in self.judge_line_list.iter().enumerate() {
+            // ── 音符 ──
+            if let Some(notes) = &line.notes {
+                for (ni, n) in notes.iter().enumerate() {
+                    let s = n.start_time.beats();
+                    let e = n.end_time.beats();
+                    if s < 0.0 {
+                        issues.push(ChartIssue {
+                            kind: IssueKind::NegativeBeat,
+                            line: Some(li),
+                            index: Some(ni),
+                            beat: Some(s),
+                            message: format!("line {li} notes[{ni}] start beat {s} < 0"),
+                        });
+                    }
+                    // hold(kind=2)的 end_time 语义上必须 ≥ start_time。
+                    if n.kind == 2 && e < s {
+                        issues.push(ChartIssue {
+                            kind: IssueKind::HoldEndBeforeStart,
+                            line: Some(li),
+                            index: Some(ni),
+                            beat: Some(e),
+                            message: format!("line {li} notes[{ni}] hold end {e} < start {s}"),
+                        });
+                    }
+                    if n.position_x.abs() > MAX_X {
+                        issues.push(ChartIssue {
+                            kind: IssueKind::PositionXOutOfRange,
+                            line: Some(li),
+                            index: Some(ni),
+                            beat: Some(s),
+                            message: format!(
+                                "line {li} notes[{ni}] position_x {} out of ±{MAX_X}",
+                                n.position_x
+                            ),
+                        });
+                    }
+                    if n.alpha > 255 {
+                        issues.push(ChartIssue {
+                            kind: IssueKind::AlphaOutOfRange,
+                            line: Some(li),
+                            index: Some(ni),
+                            beat: Some(s),
+                            message: format!("line {li} notes[{ni}] alpha {} > 255", n.alpha),
+                        });
+                    }
+                }
+                // 重复检测:同线同拍同 x(排除 fake——fake 常与实体音符叠放)。
+                // 排序后线性扫描,O(n log n),万级音符 <100ms。
+                let mut order: Vec<usize> = (0..notes.len()).collect();
+                order.sort_by(|&a, &b| {
+                    notes[a]
+                        .start_time
+                        .beats()
+                        .total_cmp(&notes[b].start_time.beats())
+                        .then_with(|| notes[a].position_x.total_cmp(&notes[b].position_x))
+                });
+                let same_pos = |a: usize, b: usize| {
+                    notes[a].is_fake == 0
+                        && notes[b].is_fake == 0
+                        && notes[a].start_time.beats() == notes[b].start_time.beats()
+                        && notes[a].position_x == notes[b].position_x
+                };
+                let mut i = 0;
+                while i < order.len() {
+                    let mut j = i + 1;
+                    while j < order.len() && same_pos(order[i], order[j]) {
+                        j += 1;
+                    }
+                    // 每组第 2..n 个报重复(每组只报一次,不重复计数)。
+                    for &k in &order[i + 1..j] {
+                        issues.push(ChartIssue {
+                            kind: IssueKind::DuplicateNote,
+                            line: Some(li),
+                            index: Some(k),
+                            beat: Some(notes[k].start_time.beats()),
+                            message: format!(
+                                "line {li} notes[{k}] duplicate of notes[{}] (beat {}, x {})",
+                                order[i],
+                                notes[k].start_time.beats(),
+                                notes[k].position_x
+                            ),
+                        });
+                    }
+                    i = j;
+                }
+            }
+
+            // ── 事件:5 个基础层 + extended 7 类。只查拍号合法性
+            // (负拍 / start>end);零长事件(如 PEC speed 步进)合法,不报。──
+            macro_rules! check_ev {
+                ($path:expr, $evs:expr) => {
+                    if let Some(evs) = $evs {
+                        for (ei, ev) in evs.iter().enumerate() {
+                            check_event_times(&mut issues, li, $path, ei, ev);
+                        }
+                    }
+                };
+            }
+            for (layer_i, layer) in line.event_layers.iter().flatten().enumerate() {
+                let lp = format!("layers[{layer_i}].");
+                check_ev!(&format!("{lp}alphaEvents"), layer.alpha_events.as_ref());
+                check_ev!(&format!("{lp}moveXEvents"), layer.move_x_events.as_ref());
+                check_ev!(&format!("{lp}moveYEvents"), layer.move_y_events.as_ref());
+                check_ev!(&format!("{lp}rotateEvents"), layer.rotate_events.as_ref());
+                check_ev!(&format!("{lp}speedEvents"), layer.speed_events.as_ref());
+                // alpha 事件值域 0..255(值本身,与音符 alpha 同口径)。
+                if let Some(evs) = layer.alpha_events.as_ref() {
+                    for (ei, ev) in evs.iter().enumerate() {
+                        if ev.start > 255.0 || ev.end > 255.0 {
+                            issues.push(ChartIssue {
+                                kind: IssueKind::AlphaOutOfRange,
+                                line: Some(li),
+                                index: Some(ei),
+                                beat: Some(ev.start_time.beats()),
+                                message: format!(
+                                    "line {li} layers[{layer_i}].alphaEvents[{ei}] value {}/{} > 255",
+                                    ev.start, ev.end
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            if let Some(ext) = &line.extended {
+                check_ev!("extended.colorEvents", ext.color_events.as_ref());
+                check_ev!("extended.textEvents", ext.text_events.as_ref());
+                check_ev!("extended.scaleXEvents", ext.scale_x_events.as_ref());
+                check_ev!("extended.scaleYEvents", ext.scale_y_events.as_ref());
+                check_ev!("extended.inclineEvents", ext.incline_events.as_ref());
+                check_ev!("extended.paintEvents", ext.paint_events.as_ref());
+                check_ev!("extended.gifEvents", ext.gif_events.as_ref());
+            }
+        }
+        issues
     }
 }
 
@@ -1657,6 +2042,53 @@ previewStart: 12
         let mut chart = Chart::from_rpe(chart, false).unwrap();
         let frame = chart.state_at(1.0);
         assert!((frame.lines[0].ctrl_pos_x - 0.5).abs() < 1e-3, "ctrl_pos_x at t=1s: {}", frame.lines[0].ctrl_pos_x);
+    }
+
+    #[test]
+    fn frozen_tracks_recompute_on_seek_and_reposition() {
+        // [PMCORE-72] A settled track (cursor past its last keyframe) keeps
+        // its output during steady forward playback; a backward seek AND a
+        // backward `reposition` (which produces no seek-back signal for
+        // `state_at`) must both force full re-evaluation back to the seek
+        // target — otherwise the frozen fast path would reuse stale values.
+        let chart = r#"{
+            "META": { "offset": 0 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "a", "Texture": "line.png", "father": -1,
+                    "eventLayers": [
+                        { "rotateEvents": [ { "start": 0.0, "end": 90.0, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 } ] }
+                    ],
+                    "notes": [], "isCover": 1
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(chart, false).unwrap();
+        // Event 0→90°(解析时乘 −1,存储 0→−90°)over 0..2 beats = 0..1s at
+        // 120 BPM(0.5s/拍)。midpoint t=0.5s → −45°。
+        let f = chart.state_at(0.5);
+        assert!((f.lines[0].rotation.to_degrees() + 45.0).abs() < 1e-3, "t=0.5s: {}", f.lines[0].rotation.to_degrees());
+        // past the end (t>1s): track frozen at −90°
+        let f = chart.state_at(2.0);
+        assert!((f.lines[0].rotation.to_degrees() + 90.0).abs() < 1e-3, "t=2s: {}", f.lines[0].rotation.to_degrees());
+        // backward seek (time < previous call): must recompute → −45° again
+        let f = chart.state_at(0.5);
+        assert!(
+            (f.lines[0].rotation.to_degrees() + 45.0).abs() < 1e-3,
+            "backward seek must recompute, got {}",
+            f.lines[0].rotation.to_degrees()
+        );
+        // settle again, then backward reposition(0.0): time == last_state_time
+        // so no seek-back signal — eval_dirty must force recompute → 0°
+        chart.state_at(2.0);
+        chart.reposition(0.0);
+        let f = chart.state_at(0.0);
+        assert!(
+            f.lines[0].rotation.to_degrees().abs() < 1e-3,
+            "backward reposition must recompute, got {}",
+            f.lines[0].rotation.to_degrees()
+        );
     }
 
     #[test]
@@ -2083,6 +2515,55 @@ previewStart: 12
     }
 
     #[test]
+    fn reposition_backward_restores_visibility() {
+        // 回归:combo 精度修复让后向 seek 也走 reposition,而 reposition 把
+        // last_state_time 设为目标、state_at 看不到 seek-back → 可见性游标
+        // 永不重置 → 过点即消的 note 后退时永久不显示(用户实测:退回去
+        // 显示不出来但 hit-fx 正常)。修复:reposition 在后向时自重置游标。
+        // 120bpm: taps at beats 2, 4, 6 → 1.0s, 2.0s, 3.0s。
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [2, 0, 1], "endTime": [2, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [4, 0, 1], "endTime": [4, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [6, 0, 1], "endTime": [6, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ]
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(src, false).unwrap();
+        // 播放过全部 note:过点即消,frame 里不可见。
+        chart.state_at(4.0);
+        assert!(chart.frame.lines[0].notes.is_empty(), "passed notes are culled");
+        // 后向 seek(main.rs hard_seek 同路径:reposition + 下一帧 state_at)。
+        // 回归判据:seek 前被消掉的 note 必须重新可见(修复前游标不重置,
+        // 退回去永远 0 条——用户实测"退回去显示不出来但 hit-fx 正常")。
+        chart.reposition(0.5);
+        {
+            let frame = chart.state_at(0.5);
+            // 接近阶段:三条 note 都未命中,应全部重新可见。
+            assert_eq!(frame.lines[0].notes.len(), 3, "notes visible again after backward seek");
+        }
+        {
+            let frame = chart.state_at(1.5);
+            assert_eq!(frame.lines[0].notes.len(), 2, "note @1.0s consumed as playback resumes");
+        }
+        {
+            let frame = chart.state_at(4.0);
+            assert_eq!(frame.lines[0].notes.len(), 0, "culling resumes past the seek target");
+        }
+        // combo 口径不受影响:reposition 后 hits_before 与可见性一致。
+        assert_eq!(chart.hits_before(0.5), 0);
+        chart.reposition(4.0);
+        assert_eq!(chart.hits_before(4.0), 3);
+    }
+
+    #[test]
     fn fire_events_matches_chart_scan() {
         // 120bpm beats 0..4 (0.5s/beat), 240bpm after (0.25s/beat).
         // Notes: tap @1 (0.5s), hold @3 (1.5s), flick @4 (2.0s), drag @5
@@ -2108,17 +2589,110 @@ previewStart: 12
             ]
         }"#;
         let rpe: RPEChart = serde_json::from_str(src).unwrap();
-        let events = Chart::fire_events_from_rpe(&rpe);
-        // fake @1.0s dropped.
+        let chart = Chart::from_rpe_chart(&rpe, false).unwrap();
+        // 统一触发事件表派生:仅非 fake 头、kind∈1..=4、按 t 升序。
+        // fake @1.0s dropped;hold 只保留头 @1.5s(tick/tail 无音频事件)。
+        let events = chart.fire_events();
         let expect: Vec<(f64, u8)> = vec![(0.5, 1), (1.5, 2), (2.0, 3), (2.25, 4)];
         assert_eq!(events, expect);
         // Sanity: same times as the full chart build reports.
-        let mut chart = Chart::from_rpe_chart(&rpe, false).unwrap();
+        let mut chart = chart;
         let mut hits = Vec::new();
         for t in [0.5, 1.5, 2.0, 2.25] {
             hits.extend(chart.advance_fired(t).iter().filter(|f| !f.fake && !f.tick && !f.hold_tail).map(|f| f.kind));
         }
         assert_eq!(hits, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn fire_events_unified_table_matches_old_scan() {
+        // 统一触发表派生(fire_events)与旧 fire_events_from_rpe 独立扫描
+        // 逐项相等(时间+kind)。谱面含 hold(产生 tick/tail)、fake、变速、
+        // 跨线 —— 任一过滤条件(tick/tail/fake)写错都会在此暴露。
+        // 120bpm beats 0..4(0.5s/beat),240bpm after(0.25s/beat):
+        // tap @1 (0.5s), hold @3→6 (1.5s→2.5s), flick @4 (2.0s),
+        // fake tap @2 (1.0s), drag @8 (3.0s), 第二线 tap @9 (3.25s)。
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [
+                { "bpm": 120.0, "startTime": [0, 0, 1] },
+                { "bpm": 240.0, "startTime": [4, 0, 1] }
+            ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [1, 0, 1], "endTime": [1, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 2, "above": 1, "startTime": [3, 0, 1], "endTime": [6, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 3, "above": 1, "startTime": [4, 0, 1], "endTime": [4, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 4, "above": 1, "startTime": [8, 0, 1], "endTime": [8, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [2, 0, 1], "endTime": [2, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 1, "visibleTime": 999999.0 }
+                    ]
+                },
+                {
+                    "Name": "line1", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [9, 0, 1], "endTime": [9, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ]
+                }
+            ]
+        }"#;
+        // 旧 fire_events_from_rpe 的独立扫描逻辑(测试内参考实现,保持原样)。
+        fn old_scan(rpe: &RPEChart) -> Vec<(f64, u8)> {
+            let mut bpm = BpmList::new(rpe.bpm_list.iter().map(|it| (it.start_time.beats(), it.bpm)).collect());
+            let mut events = Vec::new();
+            for line in &rpe.judge_line_list {
+                if let Some(notes) = &line.notes {
+                    for note in notes {
+                        if note.is_fake != 0 {
+                            continue;
+                        }
+                        events.push((bpm.time(&note.start_time), note.kind));
+                    }
+                }
+            }
+            events.sort_by(|a, b| a.0.total_cmp(&b.0));
+            events
+        }
+        let rpe: RPEChart = serde_json::from_str(src).unwrap();
+        let chart = Chart::from_rpe_chart(&rpe, false).unwrap();
+        assert_eq!(chart.fire_events(), old_scan(&rpe));
+        // 逐项断言:头事件全部命中,时间/kind/顺序正确(hold tick 与 flick
+        // 同刻 2.0s —— kind 过滤必须保留 flick 头、丢掉 tick)。
+        assert_eq!(chart.fire_events(), vec![(0.5, 1), (1.5, 2), (2.0, 3), (3.0, 4), (3.25, 1)]);
+    }
+
+    #[test]
+    fn fire_events_excludes_hold_mid_and_fake() {
+        // 120bpm(0.5s/拍):tap @1s,hold 2s→4s,fake tap @1.5s。
+        // hold tick 2.25/2.5/.../3.75 与尾 4.0 均不得作为音频事件触发。
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [2, 0, 1], "endTime": [2, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 2, "above": 1, "startTime": [4, 0, 1], "endTime": [8, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [3, 0, 1], "endTime": [3, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 1, "visibleTime": 999999.0 }
+                    ]
+                }
+            ]
+        }"#;
+        let chart = Chart::from_rpe(&src, false).unwrap();
+        // 只有 tap 头 @1.0 与 hold 头 @2.0;fake @1.5s 与全部 tick/tail 排除。
+        assert_eq!(chart.fire_events(), vec![(1.0, 1), (2.0, 2)]);
+        // 负例:hold 中部任意半拍 tick / 尾不得触发 hitsound。
+        for t in [2.25, 2.5, 3.0, 3.75, 4.0] {
+            assert!(
+                chart.fire_events().iter().all(|(et, _)| *et != t),
+                "hold mid/tail time {t} must not fire a hitsound"
+            );
+        }
     }
 
     #[test]
@@ -2204,6 +2778,59 @@ previewStart: 12
         let frame_b = chart.state_at(2.0);
         let l_b = frame_b.lines[0].position;
         assert_eq!(l_a, l_b);
+    }
+
+    #[test]
+    fn fx_poses_dedups_by_line_and_t0() {
+        // 同 fixture:线 0 拍在 (0,0),4 拍移到 (100,100),旋转 0°→90°
+        // (120bpm → 0..2s)。加两条同拍 note(和弦)与一条更晚的 note。
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [
+                        {
+                            "moveXEvents": [ { "start": 0.0, "end": 100.0, "startTime": [0, 0, 1], "endTime": [4, 0, 1], "easingType": 0 } ],
+                            "moveYEvents": [ { "start": 0.0, "end": 100.0, "startTime": [0, 0, 1], "endTime": [4, 0, 1], "easingType": 0 } ],
+                            "rotateEvents": [ { "start": 0.0, "end": 90.0, "startTime": [0, 0, 1], "endTime": [4, 0, 1], "easingType": 0 } ]
+                        },
+                        null
+                    ],
+                    "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [1, 0, 1], "endTime": [1, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [1, 0, 1], "endTime": [1, 0, 1], "positionX": 337.5, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 1, "startTime": [3, 0, 1], "endTime": [3, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ]
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(&src, false).unwrap();
+        // 120bpm:beat 1 → 0.5s,beat 3 → 1.5s。和弦两个触发点同 (line, t0)。
+        let trigs = [
+            FxTrigger { t0: 0.5, line: 0, x: 0.0 },
+            FxTrigger { t0: 0.5, line: 0, x: 0.5 },
+            FxTrigger { t0: 1.5, line: 0, x: 0.0 },
+        ];
+        let poses = chart.fx_poses(&trigs);
+        // 输出与输入等长、顺序映射。
+        assert_eq!(poses.len(), trigs.len());
+        // 同 (line, t0) 和弦:位姿逐位一致。
+        assert_eq!(poses[0], poses[1], "和弦触发点应共享同一位姿");
+        // 同线不同 t0:线在动,位姿必须不同(聚合键错误合并会改变 fx 落点)。
+        assert!((poses[2].0[0] - poses[0].0[0]).abs() > 0.01
+            || (poses[2].1 - poses[0].1).abs() > 0.01,
+            "不同 t0 位姿应不同: {:?} vs {:?}", poses[0], poses[2]);
+        // 与 state_at 同刻位姿一致(±1e-3),即批量接口语义与单点逐像素等价。
+        let (fpos, frot) = {
+            let frame = chart.state_at(0.5);
+            (frame.lines[0].position, frame.lines[0].rotation)
+        };
+        assert!((poses[0].0[0] - fpos[0]).abs() < 1e-3);
+        assert!((poses[0].0[1] - fpos[1]).abs() < 1e-3);
+        assert!((poses[0].1 - frot).abs() < 1e-3);
     }
 
     #[test]
@@ -2319,4 +2946,502 @@ previewStart: 12
             FRAMES, el.as_millis(), el.as_micros() as f64 / FRAMES as f64
         );
     }
+
+    // ── PMCORE-21 校验 ──
+
+    fn mk_note(kind: u8, start: f64, end: f64, x: f32, alpha: u16, fake: u8) -> RPENote {
+        RPENote {
+            kind,
+            above: 1,
+            start_time: Triple::from_beats(start),
+            end_time: Triple::from_beats(end),
+            position_x: x,
+            y_offset: 0.0,
+            alpha,
+            hitsound: None,
+            size: 1.0,
+            speed: 1.0,
+            is_fake: fake,
+            visible_time: 999999.0,
+            tint: None,
+            tint_hit_effects: None,
+            judge_area: None,
+            comment: None,
+        }
+    }
+
+    fn mk_line(notes: Vec<RPENote>, layers: Vec<Option<RPEEventLayer>>) -> RPEJudgeLine {
+        RPEJudgeLine {
+            name: "L".into(),
+            texture: "line.png".into(),
+            parent: None,
+            rotate_with_father: None,
+            event_layers: layers,
+            extended: None,
+            notes: Some(notes),
+            is_cover: 0,
+            z_order: 0,
+            attach_ui: None,
+            pos_control: vec![],
+            size_control: vec![],
+            alpha_control: vec![],
+            y_control: vec![],
+            comment: None,
+        }
+    }
+
+    fn mk_chart(lines: Vec<RPEJudgeLine>, bpms: Vec<(f64, f64)>) -> RPEChart {
+        RPEChart {
+            meta: crate::core::model::RPEMetadata { offset: 0, rpe_version: 160 },
+            bpm_list: bpms
+                .into_iter()
+                .map(|(b, v)| crate::core::model::RPEBpmItem {
+                    bpm: v,
+                    start_time: Triple::from_beats(b),
+                })
+                .collect(),
+            judge_line_list: lines,
+        }
+    }
+
+    #[test]
+    fn validate_detects_bad_chart_with_locations() {
+        // 一条线内构造全部内容级问题:负拍音符、hold end<start、|x|>675、
+        // alpha>255、重复音符(同拍同 x);全局:BPM≤0。事件:负拍事件、
+        // start>end 事件。
+        let layers = vec![Some(RPEEventLayer {
+            alpha_events: Some(vec![RPEEvent {
+                start_time: Triple::from_beats(-1.0),
+                end_time: Triple::from_beats(2.0),
+                start: 255.0,
+                end: 0.0,
+                easing_type: 1,
+                easing_left: 0.0,
+                easing_right: 1.0,
+                bezier: 0,
+                bezier_points: [0.0; 4],
+            }]),
+            move_x_events: Some(vec![RPEEvent {
+                start_time: Triple::from_beats(4.0),
+                end_time: Triple::from_beats(3.0), // start > end
+                start: 0.0,
+                end: 1.0,
+                easing_type: 1,
+                easing_left: 0.0,
+                easing_right: 1.0,
+                bezier: 0,
+                bezier_points: [0.0; 4],
+            }]),
+            move_y_events: None,
+            rotate_events: None,
+            speed_events: None,
+        })];
+        let chart = mk_chart(
+            vec![mk_line(
+                vec![
+                    mk_note(1, -0.5, -0.5, 0.0, 255, 0),   // 负拍
+                    mk_note(2, 2.0, 1.0, 0.0, 255, 0),     // hold end < start
+                    mk_note(1, 3.0, 3.0, 700.0, 255, 0),   // |x| > 675
+                    mk_note(1, 4.0, 4.0, 0.0, 300, 0),     // alpha > 255
+                    mk_note(1, 5.0, 5.0, 0.0, 255, 0),     // 重复对成员 1
+                    mk_note(1, 5.0, 5.0, 0.0, 255, 0),     // 重复对成员 2
+                ],
+                layers,
+            )],
+            vec![(0.0, 0.0)], // BPM ≤ 0
+        );
+        let issues = chart.validate();
+        let kinds: Vec<IssueKind> = issues.iter().map(|i| i.kind).collect();
+        assert!(kinds.contains(&IssueKind::NegativeBeat), "{kinds:?}");
+        assert!(kinds.contains(&IssueKind::HoldEndBeforeStart), "{kinds:?}");
+        assert!(kinds.contains(&IssueKind::PositionXOutOfRange), "{kinds:?}");
+        assert!(kinds.contains(&IssueKind::AlphaOutOfRange), "{kinds:?}");
+        assert!(kinds.contains(&IssueKind::BpmNonPositive), "{kinds:?}");
+        assert!(kinds.contains(&IssueKind::EventStartAfterEnd), "{kinds:?}");
+        assert!(kinds.contains(&IssueKind::DuplicateNote), "{kinds:?}");
+        // 定位字段齐全:每条问题有 line/index/beat,且指到正确位置。
+        let neg = issues.iter().find(|i| i.kind == IssueKind::NegativeBeat).unwrap();
+        assert_eq!((neg.line, neg.index), (Some(0), Some(0)));
+        assert_eq!(neg.beat, Some(-0.5));
+        let hold = issues.iter().find(|i| i.kind == IssueKind::HoldEndBeforeStart).unwrap();
+        assert_eq!((hold.line, hold.index), (Some(0), Some(1)));
+        assert_eq!(hold.beat, Some(1.0)); // end 拍
+        let x = issues.iter().find(|i| i.kind == IssueKind::PositionXOutOfRange).unwrap();
+        assert_eq!((x.line, x.index), (Some(0), Some(2)));
+        let alpha = issues.iter().find(|i| i.kind == IssueKind::AlphaOutOfRange).unwrap();
+        assert_eq!((alpha.line, alpha.index), (Some(0), Some(3)));
+        let bpm = issues.iter().find(|i| i.kind == IssueKind::BpmNonPositive).unwrap();
+        assert_eq!((bpm.line, bpm.index), (None, Some(0)));
+        let ev_neg = issues
+            .iter()
+            .filter(|i| i.kind == IssueKind::NegativeBeat)
+            .find(|i| i.message.contains("alphaEvents"))
+            .unwrap();
+        assert_eq!((ev_neg.line, ev_neg.index), (Some(0), Some(0)));
+        assert!(ev_neg.message.contains("alphaEvents"));
+        let ev_inv = issues.iter().find(|i| i.kind == IssueKind::EventStartAfterEnd).unwrap();
+        assert_eq!((ev_inv.line, ev_inv.index), (Some(0), Some(0)));
+        assert!(ev_inv.message.contains("moveXEvents"));
+        let dups: Vec<&ChartIssue> = issues.iter().filter(|i| i.kind == IssueKind::DuplicateNote).collect();
+        assert_eq!(dups.len(), 1, "一组重复只报 1 条(第 2 个成员)");
+        assert_eq!((dups[0].line, dups[0].index), (Some(0), Some(5)));
+        assert_eq!(dups[0].beat, Some(5.0));
+    }
+
+    #[test]
+    fn validate_no_false_positives() {
+        // 合法谱:叠键(同拍不同 x)、fake 与实体同拍同 x、零长 speed 事件、
+        // 合法 alpha 事件、合法 hold。全部不得误报。
+        let layers = vec![Some(RPEEventLayer {
+            alpha_events: Some(vec![RPEEvent {
+                start_time: Triple::from_beats(0.0),
+                end_time: Triple::from_beats(4.0),
+                start: 255.0,
+                end: 0.0,
+                easing_type: 1,
+                easing_left: 0.0,
+                easing_right: 1.0,
+                bezier: 0,
+                bezier_points: [0.0; 4],
+            }]),
+            move_x_events: None,
+            move_y_events: None,
+            rotate_events: None,
+            // PEC 合法产物:零长 speed 步进事件(start == end)。
+            speed_events: Some(vec![
+                RPEEvent {
+                    start_time: Triple::from_beats(0.0),
+                    end_time: Triple::from_beats(0.0),
+                    start: 1.0,
+                    end: 1.0,
+                    easing_type: 1,
+                    easing_left: 0.0,
+                    easing_right: 1.0,
+                    bezier: 0,
+                    bezier_points: [0.0; 4],
+                },
+                RPEEvent {
+                    start_time: Triple::from_beats(2.0),
+                    end_time: Triple::from_beats(2.0),
+                    start: 1.5,
+                    end: 1.5,
+                    easing_type: 1,
+                    easing_left: 0.0,
+                    easing_right: 1.0,
+                    bezier: 0,
+                    bezier_points: [0.0; 4],
+                },
+            ]),
+        })];
+        let chart = mk_chart(
+            vec![mk_line(
+                vec![
+                    mk_note(1, 1.0, 1.0, 0.0, 255, 0),   // 实体
+                    mk_note(3, 1.0, 1.0, 0.0, 255, 0),   // 同拍同 x 不同类(flick)= 叠键,仅告警
+                    mk_note(1, 1.0, 1.0, 300.0, 255, 0), // 同拍不同 x,合法
+                    mk_note(2, 2.0, 4.0, -100.0, 255, 0), // 合法 hold
+                    mk_note(3, 3.0, 3.0, 0.0, 255, 1),   // fake 与实体同拍同 x,不报重复
+                    mk_note(3, 3.0, 3.0, 0.0, 255, 0),
+                ],
+                layers,
+            )],
+            vec![(0.0, 120.0)],
+        );
+        let issues = chart.validate();
+        // 只有叠键告警(DuplicateNote),且恰好是 1.0 拍那组(flick 相对 tap)。
+        for i in &issues {
+            assert_eq!(i.kind, IssueKind::DuplicateNote, "误报: {i:?}");
+        }
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!((issues[0].line, issues[0].index, issues[0].beat), (Some(0), Some(1), Some(1.0)));
+    }
+
+    #[test]
+    fn validate_10k_notes_under_100ms() {
+        // 万级音符(单线 10k,拍号各不相同):排序后线性扫描,必须 <100ms。
+        let notes: Vec<RPENote> = (0..10_000)
+            .map(|i| mk_note(1, i as f64, i as f64, (i as f32 % 1000.0) - 500.0, 255, 0))
+            .collect();
+        let chart = mk_chart(vec![mk_line(notes, vec![])], vec![(0.0, 120.0)]);
+        let start = std::time::Instant::now();
+        let issues = chart.validate();
+        let el = start.elapsed();
+        assert!(issues.is_empty());
+        assert!(
+            el < std::time::Duration::from_millis(100),
+            "validate 10k notes took {:?}",
+            el
+        );
+    }
+
+    // ── combo 计数精度不变量(PMCORE)──
+    //
+    // 口径:主层 combo 的增量来源只有 state_at 返回的 fired 头/尾(hold 半拍
+    // tick 与 fake 不计),seek 时 combo = hits_before(ct) 重建。因此任意时刻
+    // `combo == chart.hits_before(chart_time)` 成立 ⟺ 累计 fired 集合恰等于
+    // hits_before 的"已过 note"集合(头/尾各一)。下面按 main.rs render_frame
+    // 的时钟推导(预测注入、暂停 predict/latency 归零、seek/hard_seek、A-B
+    // 回跳)逐帧仿真并断言该不变量,锁定:暂停归零回跳、前后向 seek、A-B
+    // hard_seek、边界精确停留都不产生双计/漏计。
+
+    /// 多 BPM 谱面:120 → 175 → 240 → 120(段边界拍 2/5/8),段长含非整秒
+    /// (beat 5→8 段 = 3 拍 @240 = 0.75s,起点 2.02857s)。音符落在段边界
+    /// (2.0/5.0/8.0)、半拍(1.5/2.5/5.5)、1/3 拍(4/3, 10/3, 20/3, 25/3)、
+    /// 3/5 拍(1.6);含一根 hold(beat 5→6,跨 175→240 边界)与一个 fake。
+    fn combo_chart() -> Chart {
+        let bpms = vec![(0.0, 120.0), (2.0, 175.0), (5.0, 240.0), (8.0, 120.0)];
+        let notes = vec![
+            mk_note(1, 1.0, 1.0, 0.0, 255, 0),
+            mk_note(1, 4.0 / 3.0, 4.0 / 3.0, 0.0, 255, 0),
+            mk_note(1, 1.5, 1.5, 0.0, 255, 0),
+            mk_note(1, 1.6, 1.6, 0.0, 255, 0),
+            mk_note(1, 2.0, 2.0, 0.0, 255, 0),
+            mk_note(1, 2.5, 2.5, 0.0, 255, 0),
+            mk_note(1, 10.0 / 3.0, 10.0 / 3.0, 0.0, 255, 0),
+            mk_note(2, 5.0, 6.0, 0.0, 255, 0), // hold:头@beat5 尾@beat6
+            mk_note(1, 5.5, 5.5, 0.0, 255, 0),
+            mk_note(1, 20.0 / 3.0, 20.0 / 3.0, 0.0, 255, 0),
+            mk_note(1, 8.0, 8.0, 0.0, 255, 0),
+            mk_note(1, 25.0 / 3.0, 25.0 / 3.0, 0.0, 255, 0),
+            mk_note(1, 2.0, 2.0, 300.0, 255, 1), // fake:与真实 note 同拍,排除
+        ];
+        Chart::from_rpe_chart(&mk_chart(vec![mk_line(notes, vec![])], bpms), false).unwrap()
+    }
+
+    /// 主层播放时钟 + combo 的最小仿真(main.rs render_frame / seek 语义):
+    /// - chart_time = audio + predict - latency(META offset 0);暂停时 predict/latency 归零
+    /// - 暂停归零造成的回跳被钳制为单调不减(chart_time_last 高水位,
+    ///   main.rs render_frame 修复)——真正的 seek 走 reposition + hits_before 重建
+    /// - seek:reposition(ct) + combo = hits_before(ct)(前向后向一致,
+    ///   main.rs seek/hard_seek 修复)
+    /// 每帧断言 combo == hits_before(交付的 chart_time)。
+    struct PlaySim {
+        audio: f64,
+        paused: bool,
+        predict: f64,
+        latency: f64,
+        delivered: f64,
+        combo: usize,
+    }
+
+    impl PlaySim {
+        fn new() -> Self {
+            PlaySim { audio: 0.0, paused: false, predict: 0.05, latency: 0.0, delivered: 0.0, combo: 0 }
+        }
+        fn pause(&mut self) { self.paused = true; }
+        fn resume(&mut self) { self.paused = false; }
+        /// 一帧:audio 前进 dt 后求 chart_time(含 predict/latency 与暂停归零),
+        /// state_at + fired 累计,断言不变量。
+        fn frame(&mut self, chart: &mut Chart, dt: f64) {
+            self.audio += dt;
+            let predict = if self.paused { 0.0 } else { self.predict };
+            let latency = if self.paused { 0.0 } else { self.latency };
+            let mut ct = (self.audio + predict - latency).max(0.0);
+            ct = ct.max(self.delivered); // 暂停归零回跳钳制(高水位)
+            self.delivered = ct;
+            {
+                let frame = chart.state_at(ct);
+                for f in &frame.fired {
+                    if !f.fake && !f.tick {
+                        self.combo += 1;
+                    }
+                }
+            }
+            assert_eq!(self.combo, chart.hits_before(ct), "combo invariant @ chart_time {ct:.9}");
+        }
+        /// seek(等价 main.rs seek/hard_seek):reposition 同步游标 + hits_before 重建。
+        fn seek(&mut self, chart: &mut Chart, audio_t: f64) {
+            self.audio = audio_t;
+            self.delivered = audio_t; // chart_time_last 同步到目标
+            chart.reposition(audio_t);
+            self.combo = chart.hits_before(audio_t);
+        }
+        /// 逐帧播放到 audio 精确等于 `audio_t`(最后一段用小步长)。
+        fn play_until(&mut self, chart: &mut Chart, audio_t: f64) {
+            while self.audio + 1e-12 < audio_t {
+                let dt = (audio_t - self.audio).min(0.016);
+                self.frame(chart, dt);
+            }
+        }
+    }
+
+    /// 直接以 chart 时间为输入跑一帧并断言不变量(测试 advance_fired 窗口语义本身)。
+    fn assert_frame_invariant(chart: &mut Chart, combo: &mut usize, t: f64) {
+        {
+            let frame = chart.state_at(t);
+            for f in &frame.fired {
+                if !f.fake && !f.tick {
+                    *combo += 1;
+                }
+            }
+        }
+        assert_eq!(*combo, chart.hits_before(t), "combo invariant @ chart_time {t:.9}");
+    }
+
+    #[test]
+    fn combo_invariant_bpm_conversion_locked() {
+        // 段边界拍→秒精确(beat_to_time 与 note 解析同走 BpmList::time_beats)。
+        let mut chart = combo_chart();
+        assert!((chart.beat_to_time(2.0) - 1.0).abs() < 1e-9, "120→175 边界");
+        // 175→240 边界 = 2.02857142857…s(非整秒);段长 beat 5→8 @240 = 0.75s。
+        let b5 = chart.beat_to_time(5.0);
+        let b8 = chart.beat_to_time(8.0);
+        assert!((b5 - 2.0285714285714286).abs() < 1e-9, "175→240 边界(非整秒)");
+        assert!((b8 - 2.7785714285714286).abs() < 1e-9, "240→120 边界");
+        assert!((b8 - b5 - 0.75).abs() < 1e-9, "非整秒段长");
+        assert_eq!(chart.max_combo(), 13, "11 tap + hold head + hold tail;fake 排除");
+    }
+
+    #[test]
+    fn combo_invariant_full_playback_with_predict() {
+        // 正常播放:0.05s 预测延迟注入,逐帧不变量,直到谱面末尾。
+        let mut chart = combo_chart();
+        let mut sim = PlaySim::new();
+        for _ in 0..200 {
+            sim.frame(&mut chart, 0.016);
+        }
+        assert_eq!(sim.combo, chart.hits_before(99.0));
+        assert_eq!(sim.combo, 13);
+    }
+
+    #[test]
+    fn combo_invariant_pause_resume_predict_zeroing() {
+        // 暂停 predict/latency 归零 → 原始 chart_time 回跳 0.05s;高水位钳制
+        // 后 delivered 不回退,恢复时 (回跳点, 原位置] 窗口不重放 → 不双计。
+        // 顺带确认:恢复瞬间 chart_time 前跳 0.05(暂停窗口内未过的 note 正常
+        // 触发一次,前跳=正常触发,非双计——由逐帧不变量覆盖)。
+        let mut chart = combo_chart();
+        let mut sim = PlaySim::new();
+        // 播放到 audio 1.15(chart 1.20):note@1.1714 已计。
+        sim.play_until(&mut chart, 1.15);
+        assert_eq!(sim.combo, 6); // 0.5, 0.667, 0.75, 0.8, 1.0, 1.1714
+        let delivered_before = sim.delivered;
+        sim.pause();
+        for _ in 0..5 {
+            sim.frame(&mut chart, 0.0); // 暂停帧(音频冻结)
+        }
+        assert_eq!(sim.delivered, delivered_before, "回跳被钳制");
+        assert_eq!(sim.combo, 6);
+        sim.resume();
+        // 恢复:chart_time 从 1.20 继续,(1.20, ...] 无已计 note → 不双计。
+        sim.play_until(&mut chart, 2.25);
+        assert_eq!(sim.combo, 10); // 含 hold 尾@2.2786(audio 2.2286 已过)
+        let delivered_before = sim.delivered;
+        sim.pause();
+        for _ in 0..3 {
+            sim.frame(&mut chart, 0.0);
+        }
+        assert_eq!(sim.delivered, delivered_before);
+        sim.resume();
+        sim.play_until(&mut chart, 3.2);
+        assert_eq!(sim.combo, 13);
+    }
+
+    #[test]
+    fn combo_invariant_forward_seek() {
+        // 前向 seek 跨多个 note:reposition 跳过窗口,combo 从 hits_before 重建。
+        let mut chart = combo_chart();
+        let mut sim = PlaySim::new();
+        sim.play_until(&mut chart, 1.5); // chart 1.55
+        assert_eq!(sim.combo, chart.hits_before(sim.delivered));
+        sim.seek(&mut chart, 2.6); // 跳过 1.4571 / hold头@2.0286 / 2.1536 / 尾@2.2786 / 2.4452
+        assert_eq!(sim.combo, 11); // hits_before(2.6)
+        sim.play_until(&mut chart, 3.2);
+        assert_eq!(sim.combo, 13);
+    }
+
+    #[test]
+    fn combo_invariant_backward_seek_replay() {
+        // 后向 seek:combo 从 hits_before 重建后重放继续。reposition 让重放
+        // 精确从目标开始——note@0.8 恰在 (0.78, 0.78+0.05] 预测窗口内,
+        // 若不 reposition,seek-back 重放从 0.83 起会漏掉它(combo 到不了 13)。
+        let mut chart = combo_chart();
+        let mut sim = PlaySim::new();
+        sim.play_until(&mut chart, 2.0); // chart 2.05,combo = hits_before(2.05) = 8
+        assert_eq!(sim.combo, 8);
+        sim.seek(&mut chart, 0.78);
+        assert_eq!(sim.combo, 3); // hits_before(0.78) = 0.5/0.667/0.75
+        sim.play_until(&mut chart, 3.2);
+        assert_eq!(sim.combo, 13, "重放不漏计 note@0.8");
+    }
+
+    #[test]
+    fn combo_invariant_ab_loop_jumpback() {
+        // A-B 循环回跳(main.rs 2144-2163 的 hard_seek 路径,纯 chart 模拟):
+        // 播放穿 B → hard_seek 回 A(reposition + hits_before 重建)。修复后
+        // 本帧 chart_time 用跳转后的音频位置计算——若仍用回跳前的陈旧位置,
+        // state_at 会收到 B 附近的时间,(A, B] 窗口在重放时二次触发 → 双计。
+        let mut chart = combo_chart();
+        let mut sim = PlaySim::new();
+        let a_t = chart.beat_to_time(2.0); // 1.0(120→175 段边界)
+        let b_t = chart.beat_to_time(5.0); // 2.0285714...(175→240 段边界)
+        for loop_i in 0..2 {
+            sim.play_until(&mut chart, b_t);
+            sim.seek(&mut chart, a_t); // hard_seek(A) 等价调用
+            sim.frame(&mut chart, 0.016); // 跳转帧:state_at(1.05) 只补触发 (1.0, 1.05]
+            assert_eq!(sim.combo, chart.hits_before(sim.delivered), "loop {loop_i} jump frame");
+        }
+        sim.play_until(&mut chart, 3.2);
+        assert_eq!(sim.combo, 13);
+    }
+
+    #[test]
+    fn combo_invariant_note_boundary_exact() {
+        // 播放头恰好停在 note 时间点再小幅前进:边界 note 由 hits_before 的
+        // `<=` 计入、不补触发(`<=` 与 fired 条件 `last < t <= time` 精确互补)。
+        let mut chart = combo_chart();
+        let mut combo = 0usize;
+        let t25 = chart.beat_to_time(2.5); // note@beat2.5(半拍,175 段)
+        let t_tail = chart.beat_to_time(6.0); // hold 尾(240 段)
+        assert_frame_invariant(&mut chart, &mut combo, 1.0); // 恰停在 note@1.0(段边界)
+        assert_eq!(combo, 5);
+        assert_frame_invariant(&mut chart, &mut combo, 1.001); // 小幅前进:窗口空
+        assert_eq!(combo, 5);
+        assert_frame_invariant(&mut chart, &mut combo, t25); // 恰穿越 note@beat2.5
+        assert_eq!(combo, 6);
+        // 后向 seek 到恰在 note@0.75 前:重放精确从 0.75 起,note@0.75 由
+        // hits_before 计入且不重触发(seek 到恰在 note 上)。
+        chart.reposition(0.75);
+        combo = chart.hits_before(0.75); // 0.5, 0.667, 0.75 = 3
+        assert_frame_invariant(&mut chart, &mut combo, 0.75);
+        assert_eq!(combo, 3);
+        assert_frame_invariant(&mut chart, &mut combo, 0.76);
+        assert_eq!(combo, 3);
+        // hold 尾精确边界(beat 6.0):恰穿越计 1,再小幅前进不重复。
+        assert_frame_invariant(&mut chart, &mut combo, t_tail);
+        assert_frame_invariant(&mut chart, &mut combo, t_tail + 0.0001);
+        assert_eq!(combo, chart.hits_before(t_tail + 0.0001));
+    }
+
+    #[test]
+    fn pause_predict_zeroing_raw_drop_double_counts_without_clamp() {
+        // 缺陷机制锁定:若暂停归零回跳不被钳制(原始 chart_time 从 1.186 回退
+        // 到 1.152),state_at 的 seek-back 重放会让恢复后 (1.152, 1.202] 窗口
+        // 的 note@1.1714 二次触发 → combo 超过 hits_before。main.rs render_frame
+        // 的单调钳制就是为此;此测试固定"回跳必然双计"的事实,防止未来静默
+        // 改变 advance_fired 窗口语义时丢失修复理由。
+        let mut chart = combo_chart();
+        let mut combo = 0usize;
+        for i in 0..72 {
+            assert_frame_invariant(&mut chart, &mut combo, i as f64 * 0.016 + 0.05);
+        }
+        assert_eq!(combo, 6); // 已计 note@1.1714
+        // 暂停帧:原始 chart_time 回跳到 1.152(< 1.186)→ seek-back 不报,但
+        // combo 不回退 → combo(6) 已超过 hits_before(1.152)(note 弹回)。
+        {
+            let frame = chart.state_at(1.152);
+            assert!(frame.fired.is_empty());
+        }
+        assert_eq!(chart.hits_before(1.152), 5);
+        assert_eq!(combo, 6);
+        // 恢复:chart_time 回到 1.202 → (1.152, 1.202] 重放 note@1.1714 → 双计。
+        {
+            let frame = chart.state_at(1.202);
+            assert_eq!(frame.fired.len(), 1);
+            combo += 1;
+        }
+        assert_eq!(combo, 7);
+        assert_ne!(combo, chart.hits_before(1.202), "不钳制时 combo 超过 hits_before");
+    }
 }
+

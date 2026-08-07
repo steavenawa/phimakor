@@ -127,9 +127,8 @@ impl ChartSession {
         // state_at (which mutably borrows chart; the frame borrows it too).
         let triggers = chart.fx_in_window(chart_time - 0.5, chart_time);
         // 预计算触发瞬间 t0 的线位姿:hit-fx 不绑定当前帧线状态。
-        let poses: Vec<([f32; 2], f32)> = triggers.iter()
-            .map(|tr| chart.line_pose_at(tr.line, tr.t0))
-            .collect();
+        // PMCORE-79:批量接口按 (line, t0) 聚合,和弦只算一次链 set_time。
+        let poses: Vec<([f32; 2], f32)> = chart.fx_poses(&triggers);
         let frame = chart.state_at(chart_time);
         self.last_fired.clear();
         self.last_fired.extend(frame.fired.iter().map(|f| core::chart::FiredNote {

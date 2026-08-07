@@ -130,9 +130,43 @@ impl BpmList {
     }
 }
 
+/// Parse an RPE time triple `[i, n, d]` (or a plain number) to beats.
+///
+/// Single source of truth for extra.json keyframe timing and chart event
+/// timing (main.rs 与 core::extra 共用;`d == 0` 按 1 处理防除零)。
+pub fn triple_to_beats(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Array(a) if a.len() >= 2 => {
+            let i = a[0].as_i64()? as f64;
+            let n = a[1].as_i64()? as f64;
+            let d = a.get(2).and_then(|v| v.as_i64()).unwrap_or(1) as f64;
+            Some(i + n / d.max(1.0))
+        }
+        serde_json::Value::Number(n) => n.as_f64(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn triple_to_beats_array_and_number_forms() {
+        use serde_json::json;
+        // [i, n, d] → i + n/d
+        assert_eq!(triple_to_beats(&json!([2, 1, 2])), Some(2.5));
+        // 缺省分母 d=1
+        assert_eq!(triple_to_beats(&json!([3, 0])), Some(3.0));
+        // d=0 防除零(按 1)
+        assert_eq!(triple_to_beats(&json!([1, 2, 0])), Some(3.0));
+        // 纯数字
+        assert_eq!(triple_to_beats(&json!(4.25)), Some(4.25));
+        // 短数组/非数字 → None
+        assert_eq!(triple_to_beats(&json!([1])), None);
+        assert_eq!(triple_to_beats(&json!([1, "x"])), None);
+        assert_eq!(triple_to_beats(&json!("1")), None);
+    }
 
     #[test]
     fn empty_bpm_list_does_not_panic() {

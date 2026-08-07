@@ -31,7 +31,7 @@ use winit::window::{Window, WindowAttributes, WindowId};
 #[path = "../ui/widgets.rs"]
 mod widgets;
 
-use widgets::{Area, AreaKind, Button, Canvas, Checkbox, ColorPicker, ComboBox, DragValue, Field, Form, FormField, HList, KeyValueGrid, ListBox, Panel, PanelRow, ProgressBar, RTControl, RealtimeForm, ScrollList, Slider, Stepper, TabBar, TextInput, Theme, Toggle, VList, Widget, WidgetKey};
+use widgets::{Area, AreaKind, Button, Canvas, Checkbox, CheckboxGroup, ColorPicker, ComboBox, DragValue, Field, Form, FormField, HList, KeyValueGrid, ListBox, Panel, PanelRow, ProgressBar, RTControl, RadioGroup, RealtimeForm, ScrollList, SearchableCombo, Slider, Stepper, TabBar, TextInput, Theme, Toggle, VList, Widget, WidgetKey};
 
 const W: u32 = 1600;
 const H: u32 = 1000;
@@ -97,8 +97,15 @@ impl Canvas for SkiaCanvas<'_> {
     }
 
     fn text_width(&mut self, s: &str, size: f32) -> f32 {
-        let Some(font) = self.font else { return s.len() as f32 * size * 0.55 };
-        s.chars().map(|ch| font.metrics(ch, size).advance_width).sum()
+        text_w(self.font, s, size)
+    }
+}
+
+/// 文本宽度:fontdue 度量;无字体时按比例近似。点击定位与绘制共用(PMCORE-61)。
+fn text_w(font: Option<&'static fontdue::Font>, s: &str, size: f32) -> f32 {
+    match font {
+        Some(f) => s.chars().map(|ch| f.metrics(ch, size).advance_width).sum(),
+        None => s.len() as f32 * size * 0.55,
     }
 }
 
@@ -239,10 +246,29 @@ fn build_scene(s: f32) -> Vec<(&'static str, Box<dyn Widget>)> {
         ("ListBox", Box::new(ListBox::new(x(1600.0), y(700.0), w(380.0), vec![
             "Alpha".into(), "MoveX".into(), "MoveY".into(), "Rotate".into(), "Speed".into(),
         ]))),
+        // ── 单选/多选组与可搜索下拉(列 A 下部,y=600 起)──
+        ("RadioGroup", Box::new(RadioGroup::new(x(16.0), y(600.0), w(240.0), h(24.0), vec![
+            "EZ".into(), "HD".into(), "IN".into(),
+        ], 1))),
+        ("CheckboxGroup", Box::new(CheckboxGroup::new(x(16.0), y(690.0), w(240.0), h(24.0), vec![
+            "FX".into(), "BPM".into(), "HP".into(), "OD".into(),
+        ], vec![0, 2]))),
+        ("SearchableCombo", Box::new(SearchableCombo::new(x(16.0), y(810.0), w(240.0), h(24.0), vec![
+            "grayscale".into(), "vignette".into(), "chromatic".into(), "bloom".into(),
+        ]))),
+        // 展开态:搜索行 + 过滤选项悬浮在下方(overlay 层)。
+        ("SearchableCombo open (filtered)", {
+            let mut c = SearchableCombo::new(x(280.0), y(680.0), w(260.0), h(24.0), vec![
+                "linear".into(), "cubic".into(), "expo".into(), "elastic".into(),
+            ]);
+            c.open = true;
+            c.filter = "e".into();
+            Box::new(c)
+        }),
         // ── 表单(列 C 底部,y=680 起两列并排)──
         ("Form", Box::new(Form::new(x(700.0), y(680.0), w(380.0), "Chart Settings", vec![
             FormField::Text { label: "title".into(), value: "Test Chart".into(), insert: 10, caret: 0.0 },
-            FormField::Number { label: "bpm".into(), value: 120.0, step: 1.0, min: 40.0, max: 300.0, buf: None },
+            FormField::Number { label: "bpm".into(), value: 120.0, min: 40.0, max: 300.0, buf: None },
             FormField::Combo { label: "level".into(), items: vec!["EZ".into(), "HD".into(), "IN".into(), "AT".into()], selected: 2, open: false },
             FormField::Toggle { label: "auto-play".into(), on: false, anim: 0.0, dir: -1.0 },
             FormField::Checkbox { label: "lock".into(), checked: false },
@@ -353,7 +379,7 @@ fn run_all_tests(scene: &[(&str, Box<dyn Widget>)]) -> Vec<String> {
     // 4. 组件种类覆盖:场景里出现的 AreaKind 集合必须覆盖全部交互语义
     //    (防止新组件忘了加进画廊)。
     let used: std::collections::BTreeSet<AreaKind> = with_idx.iter().map(|(_, _, _, a)| a.kind).collect();
-    let all_kinds: [AreaKind; 25] = [
+    let all_kinds: [AreaKind; 26] = [
         AreaKind::ListRow, AreaKind::Button, AreaKind::ToggleTrack, AreaKind::ToggleKnob,
         AreaKind::SliderTrack, AreaKind::SliderKnob, AreaKind::Field, AreaKind::ScrollRow,
         AreaKind::ScrollBar, AreaKind::PanelTitle, AreaKind::ComboBoxButton,
@@ -361,7 +387,7 @@ fn run_all_tests(scene: &[(&str, Box<dyn Widget>)]) -> Vec<String> {
         AreaKind::StepperPlus, AreaKind::Checkbox, AreaKind::CheckboxBox,
         AreaKind::TabBarTab, AreaKind::ProgressBar, AreaKind::GridRow,
         AreaKind::TextInput, AreaKind::DragValue, AreaKind::ColorChannel,
-        AreaKind::ColorPreview, AreaKind::ListBoxRow,
+        AreaKind::ColorPreview, AreaKind::ListBoxRow, AreaKind::RadioRow,
     ];
     for k in all_kinds {
         if !used.contains(&k) {
@@ -522,7 +548,12 @@ impl ApplicationHandler for KitApp {
                     }
                     self.focus = if needs_focus { Some(si) } else { None };
                     self.scene[si].1.set_focus(needs_focus);
-                    self.scene[si].1.on_click((mx, my));
+                    // 带文本度量的点击(PMCORE-61):text_width 与 draw 同一 fontdue 来源,
+                    // 点击 TextInput/Form 文本行时光标落到最近字符间隙。
+                    let font = load_font();
+                    let fs = self.theme.font_size;
+                    let measure = |s: &str| text_w(font, s, fs);
+                    self.scene[si].1.on_click_with_measure((mx, my), self.theme.pad_x, &measure);
                     if matches!(kind, AreaKind::SliderTrack | AreaKind::SliderKnob | AreaKind::ScrollBar | AreaKind::DragValue | AreaKind::ColorChannel | AreaKind::ProgressBar) {
                         self.drag = Some(si);
                     }
@@ -550,6 +581,8 @@ impl ApplicationHandler for KitApp {
                     Key::Named(NamedKey::Backspace) => Some(WidgetKey::Backspace),
                     Key::Named(NamedKey::ArrowLeft) => Some(WidgetKey::Left),
                     Key::Named(NamedKey::ArrowRight) => Some(WidgetKey::Right),
+                    Key::Named(NamedKey::ArrowUp) => Some(WidgetKey::Up),
+                    Key::Named(NamedKey::ArrowDown) => Some(WidgetKey::Down),
                     Key::Named(NamedKey::Home) => Some(WidgetKey::Home),
                     Key::Named(NamedKey::End) => Some(WidgetKey::End),
                     Key::Named(NamedKey::Enter) => Some(WidgetKey::Enter),

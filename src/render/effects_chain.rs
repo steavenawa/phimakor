@@ -97,9 +97,9 @@ fn effect_noop(e: &EvalEffect, def: &EffectDef) -> bool {
 /// 内置 shader:默认值打底,按名合并,注入 screen_size/time。
 fn resolve_builtin(e: &EvalEffect, si: usize, chart_time: f64, sw: f32, sh: f32) -> (Vec<f32>, usize) {
     let def = &EFFECTS[si];
-    let mut uv: Vec<f32> = def.defaults.iter().map(|(_, v)| *v).collect();
+    let mut uv: Vec<f32> = def.defaults.iter().map(|(_, _, v)| *v).collect();
     let norm = |s: &str| s.to_lowercase().replace('_', "").replace('-', "");
-    for (i, (dname, _)) in def.defaults.iter().enumerate() {
+    for (i, (dname, _, _)) in def.defaults.iter().enumerate() {
         // 剥离通道后缀(_r/_g/_b/_a/_x/_y)做归一匹配。
         let base = dname.trim_end_matches("_r").trim_end_matches("_g")
             .trim_end_matches("_b").trim_end_matches("_a")
@@ -153,7 +153,7 @@ mod tests {
         assert!((fx.uniform_values[0] - 0.7).abs() < 1e-6, "factor merged: {:?}", fx.uniform_values);
         // time 注入(内置覆盖 extra 的 time)。
         let def = &EFFECTS[fx.shader_idx];
-        if let Some(pos) = def.defaults.iter().position(|(n, _)| *n == "time") {
+        if let Some(pos) = def.defaults.iter().position(|(n, _, _)| *n == "time") {
             assert!((fx.uniform_values[pos] - 10.0).abs() < 1e-6, "time injected: {:?}", fx.uniform_values);
         }
     }

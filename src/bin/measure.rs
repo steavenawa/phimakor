@@ -12,6 +12,14 @@
 
 use std::time::Instant;
 
+// ui 模块(#[path] 引入)以 `crate::core` 引用 core 类型(main.rs 同构);
+// 这里同样 #[path] 引入本地 core,供 ui 模块/音符循环用。
+// 引擎部分(PreviewEngine)继续用 lib 的 phimakor::core::chart::Chart,
+// 两者类型隔离不混用。
+#[path = "../core/mod.rs"]
+mod core;
+use phimakor::trace_span;
+
 use phimakor::core::chart::Chart;
 
 fn stats(name: &str, samples: &[f64]) {
@@ -72,8 +80,11 @@ fn main() {
     let mut eng = rt;
     let mut render_times = Vec::with_capacity(frames);
     t = off;
+    // PreviewEngine 期望库侧 phimakor::core::FrameState;本地 #[path] core
+    // 是类型不同的副本,渲染帧用库 Chart 的 state_at。
+    let mut lib_chart = phimakor::core::chart::Chart::load(std::path::Path::new(&dir)).unwrap().1;
     for _ in 0..frames {
-        let frame = chart.state_at(t);
+        let frame = lib_chart.state_at(t);
         let s = Instant::now();
         eng.render_frame(frame, 16.0 / 9.0, 1.0);
         render_times.push(s.elapsed().as_secs_f64() * 1000.0);
@@ -91,19 +102,14 @@ use std::sync::Arc;
         let r = eng.renderer();
         let (w, h) = (1280u32, 800u32);
         // Build realistic note/event entries from the chart (like main.rs does).
-        let doc = phimakor::core::edit::ChartDocument::open(std::path::Path::new(&dir)).unwrap();
+        let doc = core::edit::ChartDocument::open(std::path::Path::new(&dir)).unwrap();
         let rpe = doc.chart().clone();
         let mut notes: Vec<NoteEntry> = Vec::new();
         let mut events: Vec<EventEntry> = Vec::new();
         for jl in rpe.judge_line_list.iter() {
             if let Some(ns) = &jl.notes {
                 for (i, n) in ns.iter().enumerate() {
-                    notes.push(NoteEntry {
-                        index: i, kind: n.kind,
-                        start_beats: n.start_time.beats(), end_beats: n.end_time.beats(),
-                        x: n.position_x, speed: n.speed, scale: n.size,
-                        texture: n.hitsound.clone().unwrap_or_default(),
-                    });
+                    notes.push(NoteEntry::from_rpe_note(n, i));
                 }
             }
             for (li, layer) in jl.event_layers.iter().flatten().enumerate() {
@@ -135,12 +141,7 @@ use std::sync::Arc;
             if let Some(jl) = rpe.judge_line_list.get(sel) {
                 if let Some(ns) = &jl.notes {
                     for (i, n) in ns.iter().enumerate() {
-                        sel_notes.push(NoteEntry {
-                            index: i, kind: n.kind,
-                            start_beats: n.start_time.beats(), end_beats: n.end_time.beats(),
-                            x: n.position_x, speed: n.speed, scale: n.size,
-                            texture: n.hitsound.clone().unwrap_or_default(),
-                        });
+                        sel_notes.push(NoteEntry::from_rpe_note(n, i));
                     }
                 }
                 for (li, layer) in jl.event_layers.iter().flatten().enumerate() {
@@ -180,11 +181,16 @@ use std::sync::Arc;
             has_custom_tex: false, full_notes: false,
             selected_line: 0, line_name: "line0".into(), line_count: 90,
             selected_layer: 0, max_layers: 1, events: Arc::new(events), notes: Arc::new(notes),
+            selected_notes: Arc::new(vec![]),
+            selected_events: Arc::new(vec![]),
             gui_scale: 1.0, snap: 0.25, vsync: true, vertical_split: 1,
             selected_tool: 0, show_menu: false, selected_event_idx: None,
             event_edit_target: 0, ev_kind: String::new(),
             ev_start_beats: 0.0, ev_end_beats: 0.0, ev_start_val: 0.0,
-            ev_end_val: 0.0, ev_easing: 0, effect_names: vec![], effects: Arc::new(vec![]), selected_effect: None, eff_edit_field: 0, num_edit: None, eff_kf_var: None, eff_kf_sel: None, eff_kf_rows: vec![],
+            ev_end_val: 0.0, ev_easing: 0, effect_names: vec![], num_edit: None, eff_kf_var: None, eff_kf_sel: None, eff_kf_rows: vec![],
+            loop_on: false, loop_a: None, loop_b: None, loop_a_time: None, loop_b_time: None, loop_toast: None,
+            line_comment: false, comment_edit: None,
+            ..Default::default()
         };
         overlay.render_iced(r.queue(), &info); // warmup (iced layout + glyph cache)
         let mut overlay_times = Vec::with_capacity(frames);
@@ -209,9 +215,12 @@ use std::sync::Arc;
                 ev_kind: info.ev_kind.clone(),
                 events: info.events.clone(),
                 notes: info.notes.clone(),
+                selected_notes: info.selected_notes.clone(),
+                selected_events: info.selected_events.clone(),
                 effect_names: info.effect_names.clone(),
-                effects: info.effects.clone(),
                 num_edit: info.num_edit.clone(), eff_kf_var: info.eff_kf_var, eff_kf_sel: info.eff_kf_sel, eff_kf_rows: info.eff_kf_rows.clone(),
+                loop_toast: info.loop_toast.clone(),
+                comment_edit: info.comment_edit.clone(),
                 ..info
             };
             let s = Instant::now();

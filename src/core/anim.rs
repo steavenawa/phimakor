@@ -95,12 +95,6 @@ impl<T: Tweenable> Anim<T> {
         *elements.into_iter().next().unwrap()
     }
 
-    /// Returns true if the cursor has reached or passed the last keyframe.
-    #[allow(dead_code)] // 备用 API
-    pub fn dead(&self) -> bool {
-        self.cursor + 1 >= self.keyframes.len()
-    }
-
     /// Advance the cursor to the correct keyframe pair for the given time.
     pub fn set_time(&mut self, time: f64) {
         if self.keyframes.is_empty() || time == self.time {
@@ -134,6 +128,24 @@ impl<T: Tweenable> Anim<T> {
             let t = (self.time - kf1.time) / (kf2.time - kf1.time);
             T::tween(&kf1.value, &kf2.value, kf1.tween.y(t as f32))
         })
+    }
+
+    /// True when the value no longer depends on time: no keyframes (always
+    /// `None`) or the cursor is already past the last keyframe in every
+    /// chained animation (value = last keyframe, constant). Lets `state_at`
+    /// skip re-interpolating settled tracks on steady forward playback
+    /// (PMCORE-72).
+    pub fn frozen(&self) -> bool {
+        let mut a = self;
+        loop {
+            if !a.keyframes.is_empty() && a.cursor + 1 < a.keyframes.len() {
+                return false;
+            }
+            match &a.next {
+                Some(n) => a = n,
+                None => return true,
+            }
+        }
     }
 
     /// Interpolate the current value, returning `None` if there are no keyframes.
