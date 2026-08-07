@@ -63,6 +63,8 @@ struct State {
     combo: u32,
     hits: u32,
     note_count: usize,
+    /// PMCORE-21 谱面内容校验告警(加载时收集,存内存;Chart 面板显示条数)。
+    chart_warnings: Vec<String>,
     seek_dim_until: Instant,
     /// Set when dragging the seek bar auto-paused playback; restored on release.
     drag_was_playing: bool,
@@ -289,6 +291,7 @@ impl App {
             aspect_idx: 0, show_overlay: true,
             show_properties: false, show_events: false, show_notes: false, full_notes: false,
             combo: 0, hits: 0, note_count: 0,
+            chart_warnings: Vec::new(),
             seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016,
             device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
@@ -412,6 +415,7 @@ impl App {
             started: Instant::now(), fps_since: Instant::now(), aspect_idx: 0,
             show_overlay: true, show_properties: false, show_events: false, show_notes: false,
             full_notes: false, combo: 0, hits: 0, note_count,
+            chart_warnings: Vec::new(),
             seek_dim_until: Instant::now(), fps: 0.0, frame_latency: 0.016,
             device_latency: std::env::var("PHIMAKOR_AUDIO_LATENCY_MS")
                 .ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(15.0) / 1000.0,
@@ -659,6 +663,8 @@ struct LoadedChart {
     extra: Option<core::extra::ExtraRoot>,
     /// 音频句柄(在后台线程等 ready,不阻塞主线程)。
     audio: Option<audio::AudioHandle>,
+    /// PMCORE-21 谱面内容校验告警(存内存,编辑器 UI 展示用)。
+    chart_warnings: Vec<String>,
 }
 
 /// 解码图片 + 垂直翻转(wgpu v=0 是顶行,与 upload_image 一致)。
@@ -685,11 +691,16 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
     let info = doc.info().clone();
     let name = dir_name(&dir);
     // PMCORE-21:内容级校验(负拍/越界/反序/BPM≤0/重复),默认放行+告警不阻断
-    // 加载;结构级问题(解析失败)已在 open 的 Err 里硬失败。警告记录到 stderr
-    // (PHIMAKOR_CHART_WARNINGS=1 才打印,避免每次加载刷屏)。
+    // 加载;结构级问题(解析失败)已在 open 的 Err 里硬失败。
+    // 警告存内存(LoadedChart.chart_warnings)供编辑器 UI 展示;终端打印
+    // 仅 PHIMAKOR_CHART_WARNINGS=1(避免每次加载刷屏)。
+    let chart_warnings: Vec<String> = doc.chart().validate()
+        .iter()
+        .map(|issue| format!("line {}: {}", issue.line.map_or(0, |l| l + 1), issue.message))
+        .collect();
     if std::env::var("PHIMAKOR_CHART_WARNINGS").is_ok() {
-        for issue in doc.chart().validate() {
-            eprintln!("chart warning [{}]: {}", dir.display(), issue.message);
+        for w in &chart_warnings {
+            eprintln!("chart warning [{}]: {}", dir.display(), w);
         }
     }
 
@@ -750,7 +761,7 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
     .ok();
     if let Some(a) = &audio { a.set_paused(true); }
 
-    Ok(LoadedChart { doc, name, textures, custom_textures, bg, bg_dim, extra, audio })
+    Ok(LoadedChart { doc, name, textures, custom_textures, bg, bg_dim, extra, audio, chart_warnings })
 }
 
 impl State {
@@ -1167,7 +1178,8 @@ impl State {
     /// 主线程应用后台加载结果(renderer 相关的上传/创建)。
     /// 纹理已预解码(RGBA),音频已就绪——这里只做 GPU 创建/上传,轻量。
     fn apply_loaded_chart(&mut self, loaded: LoadedChart) -> anyhow::Result<()> {
-        let LoadedChart { mut doc, name: _name, textures, custom_textures, bg, bg_dim, extra, audio } = loaded;
+        let LoadedChart { mut doc, name: _name, textures, custom_textures, bg, bg_dim, extra, audio, chart_warnings } = loaded;
+        self.chart_warnings = chart_warnings;
         let info = doc.info().clone();
         self.renderer.set_line_length(info.line_length);
         let chart = core::chart::Chart::from_rpe_chart(doc.chart(), info.use_rpe_170_speed == Some(true))?;
@@ -2408,7 +2420,7 @@ impl State {
                 let pan_w = ui::PANEL_W * s;
                 let px = self.window.inner_size().width as f32 - pp * pan_w;
                 let py = 56.0 * s;
-                let mut grid = ui::widgets::KeyValueGrid::new(px, py, pan_w, vec![
+                let mut grid_rows = vec![
                     ("name".into(), chart_name.to_string()),
                     ("composer".into(), composer.to_string()),
                     ("charter".into(), charter.to_string()),
@@ -2420,7 +2432,13 @@ impl State {
                     ("fps".into(), format!("{:.0}", self.fps)),
                     ("combo".into(), format!("{}", self.combo)),
                     ("score".into(), format!("{:07}", score)),
-                ]);
+                ];
+                // PMCORE-21:谱面内容校验告警(存内存,面板可见;详情终端
+                // PHIMAKOR_CHART_WARNINGS=1)。
+                if !self.chart_warnings.is_empty() {
+                    grid_rows.push(("warnings".into(), format!("⚠ {} 条", self.chart_warnings.len())));
+                }
+                let mut grid = ui::widgets::KeyValueGrid::new(px, py, pan_w, grid_rows);
                 grid.row_h = 22.0 * s;
                 grid.gap = 4.0 * s;
                 grid.title = "Chart".to_string();
@@ -2436,6 +2454,9 @@ impl State {
                     Some(ui::widgets::GridFieldKind::Number), // 5 difficulty
                     None, None, None, None, None,
                 ];
+                if !self.chart_warnings.is_empty() {
+                    grid.edit_kind.push(None); // warnings 行只读
+                }
                 grid.num_min = 0.0;
                 grid.num_max = 1000.0;
                 if let Some(prev) = &self.overlay.chart_grid {
