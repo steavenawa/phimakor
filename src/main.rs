@@ -2541,10 +2541,11 @@ impl State {
             }
             // 光标动画中(自定义光标开启时)也强制全量重绘:暂停时 ui_dirty
             // 不再触发,否则光标冻结在帧里。
-            let need_iced = self.ui_dirty || self.overlay.cursor_dirty;
+            let need_iced = self.ui_dirty || self.overlay.cursor_dirty || self.overlay.hover_dirty;
             if need_iced {
                 self.overlay.render_iced(self.renderer.queue(), &info);
                 self.ui_dirty = false;
+                self.overlay.hover_dirty = false;
             } else {
                 self.overlay.redraw_timeline(self.renderer.queue(), &info);
             }

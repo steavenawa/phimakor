@@ -399,6 +399,8 @@ pub struct IcedOverlay {
     pub mouse_pos: Option<(f32, f32)>,
     /// UI 流控层(单一真源,flow.rs):notes 面板命中/拖拽/放置统一走它。
     pub flow: UIFlow,
+    /// hover 变化置位(事件时检测):强制下一帧 render_iced 刷新高亮。
+    pub hover_dirty: bool,
     /// 左键是否按下(handle_click 写入,handle_cursor 组装 buttons 快照用)。
     btn_left: bool,
     /// 最近一次修饰键(handle_click 写入;光标移动时复用)。
@@ -561,7 +563,7 @@ impl IcedOverlay {
             texture, bind_group, iced_tex, iced_bg, timeline_tex, timeline_bg,
             clip_mask: tiny_skia::Mask::new(w.max(1), h.max(1)).unwrap(),
             w: w.max(1), h: h.max(1), panel_progress: 0.0, events_progress: 0.0,
-            notes_progress: 0.0, mouse_pos: None, flow: UIFlow::new(), btn_left: false, flow_mods: ModifiersState::default(), show_overlay: true, tl_visible: false,
+            notes_progress: 0.0, mouse_pos: None, flow: UIFlow::new(), hover_dirty: false, btn_left: false, flow_mods: ModifiersState::default(), show_overlay: true, tl_visible: false,
             tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 5],
             panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, eff_form: None, eff_form_hover: None, eff_kf_var: None, eff_kf_rows_n: 0, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, tl_worker: Some(timeline_draw::TimelineWorker::new(w.max(1), h.max(1))), perf_hint: false, fps_overlay: true, custom_cursor: false, cursor_move: 0.0, cursor_click: 0.0, cursor_trail: Vec::new(), cursor_time: 0.0, cursor_dirty: false, last_anim_iced: false, messages: Vec::new(), timeline_click: None,
             layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, gui_scale: 1.0,
@@ -640,6 +642,7 @@ impl IcedOverlay {
         // 事件层写入流控(单一真源):拖拽中 captured 钉住 hover;未按下则
         // 只更新 hover(命中几何 = flow.areas,绘制高亮不再自己重算)。
         self.rebuild_notes_flow();
+        let prev_hover = self.flow.hover;
         let buttons = [
             if self.btn_left { ButtonState::Pressed } else { ButtonState::Up },
             ButtonState::Up,
@@ -647,6 +650,13 @@ impl IcedOverlay {
         ];
         self.flow.on_mouse(x as f32, y as f32, &buttons, self.flow_mods);
         self.flow.resolve();
+        // hover 变化必须立即置重绘标志:否则关掉 custom cursor 后(cursor_dirty
+        // 不再每帧强制 render_iced)面板/音符高亮永不刷新(用户实测)。检测放在
+        // 事件时而非 dirty 门控路径里——放在后者是鸡生蛋(要 dirty 才会检测)。
+        if self.flow.hover != prev_hover {
+            self.hover_dirty = true;
+            self.timeline_dirty = true;
+        }
         if self.tl_visible {
             self.mouse_beat = self.y_to_beat(y as f32, 0.0);
         }
