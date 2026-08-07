@@ -3784,9 +3784,12 @@ impl ApplicationHandler for App {
                         if state.ctrl {
                             state.overlay.timeline_zoom_in(dy);
                         } else if state.overlay.mouse_pos.map_or(false, |(_, my)| my >= 28.0) {
-                            state.overlay.timeline_scroll(dy);
-                            // 滚轮滚动时间轴后吸附到拍数网格,窗口顶部对齐 snap 边界。
-                            state.overlay.snap_timeline_scroll(state.snap);
+                            // 滚轮 = 时间(播放头)移动:视图始终跟随播放头
+                            // (钉在窗口 10% 处),不滚动视图。用户要求。
+                            // 暂停/播放都生效;scroll_target 平滑 seek,
+                            // seek 内部置 tl_follow=true。
+                            let t = state.audio.as_ref().map(|a| a.time()).unwrap_or(0.0) + dy as f64 * -0.5;
+                            state.scroll_target = Some(t.clamp(0.0, state.chart.duration()));
                         }
                     } else {
                         let t = state.audio.as_ref().map(|a| a.time()).unwrap_or(0.0) + dy as f64 * -0.5;

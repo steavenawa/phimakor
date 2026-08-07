@@ -457,12 +457,9 @@ pub struct IcedOverlay {
     layer_click: Option<f32>,
     pub tl_scroll: f32,
     pub tl_zoom: f32,
-    /// 时间轴是否跟随播放头滚动。手动滚轮滚动会置 false(视图停住),但
-    /// 播放中 2 秒后自动恢复跟随(用户实测:手动滚一下视图永远冻住很烦);
-    /// 暂停中不恢复(暂停是编辑主力态,需要自由查看)。seek 时直接置 true。
+    /// 时间轴是否跟随播放头滚动。滚轮不再滚动视图(滚轮 = 时间移动,
+    /// main.rs 直接 seek),tl_follow 恒 true;seek 时也显式置 true。
     pub tl_follow: bool,
-    /// 最近一次手动滚轮/滚动的时间(播放中自动恢复跟随用)。
-    last_manual_scroll: std::time::Instant,
     /// 时间轴视图参数(tl_scroll/tl_zoom)被手动改动后置位,强制下一帧
     /// 全量重绘面板(否则 fast path 只画 playhead,网格/内容停留在旧视图)。
     timeline_dirty: bool,
@@ -569,7 +566,7 @@ impl IcedOverlay {
             notes_progress: 0.0, mouse_pos: None, flow: UIFlow::new(), hover_dirty: false, btn_left: false, flow_mods: ModifiersState::default(), show_overlay: true, tl_visible: false,
             tool_hover: None, selected_tool: 0, tool_hover_progress: [0.0; 5],
             panel_defs: Vec::new(), bpm_form: None, bpm_hover: None, settings_form: None, settings_hover: None, eff_form: None, eff_form_hover: None, eff_kf_var: None, eff_kf_rows_n: 0, line_list: None, line_list_hover: None, chart_grid: None, chart_grid_hover: None, tl_worker: Some(timeline_draw::TimelineWorker::new(w.max(1), h.max(1))), perf_hint: false, fps_overlay: true, custom_cursor: false, cursor_move: 0.0, cursor_click: 0.0, cursor_trail: Vec::new(), cursor_time: 0.0, cursor_dirty: false, last_anim_iced: false, messages: Vec::new(), timeline_click: None,
-            layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, last_manual_scroll: std::time::Instant::now(), gui_scale: 1.0,
+            layer_click: None, tl_scroll: 0.0, tl_zoom: 8.0, tl_follow: true, gui_scale: 1.0,
             timeline_dirty: false,
             select_start: None, select_end: None, selecting: false, seek_dragging: false,
             drag_note: None, drag_updated: None, selected_note: None,
@@ -739,24 +736,6 @@ impl IcedOverlay {
     /// Scroll the timeline (mouse wheel). `delta` is the notch value.
     /// Manual scrolling stops the playhead auto-follow (`tl_follow = false`)
     /// so the view doesn't snap back next frame.
-    pub fn timeline_scroll(&mut self, delta: f32) {
-        self.tl_follow = false;
-        self.last_manual_scroll = std::time::Instant::now();
-        self.tl_scroll = (self.tl_scroll - delta * self.tl_zoom * 0.15).max(0.0);
-        self.timeline_dirty = true;
-    }
-
-    /// Snap the timeline scroll position to the beat grid (`snap` in beats,
-    /// e.g. 0.25) so the window top aligns with a snap boundary after wheel
-    /// scrolling.
-    // ponytail: 与 snap_beat(f64) 同一套四舍五入逻辑;类型不同(f32 vs f64)
-    // 未提取公共函数,改动任一处时保持两边一致。
-    pub fn snap_timeline_scroll(&mut self, snap: f32) {
-        let s = snap.max(0.0001);
-        self.tl_scroll = (self.tl_scroll / s).round() * s;
-        self.timeline_dirty = true;
-    }
-
     pub fn handle_click(&mut self, pressed: bool, ctrl: bool, shift: bool) {
         let _s = trace_span!("handle_click");
         let s = self.gui_scale;
@@ -1877,13 +1856,9 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
             if self.tl_follow {
                 self.tl_scroll = (info.chart_beat as f32 - self.tl_zoom * 0.1).max(0.0);
             } else {
-                // 手动滚动后:播放头跑出可视窗口 → 恢复跟随;或播放中
-                // 手动滚动超过 2 秒 → 自动恢复跟随(用户实测:手动滚一下
-                // 视图永远冻住很烦)。暂停中不恢复(编辑需要自由查看)。
+                // 手动滚动后的重新跟随(现无入口置 false,防御性保留)。
                 let b = info.chart_beat as f32;
-                let timed_out = info.playing
-                    && self.last_manual_scroll.elapsed() >= std::time::Duration::from_secs(2);
-                if b < self.tl_scroll || b > self.tl_scroll + self.tl_zoom || timed_out {
+                if b < self.tl_scroll || b > self.tl_scroll + self.tl_zoom {
                     self.tl_follow = true;
                 }
             }
@@ -1988,12 +1963,9 @@ pub fn render_iced(&mut self, queue: &wgpu::Queue, info: &GameInfo) {
         self.rebuild_notes_flow();
         let st = timeline_draw::TimelineDrawState::from_overlay(self);
         // 手动滚动后的重新跟随由 worker 内快照处理,主线程同步一次。
-        // 播放中手动滚动超过 2 秒也自动恢复(与 1872 区域同口径)。
         if !st.tl_follow {
             let b = info.chart_beat as f32;
-            let timed_out = info.playing
-                && self.last_manual_scroll.elapsed() >= std::time::Duration::from_secs(2);
-            if b < st.tl_scroll || b > st.tl_scroll + st.tl_zoom || timed_out {
+            if b < st.tl_scroll || b > st.tl_scroll + st.tl_zoom {
                 self.tl_follow = true;
             }
         }
