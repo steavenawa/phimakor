@@ -104,6 +104,11 @@ impl MirrorServer {
                                 if let Ok(conn) = rustls::ServerConnection::new(cfg) {
                                     let mut s = rustls::StreamOwned::new(conn, stream);
                                     handle_conn(&mut s, s2, q2, snap3, ctrl3, sl2, cd2, mn2);
+                                    // TLS 1.3 必须显式发 close_notify:否则客户端
+                                    // 视为截断错误(浏览器 ERR_CONTENT_LENGTH_MISMATCH,
+                                    // wasm 编译中止——用户实测)。
+                                    s.conn.send_close_notify();
+                                    let _ = s.flush();
                                     return;
                                 }
                             }
