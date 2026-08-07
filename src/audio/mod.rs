@@ -268,6 +268,8 @@ impl AudioClock {
 pub enum AudioCmd {
     Pause(bool),
     Seek(f64),
+    /// 替换 hitsound 调度(编辑后 rebuild_chart 调用;线程换表并重装游标)。
+    SetEvents(Vec<(f64, u8)>),
     Quit,
 }
 
@@ -319,6 +321,14 @@ impl AudioHandle {
     /// Send a seek command to the audio thread.
     pub fn seek(&self, t: f64) {
         let _ = self.cmd.send(AudioCmd::Seek(t));
+    }
+
+    /// Replace the hitsound schedule (editor edits rebuilt the chart): the
+    /// thread swaps the table and re-arms the cursor at the current clock
+    /// position, so newly added notes sound immediately and deleted ones
+    /// stop sounding.
+    pub fn set_events(&self, events: Vec<(f64, u8)>) {
+        let _ = self.cmd.send(AudioCmd::SetEvents(events));
     }
 
     /// Signal the audio thread to shut down.
@@ -431,6 +441,14 @@ pub fn spawn_audio_thread(
                         }
                         AudioCmd::Quit => return,
                         AudioCmd::Seek(t) => last_seek = Some(t),
+                        AudioCmd::SetEvents(events) => {
+                            // 换表:游标重装到当前钟位(<= 当前位置的事件已过,不再补响;
+                            // 之后的事件按新表正常触发)。同批 Seek 随后会再次 seek_reset,
+                            // 以 Seek 后的位置为准。
+                            fired.events = events;
+                            let t = (clock.time() - total_offset).max(0.0);
+                            fired.seek_reset(t);
+                        }
                     }
                 }
                 if let Some(t) = last_seek {

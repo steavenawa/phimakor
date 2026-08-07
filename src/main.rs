@@ -1061,6 +1061,11 @@ impl State {
         if let Ok(c) = core::chart::Chart::from_rpe_chart(self.doc.chart(), self.info.use_rpe_170_speed == Some(true)) {
             self.chart = c;
             self.note_count = self.chart.max_combo();
+            // 编辑后刷新音频 hitsound 调度:调度是 spawn 时静态传入的,不刷
+            // 新则新加的 note 永远不响(旧表里没有它们的时刻)。
+            if let Some(a) = &self.audio {
+                a.set_events(self.chart.fire_events());
+            }
         }
         // Advance past current time so state_at doesn't re-fire all notes
         self.chart.state_at(cur_time);

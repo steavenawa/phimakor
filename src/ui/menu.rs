@@ -335,7 +335,11 @@ impl MenuHost {
                         self.activate(&item, i, out);
                     }
                 }
-                _ => {}
+                // 任何非菜单区域(音符块/面板行/空白)按下 → 关闭。只靠全窗
+                // mask 不够:面板内 NoteBlank/NoteBlock 在 mask 之上,点它们
+                // 命中非菜单 id,旧逻辑不关(用户实测:菜单要等别的鼠标触发
+                // 才销毁)。
+                _ => out.push(MenuAction::Close),
             }
         }
     }
