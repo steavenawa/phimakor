@@ -24,7 +24,7 @@
 //! - 区域注册:`button` 分配单调递增 id(瞬态区域);`area` 显式 id upsert
 //!   (内容派生 id,如音符索引 —— 布局重建后 hover/点击依然稳定)。
 
-use super::timeline::{HEADER_H, NT_W, PANEL_W};
+use super::timeline::{HEADER_H, NT_W, PANEL_W, TL_W};
 use super::widgets;
 use winit::keyboard::ModifiersState;
 
@@ -308,6 +308,8 @@ pub struct PanelTransform {
     pub h: f32,
     /// 音符面板滑入进度(决定 panel_x)。
     pub notes_progress: f32,
+    /// 事件面板滑入进度(决定 panel_x:两个时间轴横排,notes 在 events 左侧)。
+    pub events_progress: f32,
     /// properties 面板进度(决定 panel_x)。
     pub props_progress: f32,
 }
@@ -321,9 +323,10 @@ impl PanelTransform {
         w: f32,
         h: f32,
         notes_progress: f32,
+        events_progress: f32,
         props_progress: f32,
     ) -> Self {
-        PanelTransform { scroll, zoom, v_split, s, w, h, notes_progress, props_progress }
+        PanelTransform { scroll, zoom, v_split, s, w, h, notes_progress, events_progress, props_progress }
     }
 
     /// 由 (play_x, play_y, play_w, play_h) 反解面板几何(逆 [`Self::notes_play_rect`]),
@@ -340,14 +343,18 @@ impl PanelTransform {
             w: play.0 - 12.0 * s,
             h: play.3 + 56.0 * s + play.1,
             notes_progress: 0.0,
+            events_progress: 0.0,
             props_progress: 0.0,
         }
     }
 
-    /// 音符面板左缘 x(命中/绘制/ghost 共用;等价 mod.rs 的 panel_x(NT_W, notes_progress))。
+    /// 音符面板左缘 x(命中/绘制/ghost 共用;等价 mod.rs 的 panel_x 链)。
+    /// 两个时间轴横排:notes 在 events 左侧,events 在 properties 左侧——
+    /// 双面板同开时命中区必须同样左移,否则 notes 区域压在 events 上
+    /// (用户实测:event 面板响应 notes 位置)。
     pub fn panel_x(&self) -> f32 {
         let props_x = self.w - self.props_progress * PANEL_W * self.s;
-        props_x - self.notes_progress * NT_W * self.s
+        props_x - self.events_progress * TL_W * self.s - self.notes_progress * NT_W * self.s
     }
 
     /// 音符面板内容区几何 (play_x, play_y, play_w, play_h)。
@@ -624,7 +631,7 @@ mod tests {
 
     fn sample_transform() -> PanelTransform {
         // w = 800,s = 1,两个面板进度都为 1 → panel_x = 0,内容区几何确定。
-        PanelTransform::new(4.0, 8.0, 1, 1.0, 800.0, 800.0, 1.0, 1.0)
+        PanelTransform::new(4.0, 8.0, 1, 1.0, 800.0, 800.0, 1.0, 0.0, 1.0)
     }
 
     /// 映射往返与越界钳制(与 mod.rs 既有共享映射函数行为一致)。
@@ -660,7 +667,7 @@ mod tests {
     /// 分栏列中心:多栏按列居中,单栏退化为线性。
     #[test]
     fn panel_transform_col_x_splits_columns() {
-        let t = PanelTransform::new(0.0, 10.0, 4, 1.0, 800.0, 800.0, 1.0, 1.0);
+        let t = PanelTransform::new(0.0, 10.0, 4, 1.0, 800.0, 800.0, 1.0, 0.0, 1.0);
         let play = t.notes_play_rect();
         let col0 = play.0 + play.2 / 8.0; // 4 栏第 0 列中心(px + 0.5*pw/4)
         for nx in [-675.0, -650.0, -600.0, -550.0] {
@@ -674,8 +681,29 @@ mod tests {
         for nx in [-100.0, 0.0, 100.0] {
             assert!((t.pos_x_to_col_x(nx) - col2).abs() < 1e-2, "nx {nx} → col 2");
         }
-        let t1 = PanelTransform::new(0.0, 10.0, 1, 1.0, 800.0, 800.0, 1.0, 1.0);
+        let t1 = PanelTransform::new(0.0, 10.0, 1, 1.0, 800.0, 800.0, 1.0, 0.0, 1.0);
         assert!((t1.pos_x_to_col_x(0.0) - t1.pos_x_to_x(0.0)).abs() < 1e-6);
+    }
+
+    /// 双面板同开布局:notes 面板左移必须含 events 面板宽度(命中=绘制)。
+    /// 回归:旧公式只减 notes 宽,双面板同开时 notes 命中区右移一个
+    /// TL_W,压在 events 面板上(用户实测:event 面板响应 notes 位置)。
+    #[test]
+    fn panel_x_accounts_for_events_panel_when_both_open() {
+        let s = 1.0;
+        let w = 1280.0;
+        // props 面板开、events 开、notes 开:三面板横排链式左移。
+        let t = PanelTransform::new(0.0, 8.0, 1, s, w, 800.0, 1.0, 1.0, 1.0);
+        let props_x = w - 1.0 * PANEL_W * s;
+        let expect = props_x - TL_W * s - NT_W * s;
+        assert!((t.panel_x() - expect).abs() < 1e-3,
+            "both panels open: panel_x {} != {}", t.panel_x(), expect);
+        // 仅 notes 开(events 关):与旧行为一致(不左移 events 宽)。
+        let t2 = PanelTransform::new(0.0, 8.0, 1, s, w, 800.0, 1.0, 0.0, 1.0);
+        assert!((t2.panel_x() - (props_x - NT_W * s)).abs() < 1e-3);
+        // 全部关闭:notes 面板左缘 = 视口宽(面板未滑入,不占位)。
+        let t3 = PanelTransform::new(0.0, 8.0, 1, s, w, 800.0, 0.0, 0.0, 0.0);
+        assert!((t3.panel_x() - w).abs() < 1e-3);
     }
 
     /// from_play 逆构造:notes_play_rect 往返精确还原(旧 free fn 委托用)。

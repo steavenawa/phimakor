@@ -166,7 +166,7 @@ pub struct TimelineClick {
 /// 数字两侧同步(mania 网格批次 1)。
 /// 委托 flow::PanelTransform(单一真源);progress=0 时 panel_x() 还原传入值。
 pub(crate) fn notes_play_rect(panel_x: f32, vh: f32, s: f32) -> (f32, f32, f32, f32) {
-    PanelTransform::new(0.0, 0.0, 1, s, panel_x, vh, 0.0, 0.0).notes_play_rect()
+    PanelTransform::new(0.0, 0.0, 1, s, panel_x, vh, 0.0, 0.0, 0.0).notes_play_rect()
 }
 
 /// 像素 y → beat(tl_scroll = 窗口顶拍,tl_zoom = 窗口拍高)。越界 y 钳到
@@ -694,12 +694,15 @@ impl IcedOverlay {
         let s = self.gui_scale;
         let pp = self.panel_progress;
         let props_x = self.w as f32 - pp * PANEL_W * s;
-        props_x - progress * panel_w * s
+        // notes 面板在 events 面板左侧:双面板同开时再左移一个 events 宽
+        // (与绘制端 events_x/notes_x 链一致)。
+        props_x - self.events_progress * TL_W * s - progress * panel_w * s
     }
 
     pub(crate) fn is_over_events(&self, props: f32) -> bool {
         let s = self.gui_scale;
         let Some((mx, my)) = self.mouse_pos else { return false };
+        // events 面板在 notes 右侧、props 左侧:不受 notes 面板影响。
         let px = self.panel_x(props, TL_W, self.events_progress);
         let ly = self.h as f32 - 48.0 * s - 26.0 * s;
         mx >= px && mx <= px + TL_W * s && my >= HEADER_H * s + 4.0 * s && my <= ly - 2.0
@@ -708,6 +711,7 @@ impl IcedOverlay {
     fn is_over_notes(&self, props: f32) -> bool {
         let s = self.gui_scale;
         let Some((mx, my)) = self.mouse_pos else { return false };
+        // panel_x 已含 events 宽度左移(双面板同开时命中=绘制)。
         let px = self.panel_x(props, NT_W, self.notes_progress);
         let ly = self.h as f32 - 48.0 * s - 26.0 * s;
         mx >= px && mx <= px + NT_W * s && my >= HEADER_H * s + 4.0 * s && my <= ly - 2.0
@@ -1063,7 +1067,7 @@ impl IcedOverlay {
     fn panel_transform(&self) -> PanelTransform {
         PanelTransform::new(
             self.tl_scroll, self.tl_zoom, self.vertical_split, self.gui_scale,
-            self.w as f32, self.h as f32, self.notes_progress, self.panel_progress,
+            self.w as f32, self.h as f32, self.notes_progress, self.events_progress, self.panel_progress,
         )
     }
 
@@ -2430,7 +2434,7 @@ mod tests {
     // ── Task B:notes 面板流控区域(单一真源,flow.rs)──
 
     fn sample_pt() -> PanelTransform {
-        PanelTransform::new(4.0, 8.0, 1, 1.0, 1280.0, 800.0, 1.0, 1.0)
+        PanelTransform::new(4.0, 8.0, 1, 1.0, 1280.0, 800.0, 1.0, 0.0, 1.0)
     }
 
     fn sample_notes() -> Vec<NoteEntry> {

@@ -685,9 +685,12 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
     let info = doc.info().clone();
     let name = dir_name(&dir);
     // PMCORE-21:内容级校验(负拍/越界/反序/BPM≤0/重复),默认放行+告警不阻断
-    // 加载;结构级问题(解析失败)已在 open 的 Err 里硬失败。警告记录到 stderr。
-    for issue in doc.chart().validate() {
-        eprintln!("chart warning [{}]: {}", dir.display(), issue.message);
+    // 加载;结构级问题(解析失败)已在 open 的 Err 里硬失败。警告记录到 stderr
+    // (PHIMAKOR_CHART_WARNINGS=1 才打印,避免每次加载刷屏)。
+    if std::env::var("PHIMAKOR_CHART_WARNINGS").is_ok() {
+        for issue in doc.chart().validate() {
+            eprintln!("chart warning [{}]: {}", dir.display(), issue.message);
+        }
     }
 
     // 纹理清单:各线的 texture 字段(与 Chart::textures() 同源)。
