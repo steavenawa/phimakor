@@ -1,17 +1,19 @@
 //! Text rasterization with per-character font fallback.
 
-use super::font::{font_for, get_fonts};
+use super::font::font_for;
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use phimakor::trace_span;
 
 /// Approximate rendered text width (per-char fallback metrics, matching
 /// [`draw_text_c`] so measured width always matches the drawn width).
+/// 与绘制同走 font_for:CJK 字符用 CJK 字体度量(预热后零开销),
+/// 否则中文宽度按缺字形度量,截断/居中会错位。
 pub(crate) fn text_width(text: &str, size: f32) -> f32 {
-    let fonts = get_fonts();
     text.chars().map(|ch| {
-        let f = fonts.iter().find(|f| f.has_glyph(ch)).or_else(|| fonts.first());
-        f.map(|f| f.metrics(ch, size).advance_width).unwrap_or(0.0)
+        font_for(ch)
+            .map(|f| f.metrics(ch, size).advance_width)
+            .unwrap_or(0.0)
     }).sum()
 }
 

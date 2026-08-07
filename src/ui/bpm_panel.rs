@@ -95,10 +95,12 @@ impl<'a> Canvas for SkiaCanvas<'a> {
     }
 
     fn text_width(&mut self, s: &str, size: f32) -> f32 {
-        let fonts = super::font::get_fonts();
+        // 与绘制同走 font_for:CJK 字符用 CJK 字体度量,避免中文宽度
+        // 按缺字形度量导致截断/居中错位(预热后零开销)。
         s.chars().map(|ch| {
-            let f = fonts.iter().find(|f| f.has_glyph(ch)).or_else(|| fonts.first());
-            f.map(|f| f.metrics(ch, size).advance_width).unwrap_or(0.0)
+            super::font::font_for(ch)
+                .map(|f| f.metrics(ch, size).advance_width)
+                .unwrap_or(0.0)
         }).sum()
     }
 }

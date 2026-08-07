@@ -686,11 +686,10 @@ impl App {
         }
     }
 }
-/// 后台预解码的图片(RGBA + 尺寸,主线程直接建纹理)。
+/// 后台预解码 + 预压缩的图片(主线程直接 GPU 上传,零 CPU 重活)。
+/// 压缩/降采样在后台线程完成——切谱时大图 BC3 压缩曾卡主线程。
 struct DecodedImage {
-    rgba: Vec<u8>,
-    w: u32,
-    h: u32,
+    tex: render::PreparedTex,
 }
 
 /// 后台线程加载的谱面数据(纯 IO + 解析 + 图片解码,不碰 GPU)。
@@ -716,14 +715,16 @@ struct LoadedChart {
     chart_warnings: Vec<String>,
 }
 
-/// 解码图片 + 垂直翻转(wgpu v=0 是顶行,与 upload_image 一致)。
-fn decode_image(bytes: &[u8]) -> anyhow::Result<DecodedImage> {
+/// 解码图片 + 垂直翻转(wgpu v=0 是顶行,与 upload_image 一致)
+/// + 后台预压缩(fit/降采样/BC3,见 [`Renderer::prepare_texture`])。
+fn decode_image(bytes: &[u8], compress: bool) -> anyhow::Result<DecodedImage> {
     let mut img = image::load_from_memory(bytes)
         .map_err(|e| anyhow::anyhow!("failed to decode image: {e}"))?
         .to_rgba8();
     image::imageops::flip_vertical_in_place(&mut img);
     let (w, h) = (img.width().max(1), img.height().max(1));
-    Ok(DecodedImage { rgba: img.into_raw(), w, h })
+    let tex = render::Renderer::prepare_texture(&img.into_raw(), w, h, compress);
+    Ok(DecodedImage { tex })
 }
 
 /// Path → 目录名(空路径回退 ""):加载屏/回退显示共用。
@@ -733,8 +734,9 @@ fn dir_name(p: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// 后台加载:读 + 解析谱面 + 预解码纹理/背景 + 音频就绪。
-fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
+/// 后台加载:读 + 解析谱面 + 预解码/预压缩纹理 + 背景 + 音频就绪。
+/// `compress`:纹理 BC3 压缩开关(后台线程做,避免切谱卡主线程)。
+fn load_chart_async(dir: PathBuf, compress: bool) -> anyhow::Result<LoadedChart> {
     let doc = ChartDocument::open(&dir)
         .map_err(|e| anyhow::anyhow!("load chart {}: {e:#}", dir.display()))?;
     let info = doc.info().clone();
@@ -761,7 +763,7 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
             continue;
         }
         if let Ok(bytes) = std::fs::read(dir.join(&line.texture)) {
-            if let Ok(img) = decode_image(&bytes) {
+            if let Ok(img) = decode_image(&bytes, compress) {
                 textures.push((line.texture.clone(), img));
             } else {
                 eprintln!("warning: decode texture {}", line.texture);
@@ -776,7 +778,7 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
             for ext in &[".png", ".jpg"] {
                 let path = tex_dir.join(format!("{file}{ext}"));
                 if let Ok(bytes) = std::fs::read(&path) {
-                    if let Ok(img) = decode_image(&bytes) {
+                    if let Ok(img) = decode_image(&bytes, compress) {
                         custom_textures.push((format!("note:{key_suffix}"), img));
                     }
                     break;
@@ -791,7 +793,9 @@ fn load_chart_async(dir: PathBuf) -> anyhow::Result<LoadedChart> {
         Ok(bytes) => {
             let bg = render::Renderer::blur_background_rgba(&bytes)
                 .ok()
-                .map(|(rgba, w, h)| DecodedImage { rgba, w, h });
+                .map(|(rgba, w, h)| DecodedImage {
+                    tex: render::Renderer::prepare_texture(&rgba, w, h, compress),
+                });
             (bg, info.background_dim)
         }
         Err(_) => (None, info.background_dim),
@@ -1153,7 +1157,8 @@ impl State {
         // PMCORE-21:新加载开始,清掉上次错误提示。
         self.splash_error = None;
         self.loading_start = Instant::now();
-        self.loading_thread = Some(std::thread::spawn(move || load_chart_async(dir)));
+        let compress = self.renderer.compress_enabled();
+        self.loading_thread = Some(std::thread::spawn(move || load_chart_async(dir, compress)));
         self.ui_dirty = true;
         Ok(())
     }
@@ -1199,7 +1204,8 @@ impl State {
                     let (tx, rx) = std::sync::mpsc::channel();
                     self.preload_rx = Some(rx);
                     self.preload_target = Some(p.clone());
-                    std::thread::spawn(move || { let _ = tx.send((gen, load_chart_async(p))); });
+                    let compress = self.renderer.compress_enabled();
+                    std::thread::spawn(move || { let _ = tx.send((gen, load_chart_async(p, compress))); });
                 }
             }
         }
@@ -1237,10 +1243,10 @@ impl State {
         // 自定义特效会同步读盘+编译(tens of ms),挪到切谱瞬间一次完成。
         self.renderer.warmup_custom_effects();
         for (k, img) in &textures {
-            self.renderer.load_texture_rgba(k, &img.rgba, img.w, img.h);
+            self.renderer.load_texture_prepared(k, &img.tex);
         }
         for (k, img) in &custom_textures {
-            self.renderer.load_texture_rgba(k, &img.rgba, img.w, img.h);
+            self.renderer.load_texture_prepared(k, &img.tex);
         }
         // res 内置 note 纹理(音符/命中特效)。splash 首次进谱面也走此路径,
         // 必须在这里加载,否则音符贴图缺失。体积小,主线程解码可接受。
@@ -1253,7 +1259,7 @@ impl State {
             }
         }
         if let Some(img) = &bg {
-            self.renderer.set_background_rgba(&img.rgba, img.w, img.h, bg_dim);
+            self.renderer.set_background_prepared(&img.tex, bg_dim);
         }
         // 音频已在后台线程就绪(spawn_audio_thread 的 ready 等待不阻塞主线程)。
         // 加载/预载期间保持暂停(PMCORE-71:悬停不播音乐),进入编辑器恢复播放。
@@ -5061,6 +5067,10 @@ fn main() -> anyhow::Result<()> {
         save_settings(&settings);
     }
     let el = EventLoop::new()?;
+    // 预热 CJK 字体:首次中文绘制(加载屏谱名/splash 列表)在绘制路径
+    // 同步加载 ~20MB 字体,会把切谱/启动堵死(用户实测)。启动时一次性
+    // 加载,之后所有路径的 font_for 零阻塞。
+    ui::font::warmup_cjk();
     el.set_control_flow(ControlFlow::Poll);
     el.run_app(&mut App { dir, state: None, dialog_rx: None })?;
     Ok(())
@@ -5086,7 +5096,7 @@ mod preload_bench {
         println!("PMCORE-71 preload bench: {} charts under {root}\n", dirs.len());
         for dir in dirs.iter().take(6) {
             let t0 = Instant::now();
-            match load_chart_async(dir.clone()) {
+            match load_chart_async(dir.clone(), false) {
                 Ok(loaded) => {
                     // 音频必须暂停落地(悬停不播音乐,PMCORE-71)。set_paused 是
                     // 命令,is_paused 仅在音频线程处理后才翻转(≤5ms poll),
@@ -5216,7 +5226,7 @@ mod validate_load_error_tests {
         let dir = std::env::temp_dir().join("phimakor-no-such-chart-xyz");
         let _ = std::fs::remove_dir_all(&dir); // 确保不存在,open 必失败
         // LoadedChart 无 Debug,不能用 unwrap_err,走 match。
-        let err = match load_chart_async(dir.clone()) {
+        let err = match load_chart_async(dir.clone(), false) {
             Err(e) => e,
             Ok(_) => panic!("expected load error for {}", dir.display()),
         };

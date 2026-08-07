@@ -998,6 +998,23 @@ impl GpuTimers {
     }
 }
 
+/// 后台预压缩的纹理数据(load_chart_async 线程产出,主线程只做 GPU 上传)。
+/// 纯 CPU 步骤(尺寸限制 + Lanczos 降采样 + BC3 块压缩)全在后台,
+/// 避免切谱时主线程被大图压缩卡住(用户实测:加载路径堵死卡窗口)。
+#[derive(Clone)]
+pub struct PreparedTex {
+    /// BC3 块(compressed)或 RGBA8 像素。
+    pub data: Vec<u8>,
+    /// 处理后的尺寸(压缩时 4 对齐)。
+    pub w: u32,
+    pub h: u32,
+    /// data 是否为 BC3 块(否则 RGBA8)。
+    pub compressed: bool,
+    /// 渲染语义尺寸 = 原始像素(降采样不改视觉)。
+    pub orig_w: u32,
+    pub orig_h: u32,
+}
+
 impl Renderer {
     /// Borrow the wgpu device.
     pub fn device(&self) -> &wgpu::Device { &self.device }
@@ -1299,8 +1316,39 @@ impl Renderer {
         if compress {
             nw &= !3;
             nh &= !3;
+            // [1~3px 纹理] 对齐后可能变 0×0:create_texture(0) 会 wgpu
+            // Validation Error panic(PMCORE-71 1×1 PNG 案例)。钳回 1。
+            nw = nw.max(1);
+            nh = nh.max(1);
         }
-        (nw.max(1), nh.max(1))
+        (nw, nh)
+    }
+
+    /// 当前纹理压缩开关(设置 + 设备能力)。后台线程据此预压缩。
+    pub fn compress_enabled(&self) -> bool {
+        self.texture_compress && self.bc_supported
+    }
+
+    /// 纯 CPU 纹理准备(fit + Lanczos 降采样 + BC3 压缩),可在后台线程
+    /// 调用。`compress=false` 时只做尺寸限制。子 4px 纹理压缩对齐后
+    /// 尺寸 < 块宽,wgpu 会 Validation Error——自动回退 RGBA8。
+    pub fn prepare_texture(rgba: &[u8], w: u32, h: u32, compress: bool) -> PreparedTex {
+        let (nw, nh) = Self::fit_texture_dim(w, h, compress);
+        // 尺寸限制:超上限降采样(抗锯齿)。
+        let data: Vec<u8> = if nw != w || nh != h {
+            let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).unwrap_or_default();
+            image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3).into_raw()
+        } else {
+            rgba.to_vec()
+        };
+        if compress && nw >= 4 && nh >= 4 {
+            // BC3(DXT5):RGBA 块压缩,4:1。API:Format::compress(texpresso 2.x)。
+            let mut blocks = vec![0u8; texpresso::Format::Bc3.compressed_size(nw as usize, nh as usize)];
+            texpresso::Format::Bc3.compress(&data, nw as usize, nh as usize, texpresso::Params::default(), &mut blocks);
+            PreparedTex { data: blocks, w: nw, h: nh, compressed: true, orig_w: w, orig_h: h }
+        } else {
+            PreparedTex { data, w: nw, h: nh, compressed: false, orig_w: w, orig_h: h }
+        }
     }
 
     /// 上传 RGBA8 到 GPU 纹理(统一入口):
@@ -1310,23 +1358,18 @@ impl Renderer {
     /// 返回 (bind group, 实际尺寸)。
     fn upload_texture_rgba(&mut self, rgba: &[u8], w: u32, h: u32) -> (wgpu::BindGroup, [f32; 2]) {
         let compress = self.texture_compress && self.bc_supported;
-        let (nw, nh) = Self::fit_texture_dim(w, h, compress);
-        // 尺寸限制:超上限降采样(抗锯齿)。
-        let data: Vec<u8> = if nw != w || nh != h {
-            let img = image::RgbaImage::from_raw(w, h, rgba.to_vec()).unwrap_or_default();
-            image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Lanczos3).into_raw()
-        } else {
-            rgba.to_vec()
-        };
-        let texture = if compress && nw >= 4 && nh >= 4 {
-            // BC3(DXT5):RGBA 块压缩,4:1。API:Format::compress(texpresso 2.x)。
-            // 子 4px 纹理(如 1x1 PNG)压缩对齐后尺寸 < 块宽,wgpu 会以
-            // Validation Error panic——回退 RGBA8(PMCORE-71 实测发现)。
-            let mut blocks = vec![0u8; texpresso::Format::Bc3.compressed_size(nw as usize, nh as usize)];
-            texpresso::Format::Bc3.compress(&data, nw as usize, nh as usize, texpresso::Params::default(), &mut blocks);
+        let prepared = Self::prepare_texture(rgba, w, h, compress);
+        self.upload_prepared(&prepared)
+    }
+
+    /// 主线程同步写纹理(后台预压缩结果):仅 GPU 创建/上传,不做 CPU 重活。
+    /// 返回 (bind group, 渲染语义尺寸 = 原始像素)。
+    fn upload_prepared(&mut self, tex: &PreparedTex) -> (wgpu::BindGroup, [f32; 2]) {
+        let PreparedTex { data, w, h, compressed, .. } = tex;
+        let texture = if *compressed {
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: None,
-                size: wgpu::Extent3d { width: nw, height: nh, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -1334,8 +1377,8 @@ impl Renderer {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            let block_w = nw.div_ceil(4);
-            let block_h = nh.div_ceil(4);
+            let block_w = w.div_ceil(4);
+            let block_h = h.div_ceil(4);
             self.queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &tex,
@@ -1343,22 +1386,22 @@ impl Renderer {
                     origin: wgpu::Origin3d::ZERO,
                     aspect: wgpu::TextureAspect::All,
                 },
-                &blocks,
+                data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(block_w * 16),
                     rows_per_image: Some(block_h),
                 },
-                wgpu::Extent3d { width: nw, height: nh, depth_or_array_layers: 1 },
+                wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
             );
             tex
         } else {
-            Self::create_texture(&self.device, &self.queue, &data, nw, nh)
+            Self::create_texture(&self.device, &self.queue, data, *w, *h)
         };
         let bind_group = Self::texture_bind_group(&self.device, &self.tex_bgl, &self.sampler, &texture);
         // 渲染语义尺寸 = 原始像素尺寸(纹理线宽 = 像素 × 系数,降采样是
         // 性能优化,不应改变视觉——否则大线纹理降采样后判定线变窄)。
-        (bind_group, [w as f32, h as f32])
+        (bind_group, [tex.orig_w as f32, tex.orig_h as f32])
     }
 
     fn create_texture(
@@ -1618,11 +1661,17 @@ impl Renderer {
         self.textures.retain(|k, _| k.starts_with("note:"));
     }
 
-    /// 直载预解码 RGBA 纹理(跳过 image 解码,PMCORE 加载优化)。
-    /// 经尺寸限制 + 可选 BC3 压缩(见 `texture_compress`)。
-    pub fn load_texture_rgba(&mut self, name: &str, rgba: &[u8], w: u32, h: u32) {
-        let (bind_group, size) = self.upload_texture_rgba(rgba, w, h);
+    /// 直载后台预压缩的纹理(零 CPU 重活,只 GPU 上传)。
+    pub fn load_texture_prepared(&mut self, name: &str, tex: &PreparedTex) {
+        let (bind_group, size) = self.upload_prepared(tex);
         self.textures.insert(name.to_string(), TexEntry { bind_group, size });
+    }
+
+    /// 直载后台预压缩的背景(已模糊 + 翻转)。
+    pub fn set_background_prepared(&mut self, tex: &PreparedTex, dim: f32) {
+        let (bind_group, size) = self.upload_prepared(tex);
+        self.background = Some((bind_group, size));
+        self.background_dim = dim;
     }
 
     /// 直载预解码背景(已模糊 + 翻转)。经尺寸限制 + 可选 BC3 压缩。
@@ -2396,6 +2445,10 @@ mod tests {
         assert_eq!(w % 4, 0);
         assert_eq!(h % 4, 0);
         assert_eq!(w, 1000 & !3);
+        // 回归:1~3px 纹理压缩对齐后不得为 0(0×0 纹理 wgpu panic)。
+        assert_eq!(Renderer::fit_texture_dim(1, 1, true), (1, 1));
+        assert_eq!(Renderer::fit_texture_dim(2, 3, true), (1, 1));
+        assert_eq!(Renderer::fit_texture_dim(5, 1, true), (4, 1));
     }
 
     #[test]
