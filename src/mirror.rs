@@ -11,8 +11,8 @@
 //! 回主线程执行(与 seek 通道同语义)。
 
 use crate::core::{chart::FrameState, LineState};
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -60,6 +60,17 @@ impl MirrorServer {
         }
         let listener = TcpListener::bind(("0.0.0.0", MIRROR_PORT))
             .map_err(|e| format!("镜像服务启动失败(端口 {MIRROR_PORT}): {e}"))?;
+        // TLS(自签):WebGPU 要求 secure context,局域网 IP 的纯 http 会被
+        // 浏览器禁用 navigator.gpu(用户实测)。自签生成失败则退 http 模式
+        // (localhost 调试仍可用)。
+        let tls = make_tls_config();
+        let tls = match &tls {
+            Some(cfg) => Some(Arc::new(cfg.clone())),
+            None => {
+                eprintln!("mirror: 自签证书生成失败,降级 http(手机 WebGPU 不可用,仅 localhost 调试)");
+                None
+            }
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let snap: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
         let snap_seq = Arc::new(AtomicU64::new(0));
@@ -68,9 +79,9 @@ impl MirrorServer {
         let charts_dir = Arc::new(charts_dir);
         let music_name = Arc::new(music_name);
 
-        let (st, sq, sl, cd, mn, snap2, ctrl2) = (
+        let (st, sq, sl, cd, mn, snap2, ctrl2, tls2) = (
             stop.clone(), snap_seq.clone(), slots.clone(), charts_dir.clone(), music_name.clone(),
-            snap.clone(), ctrl_tx.clone(),
+            snap.clone(), ctrl_tx.clone(), tls,
         );
         std::thread::Builder::new()
             .name("mirror-accept".into())
@@ -79,13 +90,25 @@ impl MirrorServer {
                     if st.load(Ordering::Relaxed) {
                         break;
                     }
-                    let Ok(stream) = stream else { continue };
+                    let Ok(mut stream) = stream else { continue };
+                    let _ = stream.set_nonblocking(true);
                     let (s2, q2, sl2, cd2, mn2) = (st.clone(), sq.clone(), sl.clone(), cd.clone(), mn.clone());
                     let snap3 = snap2.clone();
                     let ctrl3 = ctrl2.clone();
+                    let tls3 = tls2.clone();
                     std::thread::Builder::new()
                         .name("mirror-conn".into())
-                        .spawn(move || handle_conn(stream, s2, q2, snap3, ctrl3, sl2, cd2, mn2))
+                        .spawn(move || {
+                            // TLS 模式:握手惰性发生在首次读(客户端发请求头时)。
+                            if let Some(cfg) = tls3 {
+                                if let Ok(conn) = rustls::ServerConnection::new(cfg) {
+                                    let mut s = rustls::StreamOwned::new(conn, stream);
+                                    handle_conn(&mut s, s2, q2, snap3, ctrl3, sl2, cd2, mn2);
+                                    return;
+                                }
+                            }
+                            handle_conn(&mut stream, s2, q2, snap3, ctrl3, sl2, cd2, mn2);
+                        })
                         .ok();
                 }
             })
@@ -189,9 +212,9 @@ fn pack_line(out: &mut Vec<u8>, line: &LineState, tex_slots: &[String]) {
 // 手写 HTTP + WebSocket 服务
 // ---------------------------------------------------------------------------
 
-/// 连接处理线程:读请求头 → 路由。
-fn handle_conn(
-    mut stream: TcpStream,
+/// 连接处理线程:读请求头 → 路由。流已设为非阻塞(WouldBlock 轮询)。
+fn handle_conn<T: Read + Write>(
+    stream: &mut T,
     stop: Arc<AtomicBool>,
     snap_seq: Arc<AtomicU64>,
     snap: Arc<Mutex<Option<Vec<u8>>>>,
@@ -200,13 +223,13 @@ fn handle_conn(
     charts_dir: Arc<PathBuf>,
     music_name: Arc<String>,
 ) {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
-    // 读请求头(直到空行;上限 8KB 防恶意)。
+    // 读请求头(直到空行;上限 8KB 防恶意;非阻塞轮询,5s 超时)。
     let mut buf = [0u8; 8192];
     let mut got = 0usize;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         match stream.read(&mut buf[got..]) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
             Ok(n) => {
                 got += n;
                 if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
@@ -216,6 +239,13 @@ fn handle_conn(
                     return;
                 }
             }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(_) => return,
         }
     }
     let head = String::from_utf8_lossy(&buf[..got]);
@@ -236,7 +266,7 @@ fn handle_conn(
     if path == "/ws" {
         if let Some(key) = get("sec-websocket-key") {
             let accept = ws_accept(&key);
-            let _ = write_all(&mut stream, &format!(
+            let _ = write_all(stream, &format!(
                 "HTTP/1.1 101 Switching Protocols\r\n\
                  Upgrade: websocket\r\n\
                  Connection: Upgrade\r\n\
@@ -249,7 +279,7 @@ fn handle_conn(
     if path == "/" || path == "/index.html" {
         // 注入当前谱面音乐文件名(JS 据此拉 /music/<名> 播放)。
         let page = PLAYER_HTML.replace("__MUSIC__", &music_name);
-        let _ = write_all(&mut stream, &format!(
+        let _ = write_all(stream, &format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             page.len(), page
         ));
@@ -269,39 +299,39 @@ fn handle_conn(
                     "application/octet-stream"
                 };
                 let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
-                if write_all(&mut stream, &head).is_ok() {
+                if write_all(stream, &head).is_ok() {
                     let _ = stream.write_all(&bytes);
                 }
                 return;
             }
         }
-        let _ = write_all(&mut stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        let _ = write_all(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         return;
     }
     if let Some(name) = path.strip_prefix("/music/") {
-        serve_music(&mut stream, &charts_dir, &music_name, name, &get);
+        serve_music(stream, &charts_dir, &music_name, name, &get);
         return;
     }
     if path == "/ctrl" {
         // POST /ctrl:读 body JSON。
-        let body = read_http_body(&mut stream, &buf[..got], &get);
+        let body = read_http_body(stream, &buf[..got], &get);
         if let Some(cmd) = parse_ctrl_json(&body) {
             let _ = ctrl.send(cmd);
-            let _ = write_all(&mut stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            let _ = write_all(stream, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
         } else {
-            let _ = write_all(&mut stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = write_all(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
         }
         return;
     }
-    let _ = write_all(&mut stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    let _ = write_all(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
 }
 
-fn write_all(stream: &mut TcpStream, s: &str) -> std::io::Result<()> {
+fn write_all<T: Write>(stream: &mut T, s: &str) -> std::io::Result<()> {
     stream.write_all(s.as_bytes())?;
     stream.flush()
 }
 
-fn read_http_body(stream: &mut TcpStream, head_buf: &[u8], get: &dyn Fn(&str) -> Option<String>) -> Vec<u8> {
+fn read_http_body<T: Read>(stream: &mut T, head_buf: &[u8], get: &dyn Fn(&str) -> Option<String>) -> Vec<u8> {
     let clen = get("content-length").and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
     if clen == 0 || clen > 65536 {
         return Vec::new();
@@ -309,11 +339,19 @@ fn read_http_body(stream: &mut TcpStream, head_buf: &[u8], get: &dyn Fn(&str) ->
     // 请求头之后可能已带 body 前缀(小 POST 一次性到达)。
     let head_end = head_buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4).unwrap_or(head_buf.len());
     let mut body = head_buf[head_end..].to_vec();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while body.len() < clen {
         let mut chunk = [0u8; 4096];
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => break,
             Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(_) => break,
         }
     }
     body.truncate(clen);
@@ -331,7 +369,7 @@ fn parse_ctrl_json(body: &[u8]) -> Option<MirrorCtrl> {
 }
 
 /// 音乐文件服务(支持 Range)。
-fn serve_music(stream: &mut TcpStream, charts_dir: &Path, music_name: &str, name: &str, get: &dyn Fn(&str) -> Option<String>) {
+fn serve_music<T: Read + Write>(stream: &mut T, charts_dir: &Path, music_name: &str, name: &str, get: &dyn Fn(&str) -> Option<String>) {
     // 只允许当前谱面音乐文件名(防目录穿越)。
     if name != music_name {
         let _ = write_all(stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
@@ -401,7 +439,7 @@ fn ws_accept(key: &str) -> String {
 }
 
 /// 发送一帧二进制(0x82)。>65535 走 64 位长度。
-fn ws_send_binary(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()> {
+fn ws_send_binary<T: Write>(stream: &mut T, payload: &[u8]) -> std::io::Result<()> {
     let len = payload.len();
     let mut frame = Vec::with_capacity(len + 10);
     frame.push(0x82);
@@ -419,10 +457,33 @@ fn ws_send_binary(stream: &mut TcpStream, payload: &[u8]) -> std::io::Result<()>
     stream.flush()
 }
 
-/// 收一帧(客户端 → 服务器;要求文本 0x81,处理 mask)。超时返回 None。
-fn ws_recv_text(stream: &mut TcpStream) -> Option<String> {
+/// 非阻塞读满 `buf`(WouldBlock 轮询,`wait` 内超时)。返回是否读满。
+fn read_full<T: Read>(stream: &mut T, buf: &mut [u8], wait: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + wait;
+    let mut off = 0usize;
+    while off < buf.len() {
+        match stream.read(&mut buf[off..]) {
+            Ok(0) => return false,
+            Ok(n) => off += n,
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// 收一帧(客户端 → 服务器;要求文本 0x81,处理 mask)。
+/// 非阻塞:最多等 `wait`(帧推流不被控制读取卡住)。
+fn ws_recv_text<T: Read>(stream: &mut T, wait: std::time::Duration) -> Option<String> {
     let mut hdr = [0u8; 2];
-    stream.read_exact(&mut hdr).ok()?;
+    if !read_full(stream, &mut hdr, wait) {
+        return None;
+    }
     let opcode = hdr[0] & 0x0F;
     if opcode != 0x01 {
         return None;
@@ -431,22 +492,28 @@ fn ws_recv_text(stream: &mut TcpStream) -> Option<String> {
     let mut len = (hdr[1] & 0x7F) as u64;
     if len == 126 {
         let mut b = [0u8; 2];
-        stream.read_exact(&mut b).ok()?;
+        if !read_full(stream, &mut b, wait) {
+            return None;
+        }
         len = u16::from_be_bytes(b) as u64;
     } else if len == 127 {
         let mut b = [0u8; 8];
-        stream.read_exact(&mut b).ok()?;
+        if !read_full(stream, &mut b, wait) {
+            return None;
+        }
         len = u64::from_be_bytes(b);
     }
     if len > 65536 {
         return None;
     }
     let mut mask = [0u8; 4];
-    if masked {
-        stream.read_exact(&mut mask).ok()?;
+    if masked && !read_full(stream, &mut mask, wait) {
+        return None;
     }
     let mut payload = vec![0u8; len as usize];
-    stream.read_exact(&mut payload).ok()?;
+    if !read_full(stream, &mut payload, wait) {
+        return None;
+    }
     if masked {
         for (i, b) in payload.iter_mut().enumerate() {
             *b ^= mask[i & 3];
@@ -456,8 +523,10 @@ fn ws_recv_text(stream: &mut TcpStream) -> Option<String> {
 }
 
 /// 推流循环:发纹理清单,然后循环推最新快照;收控制指令转发。
-fn serve_ws(
-    mut stream: TcpStream,
+/// 流非阻塞:控制读取最多等 5ms,帧推送不被卡(修复:阻塞 read_exact
+/// 曾让推流降到 0.2fps)。
+fn serve_ws<T: Read + Write>(
+    stream: &mut T,
     stop: Arc<AtomicBool>,
     snap_seq: Arc<AtomicU64>,
     snap: Arc<Mutex<Option<Vec<u8>>>>,
@@ -482,14 +551,14 @@ fn serve_ws(
             f.extend_from_slice(nb);
             push_u32(&mut f, bytes.len() as u32);
             f.extend_from_slice(&bytes);
-            if ws_send_binary(&mut stream, &f).is_err() {
+            if ws_send_binary(stream, &f).is_err() {
                 return;
             }
         }
     }
     let mut end = Vec::new();
     end.push(0xFF);
-    if ws_send_binary(&mut stream, &end).is_err() {
+    if ws_send_binary(stream, &end).is_err() {
         return;
     }
     // 循环推快照。
@@ -503,13 +572,13 @@ fn serve_ws(
             last_seq = seq;
             let payload = snap.lock().unwrap().clone();
             if let Some(p) = payload {
-                if ws_send_binary(&mut stream, &p).is_err() {
+                if ws_send_binary(stream, &p).is_err() {
                     return;
                 }
             }
         }
-        // 控制:非阻塞收一帧。
-        match ws_recv_text(&mut stream) {
+        // 控制:非阻塞收一帧(最多等 5ms,不卡推流)。
+        match ws_recv_text(stream, std::time::Duration::from_millis(5)) {
             Some(text) => {
                 if let Some(c) = parse_ctrl_json(text.as_bytes()) {
                     let _ = ctrl.send(c);
@@ -520,6 +589,20 @@ fn serve_ws(
             }
         }
     }
+}
+
+/// 自签 TLS 配置(rcgen 生成证书;失败返回 None 降级 http)。
+/// WebGPU 要求 secure context:手机经局域网 IP 访问必须 https,
+/// 自签证书由用户浏览器接受(证书警告 → 继续访问)。
+fn make_tls_config() -> Option<rustls::ServerConfig> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let cert = rcgen::generate_simple_self_signed(vec!["phimakor.local".to_string()]).ok()?;
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![CertificateDer::from(cert.cert.der().clone())], key)
+        .ok()?;
+    Some(cfg)
 }
 
 // ---------------------------------------------------------------------------

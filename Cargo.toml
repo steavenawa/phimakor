@@ -28,6 +28,10 @@ mimalloc = "0.1"
 bytemuck = { version = "*", features = ["derive"] }
 fontdue = "*"
 softbuffer = "*"
+# 镜像服务 TLS(WebGPU 需要 secure context,局域网 IP 的 http 会被浏览器
+# 禁用 navigator.gpu;自签证书让手机 https 访问)。
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 iced = { version = "*", features = ["tiny-skia", "advanced", "image"] }
 iced_tiny_skia = "*"
 tiny-skia = "*"

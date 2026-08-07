@@ -860,8 +860,9 @@ impl State {
             Ok(m) => {
                 self.mirror = Some(m);
                 // 显示局域网访问地址(主网卡 IPv4,经典 UDP 探路法,零依赖)。
+                // https:WebGPU 要求 secure context,自签证书浏览器会警告一次。
                 let ip = mirror::local_ipv4();
-                eprintln!("mirror: 已启动 — 手机浏览器打开 http://{ip}:{} (需同一 Wi-Fi)", mirror::MIRROR_PORT);
+                eprintln!("mirror: 已启动 — 手机浏览器打开 https://{ip}:{} (证书警告点继续访问;需同一 Wi-Fi)", mirror::MIRROR_PORT);
                 self.mirror_err = None;
             }
             Err(e) => {
