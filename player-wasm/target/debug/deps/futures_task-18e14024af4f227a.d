@@ -1,0 +1,11 @@
+D:\phimakor\editor\player-wasm\target\debug\deps\futures_task-18e14024af4f227a.d: D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\lib.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\spawn.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\arc_wake.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker_ref.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\future_obj.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\noop_waker.rs
+
+D:\phimakor\editor\player-wasm\target\debug\deps\libfutures_task-18e14024af4f227a.rmeta: D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\lib.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\spawn.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\arc_wake.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker_ref.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\future_obj.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\noop_waker.rs
+
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\lib.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\spawn.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\arc_wake.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker_ref.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\future_obj.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\noop_waker.rs:

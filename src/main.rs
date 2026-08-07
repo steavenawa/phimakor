@@ -1,5 +1,6 @@
 mod audio;
 mod core;
+mod mirror;
 mod render;
 mod ui;
 
@@ -214,6 +215,14 @@ struct State {
     loop_prev_audio: f64,
     /// 短暂提示 toast(文本 + 触发时刻,2 秒后过期擦除)。
     loop_toast: Option<(String, std::time::Instant)>,
+
+    // ── 镜像服务(PMCORE 镜像:手机 WebGPU 播放器)──
+    /// 运行中的镜像服务(None = 关)。
+    mirror: Option<mirror::MirrorServer>,
+    /// 镜像服务错误提示(菜单状态显示)。
+    mirror_err: Option<String>,
+    /// 纹理槽名(6 内置 + 谱面线纹理去重;切谱/开关时重建)。
+    mirror_tex_slots: Vec<String>,
 }
 
 
@@ -319,6 +328,7 @@ impl App {
             loading_name: None, loading_thread: None, loading_start: Instant::now(),
             preload_want: None, preload_target: None, preload_gen: 0, preload_rx: None, preload_slot: None,
             loop_a: None, loop_b: None, loop_on: false, loop_prev_audio: 0.0, loop_toast: None,
+            mirror: None, mirror_err: None, mirror_tex_slots: Vec::new(),
         })
     }
 
@@ -443,6 +453,7 @@ impl App {
             loading_name: None, loading_thread: None, loading_start: Instant::now(),
             preload_want: None, preload_target: None, preload_gen: 0, preload_rx: None, preload_slot: None,
             loop_a: None, loop_b: None, loop_on: false, loop_prev_audio: 0.0, loop_toast: None,
+            mirror: None, mirror_err: None, mirror_tex_slots: Vec::new(),
         })
     }
 
@@ -456,6 +467,10 @@ impl App {
             // 防止切到 splash 后打开别的谱面把未保存修改丢掉)。
             if let Err(e) = state.doc.flush() {
                 eprintln!("flush on exit failed: {e:#}");
+            }
+            // 镜像服务随编辑器关闭(手机端断开)。
+            if let Some(m) = state.mirror.take() {
+                m.stop();
             }
             if let Some(a) = &state.audio { a.quit(); }
             state.audio = None;
@@ -818,6 +833,45 @@ fn load_chart_async(dir: PathBuf, compress: bool) -> anyhow::Result<LoadedChart>
 }
 
 impl State {
+    /// 切谱面:重建镜像纹理槽(6 内置 + 谱面线纹理去重)。
+    fn mirror_refresh_tex(&mut self) {
+        let mut slots: Vec<String> = mirror::BUILTIN_TEX_NAMES.iter().map(|s| s.to_string()).collect();
+        let mut seen = std::collections::HashSet::new();
+        for l in &self.doc.chart().judge_line_list {
+            if !l.texture.is_empty() && seen.insert(l.texture.clone()) {
+                slots.push(l.texture.clone());
+            }
+        }
+        self.mirror_tex_slots = slots;
+    }
+
+    /// 镜像服务开关(菜单 F9):开 = 启动 WS/HTTP 服务,关 = 停止。
+    fn toggle_mirror(&mut self) {
+        if let Some(m) = self.mirror.take() {
+            m.stop();
+            self.ui_dirty = true;
+            eprintln!("mirror: 已停止");
+            return;
+        }
+        self.mirror_refresh_tex();
+        let music = self.info.music.clone();
+        let line_textures: Vec<String> = self.mirror_tex_slots.iter().skip(mirror::BUILTIN_TEX_NAMES.len()).cloned().collect();
+        match mirror::MirrorServer::start(self.chart_dir.clone(), music, &line_textures) {
+            Ok(m) => {
+                self.mirror = Some(m);
+                // 显示局域网访问地址(主网卡 IPv4,经典 UDP 探路法,零依赖)。
+                let ip = mirror::local_ipv4();
+                eprintln!("mirror: 已启动 — 手机浏览器打开 http://{ip}:{} (需同一 Wi-Fi)", mirror::MIRROR_PORT);
+                self.mirror_err = None;
+            }
+            Err(e) => {
+                eprintln!("mirror: {e}");
+                self.mirror_err = Some(e);
+            }
+        }
+        self.ui_dirty = true;
+    }
+
     /// Sorted (effect-index, start-beat) pairs — same ordering as the Eff
     /// panel list, so a list row maps back to `ExtraRoot::effects`.
     fn eff_sorted(&self) -> Vec<(usize, f64)> {
@@ -1312,6 +1366,10 @@ impl State {
         self.overlay.line_list = None;
         self.overlay.chart_grid = None;
         self.chart.state_at(0.0);
+        // 镜像服务:纹理槽随谱面重建(线纹理变化)。
+        if self.mirror.is_some() {
+            self.mirror_refresh_tex();
+        }
         self.loading_name = None;
         self.loading_thread = None;
         self.ui_dirty = true;
@@ -2733,6 +2791,24 @@ impl State {
             }
             _ => {}
         }
+        // 镜像服务:推最新帧快照(节流) + 消费手机控制指令。
+        if let Some(m) = &mut self.mirror {
+            m.tick(frame, dim, &self.mirror_tex_slots);
+            if let Some(ctrl) = m.poll_ctrl() {
+                match ctrl {
+                    mirror::MirrorCtrl::Pause => {
+                        if let Some(a) = &self.audio {
+                            let p = !a.is_paused();
+                            a.set_paused(p);
+                        }
+                    }
+                    mirror::MirrorCtrl::Seek(t) => {
+                        // 手机发的是音频秒(与 seek() 参数同口径,内部转 chart 秒)。
+                        self.seek(t);
+                    }
+                }
+            }
+        }
         // frame 借用已结束,应用时间轴点击 seek(PMCORE-22)。
         if let Some(b) = deferred_seek.take() {
             self.seek_to_beat(b);
@@ -3368,6 +3444,7 @@ impl App {
                         KeyCode::F5 => { if state.ctrl { state.full_notes = !state.full_notes; state.cache_valid = false; } else { state.show_notes = !state.show_notes; } state.ui_dirty = true; }
                         KeyCode::F6 => { state.renderer.set_vsync(!state.renderer.vsync); state.ui_dirty = true; }
                         KeyCode::F7 => { state.debug_memory(true); }
+                        KeyCode::F9 => { state.toggle_mirror(); }
                         KeyCode::BracketLeft => { state.gui_scale = (state.gui_scale - 0.1).max(0.5); state.ui_dirty = true; }
                         KeyCode::BracketRight => { state.gui_scale = (state.gui_scale + 0.1).min(2.0); state.ui_dirty = true; }
                         KeyCode::Digit1 => { state.snap = 1.0; state.ui_dirty = true; }
@@ -4332,6 +4409,7 @@ impl ApplicationHandler for App {
                         }
                         ui::OverlayMessage::SetLoopA => state.set_loop_point(true),
                         ui::OverlayMessage::SetLoopB => state.set_loop_point(false),
+                        ui::OverlayMessage::MirrorToggle => state.toggle_mirror(),
                         ui::OverlayMessage::EditComment => {
                             // PMCORE-77:右键菜单"注释"。事件面板或未命中音符 →
                             // 判定线注释;音符面板命中音符 → 该音符注释。

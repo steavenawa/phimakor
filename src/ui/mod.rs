@@ -90,6 +90,8 @@ pub enum OverlayMessage {
     /// 右键菜单:编辑注释(PMCORE-77)。目标由 main.rs 按 ctx_on_events /
     /// ctx_note_hit + selected_note 解析(音符注释或判定线注释)。
     EditComment,
+    /// 菜单:切换镜像服务(F9 / 菜单项;手机 WebGPU 播放器推流)。
+    MirrorToggle,
 }
 
 // ── hover 浮层(PMCORE-76)──
@@ -345,6 +347,7 @@ pub fn editor_menu_items() -> Vec<menu::MenuItem> {
         menu::MenuItem::new("Save (Ctrl+S)", menu::MenuAction::Command("save")),
         menu::MenuItem::new("Load", menu::MenuAction::Command("load")),
         menu::MenuItem::new("Export", menu::MenuAction::Command("export")),
+        menu::MenuItem::new("镜像服务 (F9)", menu::MenuAction::Command("mirror")),
         menu::MenuItem::new("Quit to Menu (Ctrl+Q)", menu::MenuAction::Command("quit")),
     ]
 }
@@ -374,6 +377,7 @@ pub fn menu_command_message(c: &str) -> Option<OverlayMessage> {
         "loop_a" => OverlayMessage::SetLoopA,
         "loop_b" => OverlayMessage::SetLoopB,
         "comment" => OverlayMessage::EditComment,
+        "mirror" => OverlayMessage::MirrorToggle,
         _ => return None,
     })
 }

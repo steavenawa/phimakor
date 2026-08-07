@@ -5,12 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>PhiMakor Player — wasm smoke test</title>
 <style>
-  body { background: #111; color: #ddd; font-family: sans-serif; margin: 0; padding: 24px; }
-  pre { background: #1a1a1f; padding: 12px; border-radius: 8px; white-space: pre-wrap; }
+  body { background: #111; color: #ddd; font-family: sans-serif; margin: 0; }
+  canvas#screen { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; background: #000; }
+  pre#log { position: fixed; left: 8px; top: 8px; z-index: 1; margin: 0; padding: 6px 10px; background: rgba(0,0,0,.55); border-radius: 6px; color: #8f8; font-size: 11px; line-height: 1.4; pointer-events: none; white-space: pre-wrap; }
 </style>
 </head>
 <body>
-<h2>PhiMakor Player wasm 冒烟</h2>
+<canvas id="screen"></canvas>
 <pre id="log">loading…</pre>
 <script type="module">
 import init, { start } from "./pkg/phimakor_player.js";

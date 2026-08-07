@@ -1,0 +1,11 @@
+D:\phimakor\editor\player-wasm\target\debug\deps\futures_core-919bb6ad9d48a741.d: D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\lib.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\future.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\stream.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\mod.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\poll.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\__internal\mod.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\__internal\atomic_waker.rs
+
+D:\phimakor\editor\player-wasm\target\debug\deps\libfutures_core-919bb6ad9d48a741.rmeta: D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\lib.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\future.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\stream.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\mod.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\poll.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\__internal\mod.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\__internal\atomic_waker.rs
+
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\lib.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\future.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\stream.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\mod.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\poll.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\__internal\mod.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-core-0.3.33\src\task\__internal\atomic_waker.rs:
