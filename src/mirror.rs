@@ -255,6 +255,29 @@ fn handle_conn(
         ));
         return;
     }
+    // 播放器 wasm 产物(/pkg/*):候选目录 CWD 的 player-wasm/pkg 与 pkg。
+    // 发布时把 wasm-bindgen 产物放到 exe 旁边任一位置即可。
+    if let Some(rel) = path.strip_prefix("/pkg/") {
+        for base in [Path::new("player-wasm/pkg"), Path::new("pkg")] {
+            let p = base.join(rel);
+            if let Ok(bytes) = std::fs::read(&p) {
+                let ct = if rel.ends_with(".js") {
+                    "application/javascript"
+                } else if rel.ends_with(".wasm") {
+                    "application/wasm"
+                } else {
+                    "application/octet-stream"
+                };
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len());
+                if write_all(&mut stream, &head).is_ok() {
+                    let _ = stream.write_all(&bytes);
+                }
+                return;
+            }
+        }
+        let _ = write_all(&mut stream, "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
+    }
     if let Some(name) = path.strip_prefix("/music/") {
         serve_music(&mut stream, &charts_dir, &music_name, name, &get);
         return;
