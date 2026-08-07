@@ -182,6 +182,13 @@ impl AudioClock {
     /// cannot be reopened — otherwise the position would desync from what
     /// is actually audible.
     pub fn seek(&self, t: f64) -> bool {
+        // [panic 兜底] 非有限秒(Inf/NaN,来自坏谱面时间链)会炸
+        // Duration::from_secs_f64(用户实测 hitsound-trigger 线程崩溃);
+        // 直接拒绝,保持时钟不动。
+        if !t.is_finite() {
+            eprintln!("warning: audio seek rejected (non-finite {t})");
+            return false;
+        }
         let t = t.max(0.0);
         let was_playing = self.playing.get();
         // rodio: on an empty queue try_seek() is a silent no-op returning Ok,

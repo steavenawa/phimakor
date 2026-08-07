@@ -947,10 +947,14 @@ impl Chart {
         // endTimes, + 1 second. speedEvents are stretched to fill max_time.
         let mut max_time = 0f64;
         for line in &rpe.judge_line_list {
+            // [时间有限性] 音符/事件拍号可能非法(triple 分母 0 → beats=Inf):
+            // Inf/NaN 必须排除,否则 duration=Inf 会让 seek clamp/scroll 全线
+            // Inf(用户实测音频线程 from_secs_f64 panic)。f64::max 对 NaN
+            // 返回另一参数,但 Inf 会传染——显式过滤非有限。
             let notes_max = line
                 .notes
                 .as_ref()
-                .map(|notes| notes.iter().map(|note| r.time(&note.end_time)).reduce(f64::max).unwrap_or(0.))
+                .map(|notes| notes.iter().map(|note| r.time(&note.end_time)).filter(|t| t.is_finite()).fold(0f64, f64::max))
                 .unwrap_or(0.);
             let events_max = line
                 .event_layers
@@ -962,11 +966,10 @@ impl Chart {
                         .chain(vec(&layer.move_y_events))
                         .chain(vec(&layer.rotate_events))
                         .map(|it| r.time(&it.end_time))
-                        .reduce(f64::max)
-                        .unwrap_or(0.)
+                        .filter(|t| t.is_finite())
+                        .fold(0f64, f64::max)
                 })
-                .reduce(f64::max)
-                .unwrap_or(0.);
+                .fold(0f64, f64::max);
             let ext_max = line
                 .extended
                 .as_ref()
@@ -980,20 +983,25 @@ impl Chart {
                         .chain(vec(&e.paint_events))
                         .chain(vec(&e.gif_events))
                     {
-                        m = m.max(r.time(&it.end_time));
+                        let t = r.time(&it.end_time);
+                        if t.is_finite() { m = m.max(t); }
                     }
                     for it in vec(&e.text_events) {
-                        m = m.max(r.time(&it.end_time));
+                        let t = r.time(&it.end_time);
+                        if t.is_finite() { m = m.max(t); }
                     }
                     for it in vec(&e.color_events) {
-                        m = m.max(r.time(&it.end_time));
+                        let t = r.time(&it.end_time);
+                        if t.is_finite() { m = m.max(t); }
                     }
                     m
                 })
                 .unwrap_or(0.);
             max_time = max_time.max(notes_max).max(events_max).max(ext_max);
         }
-        let max_time = max_time + 1.;
+        // [时间有限性] 双保险:即使上游仍混入非有限(极端拍号等),duration
+        // 也保持有限——seek bar 的 ratio×duration、scroll_target 都依赖它。
+        let max_time = if max_time.is_finite() { max_time + 1. } else { 1.0 };
         // 统一触发事件表(单一口径,见 [`build_triggers`]):音频预加载路径
         // (fire_events_from_rpe) 也走同一 builder,保证三套触发判定一致。
         // 需在 rpe.judge_line_list 被消费(下方 into_iter)前借 rpe 构建。
@@ -2132,6 +2140,49 @@ previewStart: 12
         }"#;
         let chart = Chart::from_rpe(chart, false).unwrap();
         assert!((chart.duration() - 3.0).abs() < 1e-9, "duration: {}", chart.duration());
+    }
+
+    #[test]
+    fn duration_stays_finite_on_bad_bpm_and_triple() {
+        // 回归(用户实测 hitsound-trigger 崩溃):bpm=0 → 60/0=Inf;
+        // triple 分母 0 → beats=Inf → max_time=Inf → duration=Inf →
+        // seek clamp/scroll 传染 → 音频线程 Duration::from_secs_f64 panic。
+        // BpmList 清洗 + max_time 过滤后 duration 必须有限。
+        let bad_bpm = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 0.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "a", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "notes": [
+                        { "type": 1, "above": 1, "startTime": [1, 0, 1], "endTime": [1, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ], "isCover": 1
+                }
+            ]
+        }"#;
+        let c1 = Chart::from_rpe(bad_bpm, false).unwrap();
+        assert!(c1.duration().is_finite() && c1.duration() > 0.0,
+            "bpm=0 duration: {}", c1.duration());
+        assert!(c1.fire_events().iter().all(|(t, _)| t.is_finite()),
+            "bpm=0 fire_events 含非有限时刻");
+        // triple 分母 0 → beats=Inf:endTime [1, 2, 0]。
+        let bad_triple = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "a", "Texture": "line.png", "father": -1,
+                    "eventLayers": [], "notes": [
+                        { "type": 1, "above": 1, "startTime": [1, 0, 1], "endTime": [1, 2, 0], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ], "isCover": 1
+                }
+            ]
+        }"#;
+        let c2 = Chart::from_rpe(bad_triple, false).unwrap();
+        assert!(c2.duration().is_finite() && c2.duration() > 0.0,
+            "triple d=0 duration: {}", c2.duration());
+        assert!(c2.fire_events().iter().all(|(t, _)| t.is_finite()),
+            "triple d=0 fire_events 含非有限时刻");
     }
 
     #[test]

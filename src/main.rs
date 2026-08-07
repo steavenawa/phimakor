@@ -1532,7 +1532,8 @@ impl State {
 
     fn seek(&mut self, t: f64) {
         let _s = trace_span!("seek");
-        let t = t.clamp(0.0, self.chart.duration());
+        // [时间有限性] 非有限目标(坏谱面 duration 曾为 Inf 传染)归零。
+        let t = if t.is_finite() { t.clamp(0.0, self.chart.duration()) } else { 0.0 };
         if let Some(a) = &self.audio { a.seek(t); }
         // Seek 回到播放头跟随模式(手动滚动时间轴后 seek 会重新吸附)。
         self.overlay.tl_follow = true;
@@ -1557,7 +1558,8 @@ impl State {
     /// 卡在中间时间。
     fn hard_seek(&mut self, t: f64) {
         let _s = trace_span!("hard_seek");
-        let t = t.clamp(0.0, self.chart.duration());
+        // [时间有限性] 同 seek():非有限目标归零。
+        let t = if t.is_finite() { t.clamp(0.0, self.chart.duration()) } else { 0.0 };
         if let Some(a) = &self.audio { a.seek(t); }
         self.overlay.tl_follow = true;
         self.pending_seek = None;
