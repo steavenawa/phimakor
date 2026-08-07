@@ -1,0 +1,13 @@
+D:\phimakor\editor\player-wasm\target\wasm32-unknown-unknown\release\deps\futures_task-bf135911c7275607.d: D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\lib.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\spawn.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\arc_wake.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker_ref.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\future_obj.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\noop_waker.rs
+
+D:\phimakor\editor\player-wasm\target\wasm32-unknown-unknown\release\deps\libfutures_task-bf135911c7275607.rlib: D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\lib.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\spawn.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\arc_wake.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker_ref.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\future_obj.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\noop_waker.rs
+
+D:\phimakor\editor\player-wasm\target\wasm32-unknown-unknown\release\deps\libfutures_task-bf135911c7275607.rmeta: D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\lib.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\spawn.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\arc_wake.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker_ref.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\future_obj.rs D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\noop_waker.rs
+
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\lib.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\spawn.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\arc_wake.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\waker_ref.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\future_obj.rs:
+D:\.cargo\registry\src\rsproxy.cn-e3de039b2554c837\futures-task-0.3.33\src\noop_waker.rs:

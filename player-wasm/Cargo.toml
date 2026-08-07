@@ -1,0 +1,27 @@
+[package]
+name = "phimakor-player"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "PhiMakor wasm player: chart playback in the browser via WebGPU. Receives frame snapshots from the desktop editor and renders with wgpu."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anyhow = "*"
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+serde_yaml = "0.9"
+wgpu = { version = "30", default-features = false, features = ["webgpu"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "console", "Window", "Document", "Element", "HtmlCanvasElement", "Navigator",
+] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
