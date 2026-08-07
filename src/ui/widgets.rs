@@ -2490,11 +2490,13 @@ pub struct RealtimeForm {
     pub gap: f32,
     /// 当前键盘焦点行(Text/Number 编辑)。
     pub focus_row: Option<usize>,
+    /// 播放头所在行(半透明高亮,None 表示无)。hover/焦点优先于高亮。
+    pub highlight_row: Option<usize>,
 }
 
 impl RealtimeForm {
     pub fn new(x: f32, y: f32, w: f32, title: impl Into<String>, rows: Vec<(String, RTControl)>) -> Self {
-        Self { x, y, w, title: title.into(), rows, row_h: 24.0, gap: 4.0, focus_row: None }
+        Self { x, y, w, title: title.into(), rows, row_h: 24.0, gap: 4.0, focus_row: None, highlight_row: None }
     }
 
     pub fn add_row(&mut self, label: impl Into<String>, control: RTControl) {
@@ -2766,7 +2768,15 @@ impl Widget for RealtimeForm {
             let r = self.row_rect(i);
             let on = hover.map_or(false, |a| a.id == (i + 1) as u32);
             let focused = self.focus_row == Some(i);
-            cv.fill(r, if on || focused { theme.hover } else { theme.row });
+            // 行背景:播放头高亮行用半透明 accent,hover/焦点优先于高亮。
+            let bg = if on || focused {
+                theme.hover
+            } else if self.highlight_row == Some(i) {
+                [theme.accent[0], theme.accent[1], theme.accent[2], 60]
+            } else {
+                theme.row
+            };
+            cv.fill(r, bg);
             cv.text(label, r.x() + theme.pad_x, r.y() + r.height() * 0.72, theme.font_size, theme.text);
             let vx = r.x() + 90.0 + theme.pad_x;
             match c {

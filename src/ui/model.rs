@@ -70,6 +70,15 @@ pub fn gameinfo_values(info: &GameInfo) -> std::collections::HashMap<&str, Strin
     m.insert("show_overlay", if info.show_overlay { "ON" } else { "OFF" }.to_string());
     m.insert("snap", format!("{}", info.snap));
     m.insert("vsync", if info.vsync { "ON" } else { "OFF" }.to_string());
+    // 选中线实时位姿/属性(Line 面板模板键,main.rs 每帧填)。
+    m.insert("line_x", format!("{:.1}", info.line_x));
+    m.insert("line_y", format!("{:.1}", info.line_y));
+    m.insert("line_rot", format!("{:.0} deg", info.line_rot));
+    m.insert("line_alpha", format!("{:.2}", info.line_alpha));
+    m.insert("line_notes", format!("{}", info.line_notes_total));
+    m.insert("line_parent", info.line_parent.map(|p| format!("L{p}")).unwrap_or_else(|| "—".into()));
+    m.insert("line_cover", if info.line_cover { "ON" } else { "OFF" }.to_string());
+    m.insert("line_below", if info.line_below { "ON" } else { "OFF" }.to_string());
     m
 }
 
@@ -98,6 +107,19 @@ pub struct GameInfo {
     pub show_notes: bool, pub events_progress: f32, pub notes_progress: f32,
     pub has_custom_tex: bool, pub full_notes: bool,
     pub selected_line: usize, pub line_name: String, pub line_count: usize,
+    /// 选中线实时位姿(Line 面板 Edit 区模板值,每帧从 frame 填)。
+    pub line_x: f32,
+    pub line_y: f32,
+    /// 旋转(度)。
+    pub line_rot: f32,
+    pub line_alpha: f32,
+    /// 选中线音符总数(doc 层)。
+    pub line_notes_total: usize,
+    /// 选中线父线(索引)。
+    pub line_parent: Option<usize>,
+    /// 选中线封面色/下排音符标记。
+    pub line_cover: bool,
+    pub line_below: bool,
     pub selected_layer: usize, pub max_layers: usize, pub events: Arc<Vec<EventEntry>>,
     pub notes: Arc<Vec<NoteEntry>>,
     /// 当前线选中音符(线内索引,PMCORE-18 高亮绘制用)。

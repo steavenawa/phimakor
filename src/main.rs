@@ -1305,7 +1305,8 @@ impl State {
     /// 由鼠标释放/滚轮事件调用,避开 render_frame 的 frame 借用)。
     /// 调用时机:render_frame 内 frame 借用期间 → 拆成字段级操作,
     /// 只用 `self.doc` 与 `self.overlay`(与 `self.chart` 借用不冲突)。
-    fn bpm_refresh_form(&mut self) {
+    /// `chart_time`:当前谱面秒,用于换算每段起始秒与高亮当前 BPM 段。
+    fn bpm_refresh_form(&mut self, chart_time: f64) {
         // 注意:render_frame 里 `self.chart.state_at()` 持有对 self.chart
         // 的可变借用,这里不能拿 `&mut self` 全量。字段级借用即可。
         let s = self.gui_scale;
@@ -1328,7 +1329,20 @@ impl State {
             }
         }
         let rows = self.doc.bpm_pairs();
-        let form = ui::bpm_panel::build_form(px, py, pan_w, &rows, focus, s);
+        // 每段起始秒(谱面秒):beat→秒按各自段 BPM 累计。
+        let mut secs: Vec<f64> = Vec::with_capacity(rows.len());
+        let mut t = 0.0f64;
+        for i in 0..rows.len() {
+            secs.push(t);
+            let (beat, bpm) = rows[i];
+            let next_beat = rows.get(i + 1).map(|r| r.0).unwrap_or(beat);
+            if bpm > 0.0 {
+                t += (next_beat - beat) * 60.0 / bpm;
+            }
+        }
+        // 当前播放头所在段(高亮):chart_time ∈ [sec[i], sec[i+1])。
+        let highlight = secs.iter().rposition(|&s| chart_time >= s);
+        let form = ui::bpm_panel::build_form(px, py, pan_w, &rows, &secs, highlight, focus, s);
         self.overlay.bpm_form = Some(form);
     }
 
@@ -1431,6 +1445,8 @@ impl State {
         }
         // PMCORE-24:自动保存开关/间隔实时同步到当前文档(saver 线程共享 Arc)。
         self.doc.set_autosave(self.settings.autosave, (self.settings.autosave_interval * 1000.0) as u64);
+        // 音频输出延迟补偿(ms → 秒),驱动 render_frame 的 device_latency。
+        self.device_latency = (self.settings.audio_latency_ms as f64 / 1000.0).clamp(0.0, 0.2);
         save_settings(&self.settings);
         self.ui_dirty = true;
     }
@@ -2219,7 +2235,7 @@ impl State {
         let t_eval = std::time::Instant::now();
         // BPM 面板(tool 4):每帧重建表单(在 frame 借用之前,避开借用冲突)。
         if self.show_overlay && self.show_properties && self.overlay.selected_tool == 4 {
-            self.bpm_refresh_form();
+            self.bpm_refresh_form(chart_time);
         }
         // 设置面板(tool 2):每帧重建表单。
         if self.show_overlay && self.show_properties && self.overlay.selected_tool == 2 {
@@ -2322,8 +2338,21 @@ impl State {
             dim, show_overlay: self.show_overlay,
             show_properties: self.show_properties, show_events: self.show_events, show_notes: self.show_notes,
             selected_line: self.selected_line,
-            line_name,
+            line_name: line_name.clone(),
             line_count,
+            // 选中线实时位姿/属性(Line 面板模板键,frame 借用中直接取)。
+            line_x: frame.lines.get(self.selected_line).map(|l| l.position[0]).unwrap_or(0.0),
+            line_y: frame.lines.get(self.selected_line).map(|l| l.position[1]).unwrap_or(0.0),
+            line_rot: frame.lines.get(self.selected_line).map(|l| l.rotation.to_degrees()).unwrap_or(0.0),
+            line_alpha: frame.lines.get(self.selected_line).map(|l| l.alpha).unwrap_or(1.0),
+            line_notes_total: self.doc.chart().judge_line_list.get(self.selected_line)
+                .and_then(|l| l.notes.as_ref()).map_or(0, |n| n.len()),
+            line_parent: self.doc.chart().judge_line_list.get(self.selected_line)
+                .and_then(|l| l.parent).map(|p| p.max(0) as usize),
+            line_cover: self.doc.chart().judge_line_list.get(self.selected_line)
+                .map_or(false, |l| l.is_cover != 0),
+            line_below: !self.doc.chart().judge_line_list.get(self.selected_line)
+                .map_or(false, |l| l.is_cover == 1),
             selected_layer: self.selected_layer.min(max_layers.max(1) - 1),
             max_layers,
             events: line_events.clone(),
@@ -2433,6 +2462,18 @@ impl State {
                     ("combo".into(), format!("{}", self.combo)),
                     ("score".into(), format!("{:07}", score)),
                 ];
+                // 谱面统计(只读行):BPM 范围 / NPS / 线数 / 总 offset / 选中线。
+                // frame 借用期间不能碰 self.chart,统计全从 doc 与局部变量取。
+                let bpm_vals: Vec<f64> = self.doc.chart().bpm_list.iter().map(|b| b.bpm).collect();
+                let bpm_min = bpm_vals.iter().copied().fold(f64::INFINITY, f64::min);
+                let bpm_max = bpm_vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let nps = if duration > 0.001 { self.note_count as f64 / duration } else { 0.0 };
+                let offset_ms = self.doc.chart().meta.offset as f64 + self.info.offset as f64 * 1000.0;
+                grid_rows.push(("bpm".into(), if bpm_vals.is_empty() { "—".into() } else { format!("{bpm_min:.0}~{bpm_max:.0}") }));
+                grid_rows.push(("nps".into(), format!("{nps:.2}")));
+                grid_rows.push(("lines".into(), format!("{}", line_count)));
+                grid_rows.push(("offset".into(), format!("{offset_ms:.0}ms")));
+                grid_rows.push(("line".into(), line_name.clone()));
                 // PMCORE-21:谱面内容校验告警(存内存,面板可见;详情终端
                 // PHIMAKOR_CHART_WARNINGS=1)。
                 if !self.chart_warnings.is_empty() {
@@ -2453,6 +2494,8 @@ impl State {
                     Some(ui::widgets::GridFieldKind::Text),   // 4 level
                     Some(ui::widgets::GridFieldKind::Number), // 5 difficulty
                     None, None, None, None, None,
+                    // 统计行(只读):bpm / nps / lines / offset / line
+                    None, None, None, None, None,
                 ];
                 if !self.chart_warnings.is_empty() {
                     grid.edit_kind.push(None); // warnings 行只读
@@ -2469,6 +2512,7 @@ impl State {
                 self.overlay.chart_grid = Some(grid);
             }
             // Line 面板(tool 1):实时线数据滚动列表(每帧从 frame 构建)。
+            // 固定 12 行式 + 滚动条(ScrollList 自带);行内容带状态标记。
             if self.show_properties && self.overlay.selected_tool == 1 {
                 let s = self.gui_scale;
                 let pp = self.overlay.props_progress();
@@ -2476,17 +2520,24 @@ impl State {
                 let px = self.window.inner_size().width as f32 - pp * pan_w;
                 // 面板上方配置信息高度:约 28+8*22*s,列表从下方开始。
                 let py = (28.0 + 8.0 * 22.0) * s + 4.0 * s;
-                let vh = self.window.inner_size().height as f32;
-                let list_h = (vh - 48.0 * s - py).max(60.0);
-                let visible = (list_h / (22.0 * s + 4.0 * s)) as usize;
+                // 固定 12 行,不随窗口高度伸缩;超出滚动(ScrollList 滚动条)。
+                let visible = 12usize;
                 let labels: Vec<String> = frame.lines.iter().enumerate().map(|(i, l)| {
-                    let name = self.doc.chart().judge_line_list.get(i)
-                        .map(|jl| jl.name.as_str()).unwrap_or("");
-                    format!("L{i} {name} x:{:.1} y:{:.1} r:{:.0}° a:{:.2}",
+                    let jl = self.doc.chart().judge_line_list.get(i);
+                    let name: String = jl.map(|j| j.name.as_str()).unwrap_or("").chars().take(8).collect();
+                    // 状态标记:封面色 / 隐藏(alpha≈0)/ 子线(父索引)。
+                    // show_below 与 cover 互补(解析层 is_cover!=1),不单列。
+                    let mut mark = String::new();
+                    if jl.is_some_and(|j| j.is_cover != 0) { mark.push_str("[C]"); }
+                    if l.alpha < 0.01 { mark.push_str("[H]"); }
+                    if let Some(p) = jl.and_then(|j| j.parent).filter(|&p| p >= 0) {
+                        mark.push_str(&format!("[→{p}]"));
+                    }
+                    format!("L{i} {name}{mark} x:{:.0} y:{:.0} r:{:.0}° a:{:.2}",
                         l.position[0], l.position[1],
                         l.rotation.to_degrees() % 360.0, l.alpha)
                 }).collect();
-                let mut list = ui::widgets::ScrollList::new(px, py, pan_w, frame.lines.len(), visible.max(1));
+                let mut list = ui::widgets::ScrollList::new(px, py, pan_w, frame.lines.len(), visible);
                 list.row_h = 22.0 * s;
                 list.gap = 4.0 * s;
                 list.labels = labels;

@@ -1,8 +1,8 @@
 //! BPM 面板:自研组件库(widgets.rs)的第一个正式接入试点。
 //!
-//! 用 [`RealtimeForm`] 承载 BPM 列表:每行 label = 起始拍(beat),Number
-//! 控件 = BPM 值。绘制/命中/交互全部走组件库的 areas/hit/draw/on_*,
-//! 不再维护"绘制几何"与"命中几何"两套魔法数字。
+//! 用 [`RealtimeForm`] 承载 BPM 列表:每行 label = `b{beat} @ {sec}s`(起始拍 +
+//! 换算秒),Number 控件 = BPM 值。绘制/命中/交互全部走组件库的
+//! areas/hit/draw/on_*,不再维护"绘制几何"与"命中几何"两套魔法数字。
 //!
 //! 本模块只依赖组件库与 ui 绘制原语,**不依赖 core 类型**(数据以
 //! `(beat, bpm)` 元组进出),因此 measure/ui_kit 的 `#[path]` 副本也能编译。
@@ -13,18 +13,22 @@ use super::primitives::fill_rect_clipped;
 use super::text::draw_text_on_pixmap;
 
 /// 从 `(beat, bpm)` 行数据构建 BPM 面板组件。
-/// `x/y/w`: 面板矩形(逻辑坐标,已含 gui_scale);`focus_row` 保留交互焦点。
+/// `x/y/w`: 面板矩形(逻辑坐标,已含 gui_scale);`secs[i]` 为第 i 行对应秒数
+/// (越界按 0.0);`highlight` 为播放头所在行(驱动半透明高亮);`focus_row` 保留交互焦点。
 pub fn build_form(
     x: f32,
     y: f32,
     w: f32,
     rows: &[(f64, f64)],
+    secs: &[f64],
+    highlight: Option<usize>,
     focus_row: Option<usize>,
     s: f32,
 ) -> RealtimeForm {
-    let rows: Vec<(String, RTControl)> = rows.iter().map(|(beat, bpm)| {
+    let rows: Vec<(String, RTControl)> = rows.iter().enumerate().map(|(i, (beat, bpm))| {
+        let sec = secs.get(i).copied().unwrap_or(0.0);
         (
-            format!("@{beat:.3}"),
+            format!("b{beat:.2} @ {sec:.2}s"),
             RTControl::Number {
                 value: *bpm,
                 step: 1.0,
@@ -35,9 +39,10 @@ pub fn build_form(
             },
         )
     }).collect();
-    let mut form = RealtimeForm::new(x, y, w, "BPM", rows);
+    let mut form = RealtimeForm::new(x, y, w, format!("BPM × {}", rows.len()), rows);
     form.row_h = 24.0 * s;
     form.gap = 4.0 * s;
+    form.highlight_row = highlight;
     form.focus_row = focus_row;
     form
 }
@@ -119,8 +124,13 @@ mod tests {
     #[test]
     fn form_areas_registers_rows_and_add() {
         let rows = vec![(0.0, 120.0), (4.0, 90.0), (8.0, 150.0)];
-        let form = build_form(0.0, 0.0, 300.0, &rows, None, 1.0);
+        let secs = vec![0.0, 2.5, 5.0];
+        let form = build_form(0.0, 0.0, 300.0, &rows, &secs, Some(1), None, 1.0);
         let areas = form_areas(&form);
+        assert_eq!(form.title, "BPM × 3");
+        assert_eq!(form.rows[0].0, "b0.00 @ 0.00s");
+        assert_eq!(form.rows[1].0, "b4.00 @ 2.50s");
+        assert_eq!(form.highlight_row, Some(1));
         assert!(!areas.iter().any(|a| a.id.0 == 0));
         assert_eq!(areas.len(), 3 + 1); // 3 行 + Add
         for i in 0..3 {

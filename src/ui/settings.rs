@@ -42,6 +42,9 @@ pub struct SettingsData {
     /// PMCORE-76:鼠标 hover 上下文信息浮层(时间轴 note/事件块)。默认开;
     /// 关掉后浮层完全不绘制(命中与渲染均跳过)。
     pub hover_tooltip: bool,
+    /// 音频设备输出延迟补偿(毫秒,默认 15.0,与 PHIMAKOR_AUDIO_LATENCY_MS
+    /// 环境变量默认一致)。驱动 render_frame 的 `device_latency = v/1000`。
+    pub audio_latency_ms: f32,
 }
 
 /// 过激优化:hold 身体按视口裁剪(线段求交+勾股长度),长 hold 省大量
@@ -50,7 +53,7 @@ pub use phimakor::render::AGGRESSIVE_HOLD_CLIP;
 
 impl Default for SettingsData {
     fn default() -> Self {
-        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, fps_overlay: true, custom_cursor: false, aggressive: 0, half_res_fx: true, texture_compress: true, autosave: true, autosave_interval: 1.0, frame_lock: false, hover_tooltip: true }
+        Self { vsync: true, gui_scale: 1.0, fullscreen: false, backend: None, charts_dir: None, perf_hint: false, fps_overlay: true, custom_cursor: false, aggressive: 0, half_res_fx: true, texture_compress: true, autosave: true, autosave_interval: 1.0, frame_lock: false, hover_tooltip: true, audio_latency_ms: 15.0 }
     }
 }
 
@@ -105,6 +108,7 @@ pub fn build_settings_form(x: f32, y: f32, w: f32, s: f32, settings: &SettingsDa
         ("tex compress".into(), RTControl::Toggle { on: settings.texture_compress, anim: if settings.texture_compress { 1.0 } else { 0.0 }, dir: if settings.texture_compress { 1.0 } else { -1.0 } }),
         ("autosave".into(), RTControl::Toggle { on: settings.autosave, anim: if settings.autosave { 1.0 } else { 0.0 }, dir: if settings.autosave { 1.0 } else { -1.0 } }),
         ("autosave interval".into(), RTControl::Number { value: settings.autosave_interval as f64, step: 0.1, min: 0.1, max: 60.0, last_x: 0.0, buf: None }),
+        ("audio latency".into(), RTControl::Number { value: settings.audio_latency_ms as f64, step: 1.0, min: 1.0, max: 100.0, last_x: 0.0, buf: None }),
         ("frame lock".into(), RTControl::Toggle { on: settings.frame_lock, anim: if settings.frame_lock { 1.0 } else { 0.0 }, dir: if settings.frame_lock { 1.0 } else { -1.0 } }),
         ("hover tooltip".into(), RTControl::Toggle { on: settings.hover_tooltip, anim: if settings.hover_tooltip { 1.0 } else { 0.0 }, dir: if settings.hover_tooltip { 1.0 } else { -1.0 } }),
     ]);
@@ -217,6 +221,13 @@ pub fn apply_settings_form(form: &RealtimeForm, settings: &mut SettingsData) -> 
                     changed = true;
                 }
             }
+            ("audio latency", RTControl::Number { value, .. }) => {
+                let v = (*value as f32).clamp(1.0, 100.0);
+                if (v - settings.audio_latency_ms).abs() > 0.01 {
+                    settings.audio_latency_ms = v;
+                    changed = true;
+                }
+            }
             ("frame lock", RTControl::Toggle { on, .. }) => {
                 if *on != settings.frame_lock {
                     settings.frame_lock = *on;
@@ -307,5 +318,24 @@ mod tests {
         }
         assert!(apply_settings_form(&form, &mut s));
         assert!(!s.hover_tooltip);
+    }
+
+    /// audio latency 默认 15.0;旧 config.json 缺该字段回退默认;
+    /// 表单含 "audio latency" Number 行,apply_settings_form 写回(clamp 1.0..100.0)。
+    #[test]
+    fn audio_latency_defaults_and_form_row_writes_back() {
+        assert_eq!(SettingsData::default().audio_latency_ms, 15.0);
+        let old: SettingsData = serde_json::from_str(r#"{"vsync":true}"#).unwrap();
+        assert_eq!(old.audio_latency_ms, 15.0, "旧配置无 audio_latency_ms 字段应回退默认 15.0");
+        let mut s = SettingsData::default();
+        let mut form = build_settings_form(0.0, 0.0, 300.0, 1.0, &s);
+        let row = form.rows.iter_mut().find(|(l, _)| l == "audio latency").expect("表单应有 audio latency 行");
+        if let RTControl::Number { value, .. } = &mut row.1 {
+            *value = 42.0;
+        } else {
+            panic!("audio latency 行应为 Number");
+        }
+        assert!(apply_settings_form(&form, &mut s));
+        assert_eq!(s.audio_latency_ms, 42.0);
     }
 }

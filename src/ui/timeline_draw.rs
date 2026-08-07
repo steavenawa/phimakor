@@ -230,6 +230,11 @@ impl TimelineDrawState {
             }
             if info.show_overlay {
                 draw_seek_bar(&mut pm.as_mut(), info, qp_w, props_x, vh, s);
+                // 底部状态栏(PMCORE-56):仅时间轴可见(events/notes 面板任一打开)
+                // 时画在 seek bar 上方,数据全部来自 GameInfo 现有字段。
+                if info.show_events || info.show_notes {
+                    draw_status_bar(&mut pm.as_mut(), info, qp_w, props_x, vh, s);
+                }
             }
         }
         // Panel definition matching selected tool
@@ -427,6 +432,35 @@ pub fn seek_bar_rect(qp_w: f32, props_x: f32, vh: f32, s: f32) -> (f32, f32, f32
     let sb_x = qp_w;
     let sb_w = (props_x - sb_x).max(20.0);
     (sb_x, sb_y, sb_w, sb_h)
+}
+
+/// 底部状态栏(时间轴信息条):实时显示当前时间/节拍、选中数、吸附、线/层。
+/// 画在 seek bar 上方、与时间轴面板同宽(quick panel 右侧到 props 面板左侧);
+/// 仅时间轴可见(show_events / show_notes)时调用。数据全部来自 GameInfo 现有字段。
+pub fn draw_status_bar(pm: &mut PixmapMut, info: &GameInfo, qp_w: f32, props_x: f32, vh: f32, s: f32) {
+    let sb_h = 18.0 * s;
+    let sb_y = vh - 56.0 * s - 22.0 * s;
+    let sb_x = qp_w;
+    let sb_w = (props_x - sb_x).max(20.0);
+    // 半透明深色底(与面板背景同色系),保证文字可读。
+    let mut bg = Paint::default();
+    bg.set_color_rgba8(12, 12, 14, 200);
+    if let Some(r) = Rect::from_xywh(sb_x, sb_y, sb_w, sb_h) {
+        fill_rect_clipped(pm, r, &bg);
+    }
+    // 选中数:events 面板优先(与面板语义一致),仅 notes 时取 notes。
+    let sel = if info.show_events { info.selected_events.len() } else { info.selected_notes.len() };
+    // 吸附显示为 1/n:snap 是拍步长(f32,如 0.25 → 4),换算成整数分母。
+    let snap = (1.0 / info.snap.max(1e-6)).round();
+    let txt = format!(
+        "t {:.2}s  b{:.2}  |  sel {}  |  snap 1/{:.0}  |  {} L{}  |  layer {}/{}",
+        info.chart_time, info.chart_beat, sel, snap, info.line_name, info.selected_line,
+        info.selected_layer, info.max_layers
+    );
+    // 左对齐,字号 9*s,左缘 pad 6*s;y 取基线使 9*s 文字在 18*s 条内垂直居中。
+    if let Some(font) = super::font::get_font() {
+        super::text::draw_text_on_pixmap(pm, &txt, sb_x + 6.0 * s, sb_y + (sb_h + 9.0 * s) * 0.5, 9.0 * s, font);
+    }
 }
 
 /// 绘制 hover 上下文信息浮层(PMCORE-76)。纯函数:文本内容由调用方在
