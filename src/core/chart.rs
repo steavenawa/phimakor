@@ -780,13 +780,17 @@ pub(crate) fn load_info(dir: &std::path::Path) -> Result<ChartInfo> {
     Ok(info)
 }
 
-/// 一个命中特效触发点:谱面时间 `t0` + 线索引 + note 的 x(相对线中心,
-/// 画布单位)。渲染端用线变换把 x 换算成画布位置。
+/// 一个命中特效触发点:谱面时间 `t0` + 线索引 + note 的 x/y(相对线中心,
+/// 画布单位;y 已含 above 符号与 y_offset 归一化)。渲染端用线变换把
+/// x/y 换算成画布位置。
 #[derive(Clone, Copy, Debug)]
 pub struct FxTrigger {
     pub t0: f64,
     pub line: usize,
     pub x: f32,
+    /// note 的 y 偏移(above? + : -)×(y_offset×2/900×speed),与
+    /// state_at 的 relative[1] 同语义(不含线高差 base 项)。
+    pub y: f32,
 }
 
 /// 统一触发事件表条目(构建时生成):`t` = 谱面时钟秒。
@@ -797,6 +801,8 @@ pub struct TriggerEvent {
     pub t: f64,
     pub line: usize,
     pub x: f32,
+    /// 同 [`FxTrigger::y`]:above 符号 × 归一化 y_offset。
+    pub y: f32,
     pub kind: u8,
 }
 
@@ -821,7 +827,12 @@ fn build_triggers(rpe: &RPEChart, r: &mut BpmList) -> Vec<TriggerEvent> {
             }
             let t = r.time(&note.start_time);
             let x = note.position_x / (RPE_WIDTH / 2.);
-            triggers.push(TriggerEvent { t, line: line_idx, x, kind: note.kind });
+            // y:above 符号 × y_offset 归一化(与 parse_notes/state_at 同口径:
+            // y_offset×2/RPE_HEIGHT×speed,below note 镜像取负)。fx 落点必须
+            // 含这一项,否则带 y 偏移的 note 特效落在线上(用户实测:没有
+            // 判断 note 是 up 还是 down)。
+            let y = if note.above == 1 { 1.0 } else { -1.0 } * note.y_offset * 2.0 / RPE_HEIGHT * note.speed;
+            triggers.push(TriggerEvent { t, line: line_idx, x, y, kind: note.kind });
             if note.kind == 2 {
                 let end_time = r.time(&note.end_time);
                 if end_time > t {
@@ -831,11 +842,11 @@ fn build_triggers(rpe: &RPEChart, r: &mut BpmList) -> Vec<TriggerEvent> {
                     while tb < b_end {
                         let tt = trig_bpm.time_beats(tb);
                         if tt < end_time {
-                            triggers.push(TriggerEvent { t: tt, line: line_idx, x, kind: TRIGGER_TICK });
+                            triggers.push(TriggerEvent { t: tt, line: line_idx, x, y, kind: TRIGGER_TICK });
                         }
                         tb += 0.5;
                     }
-                    triggers.push(TriggerEvent { t: end_time, line: line_idx, x, kind: TRIGGER_TAIL });
+                    triggers.push(TriggerEvent { t: end_time, line: line_idx, x, y, kind: TRIGGER_TAIL });
                 }
             }
         }
@@ -1454,7 +1465,7 @@ impl Chart {
         let start = self.triggers.partition_point(|e| e.t < t_lo);
         let end = self.triggers.partition_point(|e| e.t <= t_hi);
         self.triggers[start..end].iter()
-            .map(|e| FxTrigger { t0: e.t, line: e.line, x: e.x })
+            .map(|e| FxTrigger { t0: e.t, line: e.line, x: e.x, y: e.y })
             .collect()
     }
 
@@ -2810,9 +2821,9 @@ previewStart: 12
         let mut chart = Chart::from_rpe(&src, false).unwrap();
         // 120bpm:beat 1 → 0.5s,beat 3 → 1.5s。和弦两个触发点同 (line, t0)。
         let trigs = [
-            FxTrigger { t0: 0.5, line: 0, x: 0.0 },
-            FxTrigger { t0: 0.5, line: 0, x: 0.5 },
-            FxTrigger { t0: 1.5, line: 0, x: 0.0 },
+            FxTrigger { t0: 0.5, line: 0, x: 0.0, y: 0.0 },
+            FxTrigger { t0: 0.5, line: 0, x: 0.5, y: 0.0 },
+            FxTrigger { t0: 1.5, line: 0, x: 0.0, y: 0.0 },
         ];
         let poses = chart.fx_poses(&trigs);
         // 输出与输入等长、顺序映射。
@@ -2831,6 +2842,93 @@ previewStart: 12
         assert!((poses[0].0[0] - fpos[0]).abs() < 1e-3);
         assert!((poses[0].0[1] - fpos[1]).abs() < 1e-3);
         assert!((poses[0].1 - frot).abs() < 1e-3);
+    }
+
+    #[test]
+    fn trigger_y_carries_above_sign_and_y_offset() {
+        // 回归:fx 落点必须含 note 的 y 偏移(above 符号 × y_offset×2/900×
+        // speed)——用户实测 hit-fx 没有判断 note 是 up 还是 down,带
+        // y_offset 的 note 特效落在线上。触发表的 y 与 state_at 的
+        // relative[1] 同口径(不含线高差 base 项)。
+        // 120bpm:above note y_offset=100 → +100×2/900;below note
+        // y_offset=50 → -50×2/900。
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [ null, null ],
+                    "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [2, 0, 1], "endTime": [2, 0, 1], "positionX": 0.0, "yOffset": 100.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 },
+                        { "type": 1, "above": 0, "startTime": [3, 0, 1], "endTime": [3, 0, 1], "positionX": 0.0, "yOffset": 50.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ]
+                }
+            ]
+        }"#;
+        let chart = Chart::from_rpe(&src, false).unwrap();
+        let trigs = chart.fx_in_window(-0.5, 10.0);
+        assert_eq!(trigs.len(), 2, "two heads in window");
+        // 按 t 升序:t0=1.0s(above),1.5s(below)。
+        assert!((trigs[0].y - (100.0 * 2.0 / 900.0)).abs() < 1e-6,
+            "above y {} != +0.2222", trigs[0].y);
+        assert!((trigs[1].y - (-50.0 * 2.0 / 900.0)).abs() < 1e-6,
+            "below y {} != -0.1111", trigs[1].y);
+    }
+
+    #[test]
+    fn fx_poses_stable_across_frames() {
+        // 回归:fx 位置必须冻结在触发时刻 t0 的线位姿——播放推进中每帧
+        // 重算(窗口滑动)结果必须逐位一致。若 set_time 游标往返不幂等,
+        // 同一 t0 的位姿会随播放漂移 = 用户实测的"fx 后续帧重新跟踪线"。
+        // 线 0..2s 线性平移 (0→0.5) + 旋转 (0°→90°),note 触发于 1.0s。
+        let src = r#"{
+            "META": { "offset": 0, "RPEVersion": 160 },
+            "BPMList": [ { "bpm": 120.0, "startTime": [0, 0, 1] } ],
+            "judgeLineList": [
+                {
+                    "Name": "line0", "Texture": "line.png", "father": -1,
+                    "eventLayers": [
+                        {
+                            "moveXEvents": [ { "start": 0.0, "end": 0.5, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 } ],
+                            "rotateEvents": [ { "start": 0.0, "end": 90.0, "startTime": [0, 0, 1], "endTime": [2, 0, 1], "easingType": 0 } ]
+                        },
+                        null
+                    ],
+                    "isCover": 0,
+                    "notes": [
+                        { "type": 1, "above": 1, "startTime": [2, 0, 1], "endTime": [2, 0, 1], "positionX": 0.0, "yOffset": 0.0, "alpha": 255, "size": 1.0, "speed": 1.0, "isFake": 0, "visibleTime": 999999.0 }
+                    ]
+                }
+            ]
+        }"#;
+        let mut chart = Chart::from_rpe(&src, false).unwrap();
+        let t0 = 1.0;
+        // 参照:t0 时刻 state_at 的线位姿(fx 必须冻结在它上面)。
+        let (ref_pos, ref_rot) = {
+            let f = chart.state_at(t0);
+            (f.lines[0].position, f.lines[0].rotation)
+        };
+        let mut last: Option<([f32; 2], f32)> = None;
+        for t in [1.0, 1.1, 1.2, 1.3, 1.4, 1.5] {
+            // 推进游标(模拟播放经过 t0 之后继续前进)。
+            chart.state_at(t);
+            let trigs = chart.fx_in_window(t - 0.5, t);
+            let idx = trigs.iter().position(|tr| (tr.t0 - t0).abs() < 1e-9)
+                .expect("window contains the t0 head");
+            let poses = chart.fx_poses(&trigs);
+            let p = poses[idx];
+            // 与 t0 时刻参照一致(不随播放漂移 = 不"重新跟踪"线)。
+            assert!((p.0[0] - ref_pos[0]).abs() < 1e-3, "t={t} px {} vs {}", p.0[0], ref_pos[0]);
+            assert!((p.0[1] - ref_pos[1]).abs() < 1e-3, "t={t} py {} vs {}", p.0[1], ref_pos[1]);
+            assert!((p.1 - ref_rot).abs() < 1e-3, "t={t} rot {} vs {}", p.1, ref_rot);
+            // 跨帧逐位一致。
+            if let Some(prev) = last {
+                assert_eq!(p, prev, "t={t}: pose drifted from previous frame");
+            }
+            last = Some(p);
+        }
     }
 
     #[test]

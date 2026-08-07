@@ -144,8 +144,10 @@ impl ChartSession {
             let fx: Vec<(f64, [f32; 2])> = triggers.into_iter().zip(poses).map(|(tr, (pos, rot))| {
                 let rot = rot as f64;
                 let x = tr.x as f64 * 675.0;
-                let cx = pos[0] as f64 * 675.0 + rot.cos() * x;
-                let cy = pos[1] as f64 * 450.0 * ev_y + rot.sin() * x;
+                // y:above 符号 × y_offset(note 正式落点,旋转后与渲染一致)。
+                let y = tr.y as f64 * 450.0 * ev_y;
+                let cx = pos[0] as f64 * 675.0 + rot.cos() * x - rot.sin() * y;
+                let cy = pos[1] as f64 * 450.0 * ev_y + rot.sin() * x + rot.cos() * y;
                 (tr.t0, [cx as f32, cy as f32])
             }).collect();
             self.engine.set_frame_fx(fx);

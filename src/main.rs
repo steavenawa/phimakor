@@ -2562,16 +2562,18 @@ impl State {
             // 与 note 渲染同坐标系(画布 px):
             //   x_canvas = note.x(±1) × 675(note 偏移不乘 scale/ctrl_size——
             //   渲染 note_m 只含平移+旋转,明确 NOT its scale)
-            //   cx = pos[0]×675 + cos(rot)×x_canvas
-            //   cy = pos[1]×450×ev_y + sin(rot)×x_canvas
+            //   cx = pos[0]×675 + cos(rot)×x_canvas - sin(rot)×y_canvas
+            //   cy = pos[1]×450×ev_y + sin(rot)×x_canvas + cos(rot)×y_canvas
+            //   y_canvas = tr.y×450×ev_y(above 符号 × y_offset,note 正式落点)
             // ev_y 必须用判定区比例(render::ASPECT=3:2,letterbox 后恒定),
             // 不能用窗口比例——否则非 3:2 窗口 fx 的 y 比例与 note 错位。
             let ev_y = 1.5 / render::ASPECT as f64;
             let fx: Vec<(f64, [f32; 2])> = fx_triggers.into_iter().zip(fx_poses).map(|(tr, (pos, rot))| {
                 let rot = rot as f64;
                 let x = tr.x as f64 * 675.0;
-                let cx = pos[0] as f64 * 675.0 + rot.cos() * x;
-                let cy = pos[1] as f64 * 450.0 * ev_y + rot.sin() * x;
+                let y = tr.y as f64 * 450.0 * ev_y;
+                let cx = pos[0] as f64 * 675.0 + rot.cos() * x - rot.sin() * y;
+                let cy = pos[1] as f64 * 450.0 * ev_y + rot.sin() * x + rot.cos() * y;
                 (tr.t0, [cx as f32, cy as f32])
             }).collect();
             self.renderer.set_frame_fx(fx);
