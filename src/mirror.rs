@@ -19,8 +19,9 @@ use std::sync::{mpsc, Arc, Mutex};
 
 /// 镜像服务端口(固定;占用则启动失败并提示)。
 pub const MIRROR_PORT: u16 = 8765;
-/// 快照推流节流(帧/秒)。
-const SNAP_FPS: f32 = 30.0;
+/// 快照推流节流(帧/秒)。用户要求 60fps 推流(局域网带宽足够,
+/// 手机端 rAF 逐帧消费最新快照)。
+const SNAP_FPS: f32 = 60.0;
 /// 最大快照字节(防御异常帧撑爆共享槽)。
 const MAX_SNAP_BYTES: usize = 2 * 1024 * 1024;
 

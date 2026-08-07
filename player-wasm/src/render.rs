@@ -166,6 +166,15 @@ pub struct Renderer {
     bgl: wgpu::BindGroupLayout,
     /// 纹理槽表,None = 槽缺失 → 回退槽 0(白)。
     slots: Vec<Option<TexEntry>>,
+    // ── 每帧复用(帧效率:不每帧 create_buffer/分配 Vec)──
+    /// 实例缓冲(容量不足才重建,扩容翻倍)。
+    inst_buf: Option<wgpu::Buffer>,
+    inst_cap: usize,
+    /// 本帧绘制项(复用 capacity,clear 后重建)。
+    draw: Vec<(Instance, usize)>,
+    /// 分组用的槽位/实例快照(复用)。
+    slots_view: Vec<usize>,
+    instances: Vec<Instance>,
 }
 
 impl Renderer {
@@ -181,7 +190,11 @@ impl Renderer {
         let white = create_texture(&device, &queue, &[255, 255, 255, 255], 1, 1);
         let white_bg = texture_bind_group(&device, &bgl, &sampler, &white);
         let slots = vec![Some(TexEntry { _texture: white, bind_group: white_bg, size: [1.0, 1.0] })];
-        Renderer { device, queue, surface, config, pipeline, sampler, bgl, slots }
+        Renderer {
+            device, queue, surface, config, pipeline, sampler, bgl, slots,
+            inst_buf: None, inst_cap: 0,
+            draw: Vec::new(), slots_view: Vec::new(), instances: Vec::new(),
+        }
     }
 
     /// 上传一条握手 PNG 到指定槽位(解码 → 垂直翻转 → 建纹理)。
@@ -211,19 +224,21 @@ impl Renderer {
     }
 
     /// 画一帧快照:清屏(黑)→ 按 z 升序画线 + 音符 → present。
+    /// 帧效率:实例缓冲/绘制项 Vec 全部复用(容量不足才重建),
+    /// 不每帧 create_buffer / 分配(60fps 推流下 iPhone 才跑得动)。
     pub fn draw_snapshot(&mut self, snap: &Snapshot) -> anyhow::Result<()> {
         let aspect = self.config.width as f32 / self.config.height as f32;
         let (letterbox, kx, ev_x, ev_y) = letterbox_transform(aspect, ASPECT);
-        let mut draw: Vec<(Instance, usize)> = Vec::new();
+        self.draw.clear();
         // 按 z 升序画线(小 z 在底,大 z 在上),与主仓 sort_by_key(z_order) 一致。
         let mut lines: Vec<&LineSnap> = snap.lines.iter().collect();
         lines.sort_by_key(|l| l.z);
         for line in lines {
-            build_line(&mut draw, line, &letterbox, kx, ev_x, ev_y, &self.slots);
+            build_line(&mut self.draw, line, &letterbox, kx, ev_x, ev_y, &self.slots);
         }
         // dim:全局背景压暗,CPU 侧乘到 rgb(与主仓 to_instances 同语义)。
         let dim = snap.dim.clamp(0.0, 1.0);
-        for (inst, _) in draw.iter_mut() {
+        for (inst, _) in self.draw.iter_mut() {
             inst.color[0] *= dim;
             inst.color[1] *= dim;
             inst.color[2] *= dim;
@@ -252,23 +267,32 @@ impl Renderer {
                 ..Default::default()
             });
             pass.set_pipeline(&self.pipeline);
-            if !draw.is_empty() {
-                let instances: Vec<Instance> = draw.iter().map(|(i, _)| *i).collect();
-                let slots: Vec<usize> = draw.iter().map(|(_, s)| *s).collect();
-                let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("player-instances"),
-                    size: (instances.len() as u64 * size_of::<Instance>() as u64).max(1),
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                self.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&instances));
-                pass.set_vertex_buffer(0, buf.slice(..));
+            let n = self.draw.len();
+            if n > 0 {
+                self.instances.clear();
+                self.slots_view.clear();
+                self.instances.extend(self.draw.iter().map(|(i, _)| *i));
+                self.slots_view.extend(self.draw.iter().map(|(_, s)| *s));
+                // 实例缓冲复用:容量不足才重建(扩容翻倍),否则原地 write。
+                let need = (n * size_of::<Instance>()).max(1);
+                if self.inst_buf.is_none() || self.inst_cap < n {
+                    self.inst_cap = n * 2;
+                    self.inst_buf = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("player-instances"),
+                        size: (self.inst_cap * size_of::<Instance>()) as u64,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                }
+                let buf = self.inst_buf.as_ref().expect("inst buf");
+                self.queue.write_buffer(buf, 0, bytemuck::cast_slice(&self.instances));
+                pass.set_vertex_buffer(0, buf.slice(..(need as u64)));
                 // 按槽位分组 draw(槽 → bind group 一一对应,与主仓 ptr::eq
                 // 分组同语义)。
                 let mut start = 0;
-                for i in 1..=slots.len() {
-                    if i == slots.len() || slots[i] != slots[start] {
-                        pass.set_bind_group(0, self.bind(slots[start]), &[]);
+                for i in 1..=self.slots_view.len() {
+                    if i == self.slots_view.len() || self.slots_view[i] != self.slots_view[start] {
+                        pass.set_bind_group(0, self.bind(self.slots_view[start]), &[]);
                         pass.draw(0..4, start as u32..i as u32);
                         start = i;
                     }

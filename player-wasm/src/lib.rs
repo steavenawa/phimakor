@@ -41,6 +41,8 @@ mod wasm {
         static LATEST: RefCell<Option<crate::snap::Snapshot>> = const { RefCell::new(None) };
         /// 待上传纹理(槽位, 名字, PNG 字节;rAF 帧内上传)。
         static TEX_QUEUE: RefCell<Vec<(u8, String, Vec<u8>)>> = const { RefCell::new(Vec::new()) };
+        /// 纹理槽位计数(协议:槽位按发送顺序隐式,从 1 起;0xFF 结束重置)。
+        static TEX_SLOT: Cell<u8> = const { Cell::new(1) };
         /// 流模式:true 后不再画内嵌测试快照,只画 WS 帧。
         static STREAM_MODE: Cell<bool> = const { Cell::new(false) };
     }
@@ -66,11 +68,21 @@ mod wasm {
     }
 
     /// JS → wasm:一帧纹理字节(PROTOCOL.md 0x00 / 0xFF),解析后入队。
+    /// 槽位按接收顺序计数(从 1 起;0xFF 重置)——桌面端 0x00 帧的标签
+    /// 不是槽号,曾把所有纹理传进槽 0(音符全回退白色,用户实测"全是 hold")。
     #[wasm_bindgen]
     pub fn handle_texture(data: &[u8]) {
         match crate::snap::parse_texture_frame(data) {
-            Some((slot, name, png)) => TEX_QUEUE.with(|q| q.borrow_mut().push((slot, name, png))),
-            None => log("texture frame parse failed"),
+            Some((0x00, name, png)) => {
+                let slot = TEX_SLOT.with(|s| {
+                    let v = s.get();
+                    s.set(v + 1);
+                    v
+                });
+                TEX_QUEUE.with(|q| q.borrow_mut().push((slot, name, png)));
+            }
+            Some((0xFF, _, _)) => TEX_SLOT.with(|s| s.set(1)),
+            _ => log("texture frame parse failed"),
         }
     }
 
