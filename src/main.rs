@@ -1315,6 +1315,9 @@ impl State {
         }
         if let Some(img) = &bg {
             self.renderer.set_background_prepared(&img.tex, bg_dim);
+        } else {
+            // 无插图谱面:清掉旧背景,否则上一首的背景残留(用户实测)。
+            self.renderer.clear_background();
         }
         // 音频已在后台线程就绪(spawn_audio_thread 的 ready 等待不阻塞主线程)。
         // 加载/预载期间保持暂停(PMCORE-71:悬停不播音乐),进入编辑器恢复播放。

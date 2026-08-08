@@ -1681,6 +1681,12 @@ impl Renderer {
         self.background_dim = dim;
     }
 
+    /// 清掉背景(切到无插图的谱面时调用,否则旧背景残留)。
+    pub fn clear_background(&mut self) {
+        self.background = None;
+        self.background_dim = 1.0;
+    }
+
     /// Build this frame's draw list and execute the render pass into `view`
     /// (window surface view or offscreen target). Submits on the internal
     /// queue; the caller presents (window path) or copies out (preview path).
