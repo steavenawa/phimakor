@@ -52,6 +52,9 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32, Option<
     let re_uniform_var =
         regex::Regex::new(r"uniform\s+(float|int|uint|bool|vec[234]|ivec[234]|uvec[234]|bvec[234]|mat[234])\s+(\w+)\s*;").unwrap();
     let re_default = regex::Regex::new(r"%\s*([-0-9.]+)\s*%").unwrap();
+    // GLSL 450 保留字 `sample`(ES100 合法,常见变量名)——词法级重命名,
+    // `\bsample\b` 不会误伤 sampler2D/screenTexture_smp/rawSampleA。
+    let re_sample_word = regex::Regex::new(r"\bsample\b").unwrap();
     // 第一遍:收集非 sampler uniform 变量(声明顺序 = uniform_values 顺序)。
     let mut vars: Vec<(String, String, Option<f32>)> = Vec::new();
     for line in src.lines() {
@@ -88,6 +91,10 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32, Option<
             .replace("varying", "in")
             .replace("attribute", "in")
             .replace("gl_FragColor", "fragColor_out");
+        // ES100 的 distance 有 float 重载(GLSL 450 只接受 vec)——标量
+        // distance(a,b) 降为 abs(a-b),否则提升到 450 后 glslang 编译
+        // 失败(用户谱面 scene_beam_transition.glsl 实测:特效被跳过)。
+        l = lower_scalar_distance(&l);
         if t.starts_with("uniform ") {
             if let Some(caps) = re_sampler.captures(t) {
                 let (ty, tex_name) = (caps[1].to_string(), caps[2].to_string());
@@ -109,6 +116,8 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32, Option<
                 .replace_all(&l, "texture(sampler2D($1, ${1}_smp),")
                 .into_owned();
         }
+        // 450 保留字 `sample`(ES100 变量名)重命名,否则 glslang 编译失败。
+        l = re_sample_word.replace_all(&l, "sample_").into_owned();
         out.push_str(&l);
         out.push('\n');
     }
@@ -138,6 +147,63 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32, Option<
         out.insert_str(ver.len(), &block_src);
     }
     (out, uniform_count, layout)
+}
+
+/// 标量 distance 降级:ES100 的 `distance(float,float)` 在 GLSL 450 不存在,
+/// 逐处配平括号提取参数,两个参数都"不是向量"时替换为 `abs(a-b)`。
+/// 启发式:参数文本含 `vec`(vec2/vec3/vec4 构造或变量名带 vec)或
+/// `texture` 视为向量调用,保守保留。
+fn lower_scalar_distance(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i < line.len() {
+        if line[i..].starts_with("distance(") {
+            let open = i + "distance(".len() - 1; // '(' 的位置
+            // 配平括号找到匹配的 ')'。
+            let mut depth = 1usize;
+            let mut j = open + 1;
+            while j < line.len() && depth > 0 {
+                match bytes[j] {
+                    b'(' => depth += 1,
+                    b')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            if depth == 0 {
+                let inner = &line[open + 1..j - 1];
+                // 顶层逗号分割两参数(嵌套括号内不算)。
+                let mut d = 0i32;
+                let mut split = None;
+                for (k, ch) in inner.char_indices() {
+                    match ch {
+                        '(' => d += 1,
+                        ')' => d -= 1,
+                        ',' if d == 0 => { split = Some(k); break; }
+                        _ => {}
+                    }
+                }
+                let scalar = |s: &str| !s.contains("vec") && !s.contains("texture");
+                if let Some(k) = split {
+                    let (a, b) = (inner[..k].trim(), inner[k + 1..].trim());
+                    if scalar(a) && scalar(b) {
+                        out.push_str(&format!("abs({a}-{b})"));
+                        i = j;
+                        continue;
+                    }
+                }
+            }
+            // 不降级:原样复制 distance( 前缀。
+            out.push_str("distance(");
+            i = open + 1;
+        } else {
+            let ch = line[i..].chars().next().expect("non-empty");
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
 }
 
 /// A single active effect instance (from extra.json).
@@ -1227,6 +1293,67 @@ void main() {
         assert!(converted.contains("    float power;"));
         assert!(converted.contains("texture(sampler2D(u_tex, u_tex_smp), v_uv)"));
         let _ = compile(converted, glslang::ShaderStage::Fragment);
+    }
+
+    /// 回归(用户谱面 Designant):ES100 shader 用 `distance(float,float)`
+    /// (ES 1.00 合法,GLSL 450 只接受 vec)——提升后 glslang 编译失败,
+    /// 特效被跳过。转换器必须把标量 distance 降为 abs(a-b)。
+    #[test]
+    fn es100_scalar_distance_compiles_after_lowering() {
+        let frag = r#"#version 100
+precision mediump float;
+varying vec2 uv;
+uniform sampler2D screenTexture;
+uniform float progress; // %0% 0..1
+float rand(float n){return fract(sin(n)*43758.5453123);}
+void main()
+{
+    vec4 col=texture2D(screenTexture,uv);
+    const float distanceBetween=.1;
+    const float waveFreq=50.;
+    const float waveFreq2=70.;
+    const float waveIntensityMax=.05;
+    float y=uv.y;
+    float ySin1=sin(y*waveFreq)*waveIntensityMax;
+    float ySin2=sin(y*waveFreq2)*waveIntensityMax;
+    float ySin=(ySin1*.5)+(ySin2*.5);
+    float targetX=progress+ySin+(((y*2.)-1.));
+    float dist=distance(min(targetX,uv.x),targetX);
+    vec4 sample;
+    sample=texture2D(screenTexture,uv);
+    float rawSampleA=sample.a;
+    if(dist<.05&&rawSampleA>.001){
+        float withinDist=distance(dist,.025)/.025;
+        float barA=1.-(pow(withinDist,.65));
+        vec4 barResult=vec4(1.,1.,1.,1.)*barA;
+        sample=barResult;
+    }
+    else{
+        sample*=0.;
+    }
+    gl_FragColor=sample;
+}
+"#;
+        let (converted, _count, _layout) = glsl_for_glslang(frag);
+        let compiler = glslang::Compiler::acquire().unwrap();
+        // 与 build_eff_pipe_glsl 相同的编译闭包,但保留错误日志。
+        let compile = |src: String, stage: glslang::ShaderStage| -> Result<Vec<u32>, String> {
+            let source = glslang::ShaderSource::from(src);
+            let input = glslang::ShaderInput::new(
+                &source,
+                stage,
+                &glslang::CompilerOptions::default(),
+                None::<&[(&str, Option<&str>)]>,
+                None,
+            )
+            .map_err(|e| format!("input: {e:?}"))?;
+            let shader = compiler.create_shader(input).map_err(|e| format!("create: {e:?}"))?;
+            shader.compile().map_err(|e| format!("compile: {e:?}"))
+        };
+        match compile(converted, glslang::ShaderStage::Fragment) {
+            Ok(_) => {}
+            Err(e) => panic!("scene_beam_transition 类 shader(distance(float,float))编译失败: {e}"),
+        }
     }
 
     #[test]
