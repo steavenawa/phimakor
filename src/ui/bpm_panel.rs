@@ -48,9 +48,17 @@ pub fn build_form(
 }
 
 /// 从表单提取当前 `(beat, bpm)` 行数据(回写用)。
+/// label 形如 `b{beat:.2} @ {sec:.2}s`(Add 新行是 `var{n}`,解析失败归 0)。
 pub fn rows_of(form: &RealtimeForm) -> Vec<(f64, f64)> {
     form.rows.iter().map(|(label, ctrl)| {
-        let beat = label.trim_start_matches('@').parse::<f64>().unwrap_or(0.0);
+        // 解析 `b` 前缀 + 第一个 `@` 前的 beat 部分(旧实现直接 parse 整个
+        // label,新格式下全部失败 → beat 归 0 → bpm_apply 把每段起始拍
+        // 改成 0,谱面 BPM 全乱——用户实测"面板点不开/功能有问题")。
+        let beat = label
+            .strip_prefix('b')
+            .and_then(|s| s.split('@').next())
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .unwrap_or(0.0);
         let bpm = match ctrl {
             RTControl::Number { value, .. } => *value,
             _ => 0.0,
@@ -144,6 +152,28 @@ mod tests {
             assert!((a.rect.1 - expect_y).abs() < 1e-4);
         }
         assert!(areas.iter().any(|a| a.id.0 == 4)); // Add
+    }
+
+    /// 回归:label 新格式 `b{beat} @ {sec}s` 下 rows_of 必须还原 beat
+    /// (旧实现直接 parse 整个 label,全部失败 → beat 归 0 → bpm_apply
+    /// 把每段起始拍改成 0,谱面 BPM 全乱——用户实测)。
+    #[test]
+    fn rows_of_roundtrips_new_label_format() {
+        let rows = vec![(0.0, 120.0), (4.0, 90.0), (8.5, 150.0)];
+        let secs = vec![0.0, 2.5, 6.0];
+        let form = build_form(0.0, 0.0, 300.0, &rows, &secs, None, None, 1.0);
+        let out = rows_of(&form);
+        assert_eq!(out.len(), 3);
+        for (i, (beat, bpm)) in out.iter().enumerate() {
+            let (eb, ep) = rows[i];
+            assert!((beat - eb).abs() < 1e-9, "row {i}: beat {beat} != {eb}");
+            assert!((bpm - ep).abs() < 1e-9, "row {i}: bpm {bpm} != {ep}");
+        }
+        // Add 新行("var{n}")解析失败归 0(bpm_apply 的增行逻辑兜底)。
+        let mut f = form.clone();
+        f.add_row("var1", RTControl::Number { value: 120.0, step: 1.0, min: 1.0, max: 1000.0, last_x: 0.0, buf: None });
+        let out = rows_of(&f);
+        assert_eq!(out.last().unwrap().0, 0.0);
     }
 }
 
