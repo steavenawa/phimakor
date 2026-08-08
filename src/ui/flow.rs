@@ -351,7 +351,7 @@ impl PanelTransform {
     /// 音符面板左缘 x(命中/绘制/ghost 共用;等价 mod.rs 的 panel_x 链)。
     /// 两个时间轴横排:notes 在 events 左侧,events 在 properties 左侧——
     /// 双面板同开时命中区必须同样左移,否则 notes 区域压在 events 上
-    /// (用户实测:event 面板响应 notes 位置)。
+    /// 。
     pub fn panel_x(&self) -> f32 {
         let props_x = self.w - self.props_progress * PANEL_W * self.s;
         props_x - self.events_progress * TL_W * self.s - self.notes_progress * NT_W * self.s
@@ -687,7 +687,7 @@ mod tests {
 
     /// 双面板同开布局:notes 面板左移必须含 events 面板宽度(命中=绘制)。
     /// 回归:旧公式只减 notes 宽,双面板同开时 notes 命中区右移一个
-    /// TL_W,压在 events 面板上(用户实测:event 面板响应 notes 位置)。
+    /// TL_W,压在 events 面板上。
     #[test]
     fn panel_x_accounts_for_events_panel_when_both_open() {
         let s = 1.0;

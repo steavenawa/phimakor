@@ -93,7 +93,7 @@ fn glsl_for_glslang(src: &str) -> (String, usize, Vec<(String, u32, u32, Option<
             .replace("gl_FragColor", "fragColor_out");
         // ES100 的 distance 有 float 重载(GLSL 450 只接受 vec)——标量
         // distance(a,b) 降为 abs(a-b),否则提升到 450 后 glslang 编译
-        // 失败(用户谱面 scene_beam_transition.glsl 实测:特效被跳过)。
+        // 失败(自定义特效被跳过)。
         l = lower_scalar_distance(&l);
         if t.starts_with("uniform ") {
             if let Some(caps) = re_sampler.captures(t) {
@@ -223,14 +223,19 @@ pub struct ActiveEffect {
     pub uniforms_names: Vec<String>,
     /// How many leading elements of `uniform_values` are meaningful.
     pub uniform_count: usize,
+    /// 特效作用的 z 层范围 `(min, max)`:渲染端按此生成遮罩,特效结果
+    /// 只与遮罩区域混合;`None` = 全屏。
+    pub target_range: Option<(f32, f32)>,
 }
 
 /// Ping-pong pair + per-effect GPU pipelines.
 pub struct PostPipe {
     /// Ping-pong colour targets (alternate read/write for multi-pass effects).
-    pub(crate) targets: [Option<wgpu::Texture>; 2],
+    /// 3 张:带 z 遮罩的特效 = run_effect 写一张 + blend 写第三张(环形轮转,
+    /// 避免 blend 自读自写)。
+    pub(crate) targets: [Option<wgpu::Texture>; 3],
     /// Texture views for the ping-pong targets.
-    pub(crate) target_views: [Option<wgpu::TextureView>; 2],
+    pub(crate) target_views: [Option<wgpu::TextureView>; 3],
     /// Index of the target holding the last effect output (set by apply()).
     last_output: usize,
 
@@ -256,6 +261,14 @@ pub struct PostPipe {
     pub blit_pipeline: Option<wgpu::RenderPipeline>,
     /// Cached blit bind groups keyed by (SrcTag, use_half_sampler).
     blit_bgs: HashMap<(SrcTag, bool), wgpu::BindGroup>,
+
+    // ── z 层遮罩(targetRange):特效结果只与目标 z 层的形状混合 ──
+    /// 遮罩纹理池(range 位模式 → 纹理;内容由 Renderer 每帧重渲染)。
+    masks: HashMap<(u32, u32), (wgpu::Texture, wgpu::TextureView)>,
+    /// mask 混合管线(prev + fx + mask → out)。
+    mask_blend_pipeline: Option<wgpu::RenderPipeline>,
+    /// mask 混合绑定组布局(创建绑定组用)。
+    mask_blend_bgl: Option<wgpu::BindGroupLayout>,
 
     /// Active effects for the current frame.
     pub active: Vec<ActiveEffect>,
@@ -410,8 +423,8 @@ impl PostPipe {
             cache,
         }));
         let mut pipe = PostPipe {
-            targets: [None, None],
-            target_views: [None, None],
+            targets: [None, None, None],
+            target_views: [None, None, None],
             last_output: 0,
             half_targets: [None, None],
             half_views: [None, None],
@@ -420,6 +433,9 @@ impl PostPipe {
             half_sampler,
             blit_pipeline,
             blit_bgs: HashMap::new(),
+            masks: HashMap::new(),
+            mask_blend_pipeline: None,
+            mask_blend_bgl: None,
             pipelines: HashMap::new(),
             chart_dir: None,
             active: Vec::new(),
@@ -428,6 +444,69 @@ impl PostPipe {
             failed_custom: HashSet::new(),
             width: 0, height: 0, tex_format: tex_fmt, chart_time: 0.0,
         };
+        // mask 混合管线:prev + fx + mask 三纹理输入,out = prev*(1-mask) + fx*mask。
+        let blend_frag = r"
+@group(0) @binding(0) var prev_tex: texture_2d<f32>;
+@group(0) @binding(1) var prev_smp: sampler;
+@group(0) @binding(2) var fx_tex: texture_2d<f32>;
+@group(0) @binding(3) var fx_smp: sampler;
+@group(0) @binding(4) var mask_tex: texture_2d<f32>;
+@group(0) @binding(5) var mask_smp: sampler;
+@fragment fn fs_main(@location(0) uv: vec2f) -> @location(0) vec4f {
+    let prev = textureSample(prev_tex, prev_smp, uv);
+    let fx = textureSample(fx_tex, fx_smp, uv);
+    let m = textureSample(mask_tex, mask_smp, uv).r;
+    return mix(prev, fx, m);
+}
+";
+        let blend_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("mask-blend"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(
+                String::from(crate::render::shaders::VERT) + blend_frag
+            )),
+        });
+        let blend_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mask-blend-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 5, visibility: wgpu::ShaderStages::FRAGMENT, ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), count: None },
+            ],
+        });
+        let blend_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("mask-blend-pl"),
+            bind_group_layouts: &[Some(&blend_bgl)],
+            ..Default::default()
+        });
+        pipe.mask_blend_pipeline = Some(device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("mask-blend-pipe"),
+            layout: Some(&blend_pl),
+            vertex: wgpu::VertexState {
+                module: &blend_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &blend_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: tex_fmt,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
+        }));
+        pipe.mask_blend_bgl = Some(blend_bgl);
         pipe.resize(device, width, height);
         pipe
     }
@@ -439,6 +518,7 @@ impl PostPipe {
         // Old texture views are dropped — cached bind groups referencing
         // them must go too, otherwise the old targets can never be freed.
         self.blit_bgs.clear();
+        self.masks.clear(); // 尺寸变化,遮罩纹理重建
         for ep in self.pipelines.values_mut() {
             ep.screen_bgs.clear();
         }
@@ -849,16 +929,16 @@ impl PostPipe {
         }
 
         // Phase 1: ensure all pipelines exist
-        // Copy active descriptors: (pipeline_key, uniform_values, uniform_names)
-        let descriptors: Vec<(String, Vec<f32>, Vec<String>)> = active.iter().map(|ae| {
+        // Copy active descriptors: (pipeline_key, uniform_values, uniform_names, z_range)
+        let descriptors: Vec<(String, Vec<f32>, Vec<String>, Option<(f32, f32)>)> = active.iter().map(|ae| {
             let key = if ae.shader_idx < usize::MAX {
                 EFFECTS.get(ae.shader_idx).map(|d| d.name.to_string()).unwrap_or_default()
             } else {
                 ae.custom_name.clone().unwrap_or_default()
             };
-            (key, ae.uniform_values.clone(), ae.uniforms_names.clone())
+            (key, ae.uniform_values.clone(), ae.uniforms_names.clone(), ae.target_range)
         }).collect();
-        for (key, _, _) in &descriptors {
+        for (key, _, _, _) in &descriptors {
             if let Some(def) = EFFECTS.iter().find(|d| d.name == key.as_str()) {
                 self.ensure_effect(device, def, cache);
             } else if !key.is_empty() {
@@ -866,34 +946,53 @@ impl PostPipe {
             }
         }
 
-        // Phase 2: execute effects. `write_idx` toggles 0/1 between effects
-        // (local only — no persistent state to get out of sync).
+        // Phase 2: execute effects. `write_idx` 在 3 张 target 间环形轮转:
+        // 普通特效 run_effect 写一张;带 z 遮罩的特效再 blend 写第三张
+        // (避免自读自写:prev 与 fx 同时被读时输出必须落在第三个槽)。
         //
         // 半分辨率段:带宽型特效(glitch/chromatic/blur 类)在 W/2×H/2 target
         // 上跑,省 ~75% 像素带宽;连续 half-res 特效只做一次降采样和一次
-        // 升采样(段内直接 ping-pong 半分辨率 target)。
+        // 升采样(段内直接 ping-pong 半分辨率 target)。带 z 遮罩的特效
+        // 强制全分辨率(blend 需要全分辨率 mask,半分辨率段不参与)。
         // `read_view` 是 owned clone(wgpu::TextureView 内部 Arc,clone 廉价),
         // 避免跨迭代的借用链。
         let mut read_view: wgpu::TextureView = src.clone();
         let mut read_tag = SrcTag::Scene;
         let half_res = self.half_res_enabled;
         let mut write_idx = 0usize;
+        let mut last_written = 0usize;
         let mut i = 0usize;
         while i < descriptors.len() {
-            if !(half_res && effect_is_half_res(&descriptors[i].0)) {
-                let (key, uv, names) = &descriptors[i];
+            let halfable = half_res && effect_is_half_res(&descriptors[i].0) && descriptors[i].3.is_none();
+            if !halfable {
+                let (key, uv, names, range) = &descriptors[i];
                 let write_view = self.target_views[write_idx].as_ref().unwrap().clone();
-                write_idx = 1 - write_idx;
+                write_idx = (write_idx + 1) % 3;
                 if self.run_effect(encoder, device, queue, key, uv, names, &read_view, &write_view, read_tag) {
-                    read_view = write_view;
-                    read_tag = SrcTag::Full((1 - write_idx) as u8);
+                    if let Some(r) = range {
+                        // 遮罩混合:out = prev*(1-mask) + fx*mask → 第三张。
+                        let out = self.target_views[write_idx].as_ref().unwrap().clone();
+                        write_idx = (write_idx + 1) % 3;
+                        let mask = self.mask_view(device, *r).clone();
+                        self.blend_masked(encoder, device, &read_view, &write_view, &mask, &out);
+                        read_view = out;
+                        last_written = (write_idx + 2) % 3;
+                    } else {
+                        read_view = write_view;
+                        last_written = (write_idx + 2) % 3;
+                    }
+                    read_tag = SrcTag::Full(last_written as u8);
                 } else {
-                    write_idx = 1 - write_idx; // roll back; keep read_view
+                    write_idx = (write_idx + 2) % 3; // roll back; keep read_view
                 }
                 i += 1;
             } else {
                 let mut j = i + 1;
-                while j < descriptors.len() && half_res && effect_is_half_res(&descriptors[j].0) {
+                while j < descriptors.len()
+                    && half_res
+                    && effect_is_half_res(&descriptors[j].0)
+                    && descriptors[j].3.is_none()
+                {
                     j += 1;
                 }
                 // Downscale: current full-res output → half-res ping-pong[0].
@@ -902,7 +1001,7 @@ impl PostPipe {
                 let mut h_read: wgpu::TextureView = h0;
                 let mut h_read_tag = SrcTag::Half(0);
                 let mut h_write = 1usize;
-                for (key, uv, names) in descriptors.iter().take(j).skip(i) {
+                for (key, uv, names, _) in descriptors.iter().take(j).skip(i) {
                     let wv = self.half_views[h_write].as_ref().unwrap().clone();
                     h_write = 1 - h_write;
                     if self.run_effect(encoder, device, queue, key, uv, names, &h_read, &wv, h_read_tag) {
@@ -914,17 +1013,15 @@ impl PostPipe {
                 }
                 // Upscale: last half-res output → full-res ping-pong slot.
                 let fw = self.target_views[write_idx].as_ref().unwrap().clone();
-                write_idx = 1 - write_idx;
+                write_idx = (write_idx + 1) % 3;
                 self.blit(encoder, device, &h_read, &fw, h_read_tag);
                 read_view = fw;
-                read_tag = SrcTag::Full((1 - write_idx) as u8);
+                last_written = (write_idx + 2) % 3;
+                read_tag = SrcTag::Full(last_written as u8);
                 i = j;
             }
         }
-        // After the loop, `write_idx` points at the slot that was NOT written
-        // last (it toggled after the final write); the last output is the
-        // other one.
-        self.last_output = 1 - write_idx;
+        self.last_output = last_written;
     }
 
     /// Run one effect pass: bind screen + uniform groups, draw the full-screen
@@ -1085,6 +1182,58 @@ impl PostPipe {
         true
     }
 
+    /// z 层遮罩纹理视图(range → 纹理,创建即缓存;内容由 Renderer 每帧
+    /// 重渲染——特效执行前调用 [`Self::mask_view`] 拿目标,画白色场景)。
+    pub fn mask_view(&mut self, device: &wgpu::Device, range: (f32, f32)) -> &wgpu::TextureView {
+        let key = (range.0.to_bits(), range.1.to_bits());
+        if !self.masks.contains_key(&key) {
+            let tex = Self::make_target(device, self.width, self.height, "post-mask", self.tex_format);
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            self.masks.insert(key, (tex, view));
+        }
+        &self.masks.get(&key).expect("mask just inserted").1
+    }
+
+    /// 遮罩混合:out = prev*(1-mask) + fx*mask。prev/fx 同全分辨率采样器。
+    /// 绑定组每调用新建(prev/fx 视图每帧变化,缓存 key 不稳)。
+    fn blend_masked(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        device: &wgpu::Device,
+        prev: &wgpu::TextureView,
+        fx: &wgpu::TextureView,
+        mask: &wgpu::TextureView,
+        out: &wgpu::TextureView,
+    ) {
+        let Some(pl) = &self.mask_blend_pipeline else { return };
+        let Some(bgl) = &self.mask_blend_bgl else { return };
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mask-blend-bg"),
+            layout: bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(prev) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(fx) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(mask) },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("mask-blend"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: out,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(pl);
+        pass.set_bind_group(0, &bg, &[]);
+        pass.draw(0..3, 0..1);
+    }
+
     /// Copy `src` into `dst` with the passthrough blit pipeline. Used for the
     /// no-op shortcut and for down/upscaling around half-resolution effect
     /// runs. Bind groups are cached per (SrcTag, half-sampler) pair.
@@ -1205,6 +1354,7 @@ mod tests {
             shader_idx: si,
             custom_name: None,
             priority: 0,
+            target_range: None,
             uniform_values: vals.to_vec(),
             uniform_count: vals.len(),
             uniforms_names: Vec::new(),
@@ -1226,6 +1376,7 @@ mod tests {
             shader_idx: usize::MAX,
             custom_name: Some("x.frag".into()),
             priority: 0,
+            target_range: None,
             uniform_values: vec![0.0],
             uniform_count: 1,
             uniforms_names: Vec::new(),

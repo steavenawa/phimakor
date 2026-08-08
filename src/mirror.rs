@@ -62,7 +62,7 @@ impl MirrorServer {
         let listener = TcpListener::bind(("0.0.0.0", MIRROR_PORT))
             .map_err(|e| format!("镜像服务启动失败(端口 {MIRROR_PORT}): {e}"))?;
         // TLS(自签):WebGPU 要求 secure context,局域网 IP 的纯 http 会被
-        // 浏览器禁用 navigator.gpu(用户实测)。自签生成失败则退 http 模式
+        // 浏览器禁用 navigator.gpu。自签生成失败则退 http 模式
         // (localhost 调试仍可用)。
         let tls = make_tls_config();
         let tls = match &tls {
@@ -107,7 +107,7 @@ impl MirrorServer {
                                     handle_conn(&mut s, s2, q2, snap3, ctrl3, sl2, cd2, mn2);
                                     // TLS 1.3 必须显式发 close_notify:否则客户端
                                     // 视为截断错误(浏览器 ERR_CONTENT_LENGTH_MISMATCH,
-                                    // wasm 编译中止——用户实测)。
+                                    // wasm 编译中止)。
                                     s.conn.send_close_notify();
                                     let _ = flush_nb(&mut s);
                                     return;
@@ -335,7 +335,7 @@ fn handle_conn<T: Read + Write>(
 /// 非阻塞语义下的全量写入(WouldBlock 轮询重试——TcpStream 被设为
 /// 非阻塞后,大块写入(wasm 1~2MB)会撞内核缓冲 WouldBlock,普通
 /// write_all 直接 Err → 响应截断(浏览器 ERR_CONTENT_LENGTH_MISMATCH,
-/// 用户实测 wasm 编译中止)。
+/// wasm 编译中止)。
 fn write_all_nb<T: Write>(stream: &mut T, mut buf: &[u8]) -> std::io::Result<()> {
     while !buf.is_empty() {
         match stream.write(buf) {

@@ -96,7 +96,7 @@ pub(crate) fn font_for(ch: char) -> Option<&'static fontdue::Font> {
 
 /// 预热 CJK 字体槽(启动时调用一次)。首次中文绘制会同步读盘+解析
 /// msyh.ttc(~20MB,约 200ms),若发生在主线程绘制路径(加载屏谱名/
-/// splash 列表)会把窗口"堵死"(用户实测:字体把加载路径堵住)。
+/// splash 列表)会把窗口"堵死"(字体加载阻塞绘制路径)。
 /// 启动时预热后,所有路径的 font_for 零阻塞(OnceLock 已填充)。
 /// 只触发第一个覆盖中文的槽位('中' 走 CJK 链,msyh 优先命中)。
 pub fn warmup_cjk() {

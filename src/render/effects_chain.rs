@@ -37,6 +37,7 @@ fn resolve_one(e: &EvalEffect, chart_time: f64, screen: (f32, f32)) -> Vec<Activ
             shader_idx: usize::MAX,
             custom_name: Some(e.shader_name.clone()),
             priority: e.priority,
+            target_range: e.target_range.clone().map(|r| (r.min_z_index, r.max_z_index)),
             uniform_values: e.uniforms.clone(),
             uniform_count: e.uniforms.len(),
             uniforms_names: e.uniforms_names.clone(),
@@ -52,6 +53,7 @@ fn resolve_one(e: &EvalEffect, chart_time: f64, screen: (f32, f32)) -> Vec<Activ
             shader_idx: si,
             custom_name: None,
             priority: e.priority,
+            target_range: e.target_range.clone().map(|r| (r.min_z_index, r.max_z_index)),
             uniform_values: uv,
             uniform_count: uc,
             uniforms_names: Vec::new(),
@@ -64,6 +66,7 @@ fn resolve_one(e: &EvalEffect, chart_time: f64, screen: (f32, f32)) -> Vec<Activ
             shader_idx: ssi,
             custom_name: None,
             priority: e.priority,
+            target_range: e.target_range.clone().map(|r| (r.min_z_index, r.max_z_index)),
             uniform_values: uv,
             uniform_count: uc,
             uniforms_names: Vec::new(),
@@ -133,6 +136,7 @@ mod tests {
             shader: shader.to_string(),
             global: true,
             priority: 0,
+            target_range: None,
             vars: vars.into_iter()
                 .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
                 .collect(),

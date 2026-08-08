@@ -53,7 +53,7 @@ pub fn rows_of(form: &RealtimeForm) -> Vec<(f64, f64)> {
     form.rows.iter().map(|(label, ctrl)| {
         // 解析 `b` 前缀 + 第一个 `@` 前的 beat 部分(旧实现直接 parse 整个
         // label,新格式下全部失败 → beat 归 0 → bpm_apply 把每段起始拍
-        // 改成 0,谱面 BPM 全乱——用户实测"面板点不开/功能有问题")。
+        // 改成 0,谱面 BPM 全乱)。
         let beat = label
             .strip_prefix('b')
             .and_then(|s| s.split('@').next())
@@ -156,7 +156,7 @@ mod tests {
 
     /// 回归:label 新格式 `b{beat} @ {sec}s` 下 rows_of 必须还原 beat
     /// (旧实现直接 parse 整个 label,全部失败 → beat 归 0 → bpm_apply
-    /// 把每段起始拍改成 0,谱面 BPM 全乱——用户实测)。
+    /// 把每段起始拍改成 0,谱面 BPM 全乱)。
     #[test]
     fn rows_of_roundtrips_new_label_format() {
         let rows = vec![(0.0, 120.0), (4.0, 90.0), (8.5, 150.0)];

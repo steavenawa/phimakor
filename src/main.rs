@@ -913,6 +913,7 @@ impl State {
             shader: name,
             global: true,
             priority: 0,
+            target_range: None,
             vars,
         });
         // Select the freshly added effect (its row after the start-beat sort).
@@ -1316,7 +1317,7 @@ impl State {
         if let Some(img) = &bg {
             self.renderer.set_background_prepared(&img.tex, bg_dim);
         } else {
-            // 无插图谱面:清掉旧背景,否则上一首的背景残留(用户实测)。
+            // 无插图谱面:清掉旧背景,否则上一首的背景残留。
             self.renderer.clear_background();
         }
         // 音频已在后台线程就绪(spawn_audio_thread 的 ready 等待不阻塞主线程)。
@@ -2061,7 +2062,7 @@ impl State {
         }
         // 编辑器模式:面板文本输入(Chart 元信息 / Eff / BPM / Settings)。
         // 候选窗粗定位到属性面板区域(行级跟随需要绘制侧几何回传,暂不做;
-        // ponytail: 面板级足够用,行级候选窗位置等用户反馈再跟进)。
+        // ponytail: 面板级足够用,行级候选窗位置等后续需求再跟进)。
         if self.show_properties {
             let vw = self.window.inner_size().width as f32;
             let pp = self.overlay.props_progress();
@@ -5150,7 +5151,7 @@ fn main() -> anyhow::Result<()> {
     }
     let el = EventLoop::new()?;
     // 预热 CJK 字体:首次中文绘制(加载屏谱名/splash 列表)在绘制路径
-    // 同步加载 ~20MB 字体,会把切谱/启动堵死(用户实测)。启动时一次性
+    // 同步加载 ~20MB 字体,会把切谱/启动堵死。启动时一次性
     // 加载,之后所有路径的 font_for 零阻塞。
     ui::font::warmup_cjk();
     el.set_control_flow(ControlFlow::Poll);

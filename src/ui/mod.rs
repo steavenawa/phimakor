@@ -655,7 +655,7 @@ impl IcedOverlay {
         self.flow.on_mouse(x as f32, y as f32, &buttons, self.flow_mods);
         self.flow.resolve();
         // hover 变化必须立即置重绘标志:否则关掉 custom cursor 后(cursor_dirty
-        // 不再每帧强制 render_iced)面板/音符高亮永不刷新(用户实测)。检测放在
+        // 不再每帧强制 render_iced)面板/音符高亮永不刷新。检测放在
         // 事件时而非 dirty 门控路径里——放在后者是鸡生蛋(要 dirty 才会检测)。
         if self.flow.hover != prev_hover {
             self.hover_dirty = true;

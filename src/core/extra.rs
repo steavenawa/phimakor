@@ -36,6 +36,15 @@ pub struct ExtraBpmItem {
     pub bpm: f64,
 }
 
+/// 特效作用的 z 层范围(RPE `targetRange`):只有 z_order 落在
+/// [min_z_index, max_z_index] 的线/音符会被该特效影响。缺失 = 全屏。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetRange {
+    pub min_z_index: f32,
+    pub max_z_index: f32,
+}
+
 /// A post-processing effect definition loaded from extra.json.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,6 +61,11 @@ pub struct ExtraEffect {
     /// Render priority (lower values are processed first).
     #[serde(default)]
     pub priority: u32,
+    /// 特效作用的 z 层范围(缺失 = 全屏;渲染端按此生成遮罩,
+    /// 否则非 global 特效被无差别全屏应用,恒黑类特效会把整个画面
+    /// 抹黑)。
+    #[serde(default)]
+    pub target_range: Option<TargetRange>,
     /// Keyframed uniform variable values.
     #[serde(default)]
     pub vars: HashMap<String, serde_json::Value>,
@@ -80,6 +94,8 @@ pub struct EvalEffect {
     pub global: bool,
     /// Render priority for ordering.
     pub priority: u32,
+    /// 特效作用的 z 层范围(缺失 = 全屏,渲染端生成遮罩用)。
+    pub target_range: Option<TargetRange>,
     /// Flat uniform values computed at the current beat.
     pub uniforms: Vec<f32>,
     /// Variable names corresponding to each uniform value.
@@ -107,6 +123,7 @@ pub fn evaluate_effects(root: &ExtraRoot, beat: f64) -> Vec<EvalEffect> {
             end_beat: eb,
             global: ef.global,
             priority: ef.priority,
+            target_range: ef.target_range.clone(),
             uniforms,
             uniforms_names,
         });
@@ -250,6 +267,7 @@ mod tests {
                 shader: "grayscale".to_string(),
                 global: true,
                 priority: 0,
+                target_range: None,
                 vars: HashMap::from([("factor".to_string(), serde_json::json!(0.5))]),
             }],
         };
@@ -264,6 +282,35 @@ mod tests {
         assert!((e.end.beats() - 8.0).abs() < 1e-9);
         assert!(e.global);
         assert_eq!(e.vars["factor"], 0.5);
+    }
+
+    #[test]
+    fn target_range_parsed_and_evaluated() {
+        // targetRange(minZIndex/maxZIndex)必须解析并透传到 EvalEffect:
+        // 之前字段缺失被 serde 静默丢弃,非 global 特效被无差别全屏应用
+        // (恒黑类特效把整个画面抹黑)。
+        let json = r#"{
+            "effects": [{
+                "start": [0,0,1],
+                "end": [10,0,1],
+                "shader": "/invis.glsl",
+                "global": false,
+                "targetRange": { "minZIndex": 8, "maxZIndex": 16 },
+                "vars": { "factor": 1.0 }
+            }]
+        }"#;
+        let root = parse_extra(json.as_bytes()).unwrap();
+        let e = &root.effects[0];
+        let r = e.target_range.as_ref().expect("targetRange 必须解析");
+        assert_eq!((r.min_z_index, r.max_z_index), (8.0, 16.0));
+        let active = evaluate_effects(&root, 5.0);
+        let ar = active[0].target_range.as_ref().expect("EvalEffect 透传 targetRange");
+        assert_eq!((ar.min_z_index, ar.max_z_index), (8.0, 16.0));
+        // roundtrip:序列化后字段保留。
+        let json2 = serde_json::to_string(&root).unwrap();
+        let back: ExtraRoot = serde_json::from_str(&json2).unwrap();
+        let r2 = back.effects[0].target_range.as_ref().unwrap();
+        assert_eq!((r2.min_z_index, r2.max_z_index), (8.0, 16.0));
     }
 
     #[test]

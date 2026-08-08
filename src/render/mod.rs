@@ -1000,7 +1000,7 @@ impl GpuTimers {
 
 /// 后台预压缩的纹理数据(load_chart_async 线程产出,主线程只做 GPU 上传)。
 /// 纯 CPU 步骤(尺寸限制 + Lanczos 降采样 + BC3 块压缩)全在后台,
-/// 避免切谱时主线程被大图压缩卡住(用户实测:加载路径堵死卡窗口)。
+/// 避免切谱时主线程被大图压缩卡住。
 #[derive(Clone)]
 pub struct PreparedTex {
     /// BC3 块(compressed)或 RGBA8 像素。
@@ -1016,6 +1016,90 @@ pub struct PreparedTex {
 }
 
 impl Renderer {
+    /// z 层遮罩渲染:只画 z_order ∈ range 的线(长条)+ 音符(方块),
+    /// 全部白色不透明——特效混合用的形状遮罩(targetRange 语义)。
+    /// 简化几何:线 = 线 quad,音符 = 方块(不拆 hold 三段,形状够用)。
+    fn render_mask(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        window_aspect: f32,
+        frame: &crate::core::FrameState,
+        range: (f32, f32),
+        mask_view: &wgpu::TextureView,
+    ) {
+        let aspect = self.playfield_aspect;
+        let (letterbox, _kx, _ky, ev_x, ev_y) = letterbox_transform(window_aspect, aspect);
+        let mut inst: Vec<Instance> = Vec::new();
+        let white = [1.0, 1.0, 1.0, 1.0];
+        for line in frame.lines.iter().filter(|l| {
+            let z = l.z_order as f32;
+            z >= range.0 && z <= range.1
+        }) {
+            if line.pe_hide || line.attach_ui.is_some() {
+                continue;
+            }
+            let ctrl_px = line.position[0] * CANVAS_W * ev_x;
+            let ctrl_py = line.position[1] * CANVAS_H * ev_y;
+            let line_m = mat_mul(
+                &letterbox,
+                &mat_mul(
+                    &mat_translate(ctrl_px, ctrl_py),
+                    &mat_mul(
+                        &mat_rotate(line.rotation),
+                        &mat_scale(line.scale[0] * line.ctrl_size_x, line.scale[1] * line.ctrl_size_y),
+                    ),
+                ),
+            );
+            inst.push(Instance {
+                model: instance_model(&mat_mul(&line_m, &mat_scale(LINE_LEN * self.line_length / 6.0, LINE_THICK))),
+                color: white,
+                uv_rect: [0., 0., 1., 1.],
+            });
+            let note_m = mat_mul(&letterbox, &mat_mul(&mat_translate(ctrl_px, ctrl_py), &mat_rotate(line.rotation)));
+            for n in &line.notes {
+                if n.alpha <= 0.0 {
+                    continue;
+                }
+                let x = n.relative[0] * CANVAS_W * ev_x;
+                let y = n.relative[1] * CANVAS_H * ev_y;
+                let w = NOTE_SPRITE_W * n.scale;
+                let h = NOTE_H * n.scale.max(1.0);
+                inst.push(Instance {
+                    model: instance_model(&mat_mul(&note_m, &mat_mul(&mat_translate(x, y), &mat_scale(w, h)))),
+                    color: white,
+                    uv_rect: [0., 0., 1., 1.],
+                });
+            }
+        }
+        if inst.is_empty() {
+            return; // 遮罩保持上一帧内容(本帧无目标层)→ 混合无效果
+        }
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("mask-instances"),
+            size: (inst.len() * size_of::<Instance>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        self.queue.write_buffer(&buf, 0, bytemuck::cast_slice(&inst));
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("scene-mask"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: mask_view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_vertex_buffer(0, buf.slice(..));
+        pass.set_bind_group(0, &self.white, &[]);
+        pass.draw(0..4, 0..inst.len() as u32);
+    }
+
     /// Borrow the wgpu device.
     pub fn device(&self) -> &wgpu::Device { &self.device }
     /// Borrow the wgpu queue.
@@ -2250,6 +2334,21 @@ impl Renderer {
         }
         // Step 2: Run post-processing effects (if any)
         if has_effects {
+            // Step 1.5:z 层遮罩(targetRange)——对每个 distinct range 渲染
+            // 白色场景(只画 z 在 range 内的线+音符)到遮罩纹理,特效
+            // 执行时按遮罩混合,否则非 global 特效被无差别全屏应用。
+            let mut ranges: Vec<(f32, f32)> = Vec::new();
+            for ae in &self.post.active {
+                if let Some(r) = ae.target_range {
+                    if !ranges.contains(&r) {
+                        ranges.push(r);
+                    }
+                }
+            }
+            for r in ranges {
+                let mask_view = self.post.mask_view(&self.device, r).clone();
+                self.render_mask(&mut encoder, window_aspect, frame, r, &mask_view);
+            }
             self.post.apply(
                 &mut encoder,
                 &self.device,

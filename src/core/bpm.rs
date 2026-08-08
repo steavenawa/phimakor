@@ -70,8 +70,8 @@ impl BpmList {
         for (now_beats, bpm) in ranges {
             // bpm ≤ 0 或非有限 → 120 兜底(与空表 fallback 同语义):坏谱面
             // 时间表退化但不产生 Inf/NaN(60/0=Inf 会污染 duration →
-            // seek clamp 出 Inf → 音频线程 from_secs_f64 panic,用户实测
-            // hitsound-trigger 崩溃)。validate 的 BpmNonPositive 已告警。
+            // seek clamp 出 Inf → 音频线程 from_secs_f64 panic)
+            // hitsound-trigger 崩溃。validate 的 BpmNonPositive 已告警。
             let bpm = if bpm.is_finite() && bpm > 0.0 { bpm } else { 120.0 };
             if let Some(bpm) = last_bpm {
                 time += (now_beats - last_beats) * (60. / bpm);
@@ -185,7 +185,7 @@ mod tests {
     fn non_positive_bpm_degrades_to_120() {
         // 回归:坏谱面 bpm=0/负/NaN 曾把时间表污染成 Inf/NaN
         // (60/0),duration 跟着 Inf,seek 传导到音频线程
-        // Duration::from_secs_f64 直接 panic(用户实测)。
+        // Duration::from_secs_f64 直接 panic。
         let mut b = BpmList::new(vec![(0.0, 0.0), (4.0, -120.0), (8.0, f64::NAN)]);
         for beats in [0.0, 2.0, 4.0, 6.0, 8.0, 10.0] {
             let t = b.time_beats(beats);

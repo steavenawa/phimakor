@@ -829,7 +829,7 @@ fn build_triggers(rpe: &RPEChart, r: &mut BpmList) -> Vec<TriggerEvent> {
             let x = note.position_x / (RPE_WIDTH / 2.);
             // y:above 符号 × y_offset 归一化(与 parse_notes/state_at 同口径:
             // y_offset×2/RPE_HEIGHT×speed,below note 镜像取负)。fx 落点必须
-            // 含这一项,否则带 y 偏移的 note 特效落在线上(用户实测:没有
+            // 含这一项,否则带 y 偏移的 note 特效落在线上(没有
             // 判断 note 是 up 还是 down)。
             let y = if note.above == 1 { 1.0 } else { -1.0 } * note.y_offset * 2.0 / RPE_HEIGHT * note.speed;
             triggers.push(TriggerEvent { t, line: line_idx, x, y, kind: note.kind });
@@ -949,7 +949,7 @@ impl Chart {
         for line in &rpe.judge_line_list {
             // [时间有限性] 音符/事件拍号可能非法(triple 分母 0 → beats=Inf):
             // Inf/NaN 必须排除,否则 duration=Inf 会让 seek clamp/scroll 全线
-            // Inf(用户实测音频线程 from_secs_f64 panic)。f64::max 对 NaN
+            // Inf。f64::max 对 NaN
             // 返回另一参数,但 Inf 会传染——显式过滤非有限。
             let notes_max = line
                 .notes
@@ -2144,7 +2144,7 @@ previewStart: 12
 
     #[test]
     fn duration_stays_finite_on_bad_bpm_and_triple() {
-        // 回归(用户实测 hitsound-trigger 崩溃):bpm=0 → 60/0=Inf;
+        // 回归:bpm=0 → 60/0=Inf;
         // triple 分母 0 → beats=Inf → max_time=Inf → duration=Inf →
         // seek clamp/scroll 传染 → 音频线程 Duration::from_secs_f64 panic。
         // BpmList 清洗 + max_time 过滤后 duration 必须有限。
@@ -2588,7 +2588,7 @@ previewStart: 12
     fn reposition_backward_restores_visibility() {
         // 回归:combo 精度修复让后向 seek 也走 reposition,而 reposition 把
         // last_state_time 设为目标、state_at 看不到 seek-back → 可见性游标
-        // 永不重置 → 过点即消的 note 后退时永久不显示(用户实测:退回去
+        // 永不重置 → 过点即消的 note 后退时永久不显示(退回去
         // 显示不出来但 hit-fx 正常)。修复:reposition 在后向时自重置游标。
         // 120bpm: taps at beats 2, 4, 6 → 1.0s, 2.0s, 3.0s。
         let src = r#"{
@@ -2612,7 +2612,7 @@ previewStart: 12
         assert!(chart.frame.lines[0].notes.is_empty(), "passed notes are culled");
         // 后向 seek(main.rs hard_seek 同路径:reposition + 下一帧 state_at)。
         // 回归判据:seek 前被消掉的 note 必须重新可见(修复前游标不重置,
-        // 退回去永远 0 条——用户实测"退回去显示不出来但 hit-fx 正常")。
+        // 退回去永远 0 条)。
         chart.reposition(0.5);
         {
             let frame = chart.state_at(0.5);
@@ -2905,7 +2905,7 @@ previewStart: 12
 
     #[test]
     fn fx_poses_stable_across_frames_on_real_chart() {
-        // 回归(QuomodocunquizE 用户实测 fx 瞬跳):细步进全程播放,同一
+        // 回归(QuomodocunquizE fx 瞬跳):细步进全程播放,同一
         // (line, t0) 的 fx 位姿必须逐位一致。修复前旧去重缓存(keys/poses
         // 双 Vec 同序)在密集窗口下命中索引错位,31,705/149,191 漂移;
         // HashMap 按 (line, t0 位模式) 缓存后为 0。
@@ -2948,7 +2948,7 @@ previewStart: 12
     #[test]
     fn trigger_y_carries_above_sign_and_y_offset() {
         // 回归:fx 落点必须含 note 的 y 偏移(above 符号 × y_offset×2/900×
-        // speed)——用户实测 hit-fx 没有判断 note 是 up 还是 down,带
+        // speed)——hit-fx 落点需含 y 偏移:
         // y_offset 的 note 特效落在线上。触发表的 y 与 state_at 的
         // relative[1] 同口径(不含线高差 base 项)。
         // 120bpm:above note y_offset=100 → +100×2/900;below note
@@ -2982,7 +2982,7 @@ previewStart: 12
     fn fx_poses_stable_across_frames() {
         // 回归:fx 位置必须冻结在触发时刻 t0 的线位姿——播放推进中每帧
         // 重算(窗口滑动)结果必须逐位一致。若 set_time 游标往返不幂等,
-        // 同一 t0 的位姿会随播放漂移 = 用户实测的"fx 后续帧重新跟踪线"。
+        // 同一 t0 的位姿会随播放漂移 = "fx 后续帧重新跟踪线"。
         // 线 0..2s 线性平移 (0→0.5) + 旋转 (0°→90°),note 触发于 1.0s。
         let src = r#"{
             "META": { "offset": 0, "RPEVersion": 160 },

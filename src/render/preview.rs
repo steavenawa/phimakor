@@ -309,6 +309,7 @@ impl PreviewEngine {
                 shader_idx: si,
                 custom_name: if si == usize::MAX { Some(e.shader_name.clone()) } else { None },
                 priority: e.priority,
+                target_range: e.target_range.clone().map(|r| (r.min_z_index, r.max_z_index)),
                 uniform_values: uv,
                 uniform_count: count,
                 uniforms_names: e.uniforms_names.clone(),
